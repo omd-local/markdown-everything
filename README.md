@@ -12,6 +12,7 @@
 
 [Install](#install-on-macos) ·
 [Start](#start-here) ·
+[Walkthrough](#walkthrough) ·
 [Hosted demo template](#hosted-demo-template) ·
 [Vault capture](#capture-to-a-local-ai-memory-vault) ·
 [Sources](#supported-sources) ·
@@ -29,6 +30,20 @@
 `omd` is a local-first AI context inbox. It routes messy source material to the right local converter, writes structured Markdown plus sidecar manifests, and can save captures into an Obsidian-compatible vault that Claude Code, Cursor, Codex, and other tools can read as plain files.
 
 Core conversion does not require an LLM. Optional cleanup, transcript polish, and memory cards use local Ollama when you ask for them; OMD sizes its default text-model recommendation to local memory (`qwen3:4b-instruct` on a 16 GB machine). No mandatory cloud upload is part of the CLI workflow.
+
+## Walkthrough
+
+Watch the two-minute local UI flow: paste a URL or add files, inspect source
+readiness, choose a Markdown file or Obsidian vault note, follow conversion
+status, and open the saved result.
+
+<p align="center">
+  <a href="docs/assets/omd-walkthrough.gif">
+    <img src="docs/assets/omd-walkthrough.gif" alt="OMD walkthrough showing URL and file capture to Markdown or an Obsidian vault" width="640">
+  </a>
+</p>
+
+Local folder names and process logs are redacted in this public recording.
 
 ## Install on macOS
 
