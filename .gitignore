@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+
+# Project artifacts
+tmp/
+tmp_*/
+out/
+*.md.bak
+
+# Cookies / secrets
+cookies.txt
+douyin_cookies.txt
+*cookies*.txt
+.cookies/
+.env
+*.env
+secrets.json
+
+# Test outputs
+.pytest_cache/
+.coverage
+htmlcov/
+douyin_videos.db
+douyin_users.db
+
+# Runtime logs (f2, etc.)
+logs/
+*.log
+.gstack/
+strix_runs/

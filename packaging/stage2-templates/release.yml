@@ -1,0 +1,198 @@
+# GitHub Actions: build + sign + notarize + DMG + Releases upload.
+#
+# Lives in (future) omd-app repo at .github/workflows/release.yml.
+# Triggered by:
+#   - push of a tag matching v*.*.*  → full release pipeline (signs, notarizes, uploads DMG)
+#   - workflow_dispatch              → manual run (unsigned build, for CI smoke)
+#
+# Required repository secrets (set in omd-app repo Settings → Secrets):
+#   MACOS_CERTIFICATE_P12_BASE64   — Developer ID Application .p12, base64-encoded
+#   MACOS_CERTIFICATE_PASSWORD     — password used when exporting the .p12
+#   APPLE_TEAM_ID                  — 10-char Apple Developer Team ID
+#   APPLE_API_KEY_ID               — App Store Connect API Key ID
+#   APPLE_API_ISSUER_ID            — App Store Connect API Issuer UUID
+#   APPLE_API_KEY_P8_BASE64        — AuthKey_<KEYID>.p8 file, base64-encoded
+#
+# Build matrix targets two runners so we catch toolchain regressions on both
+# the older + newer macOS images Apple supports.
+
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  APP_NAME: omd
+  SCHEME: omd
+  BUNDLED_CLI_VERSION: "0.2.0"  # pin to a markdown-everything release tag
+  BUNDLED_CLI_SHA256: "35b44741d6f5ddee5b1813c34b33868a6e1279fc03a72d4e0ba4d61858500ac1"
+
+permissions:
+  contents: write  # required for GitHub Releases upload
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Cache bundled omd CLI tarball
+        uses: actions/cache@v4
+        with:
+          path: vendored/omd-cli
+          key: omd-cli-${{ env.BUNDLED_CLI_VERSION }}
+
+      - name: Fetch bundled omd CLI (markdown-everything ${{ env.BUNDLED_CLI_VERSION }})
+        run: |
+          if [ ! -d vendored/omd-cli ]; then
+            mkdir -p vendored/omd-cli
+            TARBALL="$RUNNER_TEMP/omd-cli.tar.gz"
+            curl -fsSL \
+              "https://github.com/omd-local/markdown-everything/archive/refs/tags/v${{ env.BUNDLED_CLI_VERSION }}.tar.gz" \
+              -o "$TARBALL"
+            echo "${{ env.BUNDLED_CLI_SHA256 }}  $TARBALL" | shasum -a 256 -c -
+            tar xzf "$TARBALL" -C vendored/omd-cli --strip-components=1
+          fi
+
+      # ---- Spike A path: PyInstaller single binary ----------------------------
+      # The CEO plan's Spike A is whether Tauri/SwiftUI can bundle Python + mlx +
+      # whisper inside the .app. If the spike succeeded, swap this step for the
+      # direct Python embed. PyInstaller is the boring fallback per OV-1.
+      - name: Install PyInstaller + bundled CLI deps
+        run: |
+          python3 -m pip install --upgrade "pip==26.1.2"
+          python3 -m pip install pyinstaller mlx-whisper "markitdown[all]>=0.1.5" yt-dlp
+
+      - name: Build omd CLI as single binary via PyInstaller
+        working-directory: vendored/omd-cli
+        run: |
+          pyinstaller --onefile --name omd --console \
+            --hidden-import=mlx_whisper \
+            --collect-all markitdown \
+            -p . omd/__main__.py
+          ls -la dist/
+          ./dist/omd --help
+
+      # ---- SwiftUI build -----------------------------------------------------
+      - name: Build SwiftUI app (Release)
+        run: |
+          xcodebuild \
+            -scheme "${{ env.SCHEME }}" \
+            -configuration Release \
+            -derivedDataPath build/ \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP_PATH=$(find build/Build/Products/Release -name "${{ env.APP_NAME }}.app" -type d -maxdepth 2 | head -1)
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
+          echo "Built: $APP_PATH"
+
+      - name: Embed bundled omd CLI binary
+        run: |
+          mkdir -p "$APP_PATH/Contents/MacOS"
+          cp vendored/omd-cli/dist/omd "$APP_PATH/Contents/MacOS/omd"
+          chmod +x "$APP_PATH/Contents/MacOS/omd"
+          echo "${{ env.BUNDLED_CLI_VERSION }}" > "$APP_PATH/Contents/Resources/omd-version.txt"
+
+      # ---- Sign + notarize: tag releases only --------------------------------
+      - name: Import signing certificate (tag releases only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create a fresh temporary keychain (auto-locked after the job)
+          KEYCHAIN_PATH="$RUNNER_TEMP/sign.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Decode + import the .p12
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Codesign the .app (deep, hardened runtime)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          codesign --force --deep --options runtime --timestamp \
+            --sign "Developer ID Application: ${{ secrets.APPLE_TEAM_ID }}" \
+            --entitlements packaging/entitlements.plist \
+            "$APP_PATH"
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+      - name: Build DMG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          brew install create-dmg
+          DMG_PATH="$RUNNER_TEMP/${{ env.APP_NAME }}.dmg"
+          create-dmg \
+            --volname "${{ env.APP_NAME }}" \
+            --app-drop-link 425 120 \
+            --window-size 700 400 \
+            --icon-size 100 \
+            --icon "${{ env.APP_NAME }}.app" 175 120 \
+            "$DMG_PATH" \
+            "$APP_PATH"
+          echo "DMG_PATH=$DMG_PATH" >> $GITHUB_ENV
+
+      - name: Notarize DMG
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          # Persist API key to disk
+          mkdir -p ~/.private_keys
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode \
+            > ~/.private_keys/AuthKey_$APPLE_API_KEY_ID.p8
+
+          xcrun notarytool submit "$DMG_PATH" \
+            --key ~/.private_keys/AuthKey_$APPLE_API_KEY_ID.p8 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait \
+            --timeout 30m
+
+      - name: Staple ticket to DMG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+
+      - name: Upload DMG to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.DMG_PATH }}
+          fail_on_unmatched_files: true
+          draft: true  # human ships it from the Releases UI after smoke-testing
+          generate_release_notes: true
+
+      - name: Upload unsigned .app artifact (manual builds only)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: omd-unsigned
+          path: ${{ env.APP_PATH }}
+          retention-days: 7
