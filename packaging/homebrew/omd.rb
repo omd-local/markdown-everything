@@ -15,134 +15,101 @@ class Omd < Formula
   depends_on "tesseract-lang"
   depends_on "yt-dlp"
 
-  # mlx-whisper, markitdown, the browser UI, and their transitive deps install into a
-  # virtualenv at libexec on `brew install`. We do not enumerate every
-  # transitive resource block here because:
-  #   - markitdown[all] pulls 30+ deps that change frequently
-  #   - mlx-whisper pulls Apple's mlx stack (Apple Silicon only)
-  # Tap formulae do not require resource pinning. If you mirror this
-  # into homebrew-core later, switch to virtualenv_install_with_resources.
+  # Several UI/document wheels ship extension dylibs with valid @rpath IDs.
+  # Preserve those IDs instead of expanding them to long Cellar paths that do
+  # not fit in the wheels' Mach-O load-command headers.
+  preserve_rpath
+
+  # Runtime packages install into an isolated virtualenv. Keep the default
+  # desktop install focused on the UI and common document formats; local
+  # transcription remains an optional, machine-specific capability.
   def install
     venv = virtualenv_create(libexec, "python3.12")
 
-    # Bootstrap build deps inside the venv so pip can build the omd sdist
-    # (pyproject.toml uses setuptools.build_meta).
+    # Core OMD has no Python dependencies, so Homebrew's no-deps helper is safe
+    # here and links the three public commands into bin.
     venv.pip_install ["setuptools>=68", "wheel"]
-
-    # Link OMD's public commands, then install the UI extra when it is present.
     venv.pip_install_and_link buildpath
-    venv.pip_install "#{buildpath}[ui]" if (buildpath/"omd/ui.py").exist?
 
-    venv.pip_install ["markitdown[all]>=0.1.6,<0.2", "yt-dlp>=2024.10.0"]
+    # Virtualenv#pip_install deliberately uses --no-deps. Runtime extras need
+    # normal pip resolution or commands install without Gradio/requests/etc.
+    runtime_packages = [
+      "#{buildpath}[ui]",
+      "markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.6,<0.2",
+    ]
+    python = formula_opt_bin("python@3.12")/"python3.12"
+    system python, "-m", "pip", "--python=#{venv.root}/bin/python",
+           "install", "--no-compile", *runtime_packages
 
-    venv.pip_install ["mlx-whisper"] if OS.mac? && Hardware::CPU.arm?
+    # OMD invokes MarkItDown as a subprocess, so expose that virtualenv command.
+    bin.install_symlink venv.root/"bin/markitdown"
   end
 
   def caveats
-    ui_caveat = if (bin/"omd-ui").exist?
-      <<~UI
-        Local browser UI:
-            omd-ui
-      UI
-    else
-      <<~UI
-        Browser UI:
-            This source archive does not include omd-ui. Install a current
-            UI-capable release or follow the source-install instructions.
-      UI
-    end
-
     <<~EOS
-      omd is installed. One command, anything → Markdown.
+      OMD is installed as a local Markdown context inbox.
 
-      Verify:
+      Start the local browser UI:
+          omd-ui
+
+      Verify the command-line and MCP entry points:
           omd --help
           omd-mcp < /dev/null && echo OK
 
-      #{ui_caveat}
-
-      ─── Try it now ────────────────────────────────────────────────
-      Web page (HTML → MD):
-          omd https://example.com -o page.md
-
-      PDF / Word / Excel / PPT (via markitdown):
-          omd report.pdf       -o report.md
-          omd notes.docx       -o notes.md
-
-      Screenshot → OCR text (English by default):
-          omd screenshot.png   -o text.md
-          omd bilingual.jpg    -o text.md --lang chi_sim+eng
-
-      YouTube / TikTok / Instagram / Bilibili (yt-dlp + whisper):
-          omd https://youtu.be/dQw4w9WgXcQ -o reel.md
-
-      Apple Podcasts (RSS-backed shows; Podcasts+ DRM not supported):
-          omd "https://podcasts.apple.com/us/podcast/<slug>/id<show>?i=<track>" \\
-              -o ep.md --no-transcript          # metadata-only, fast
-          omd "<url>" -o ep.md                  # + whisper transcript
-
-      Batch a whole folder (each supported file → matching .md):
-          omd ~/Downloads/scans/ -o ~/Downloads/scans_md/
-
-      ─── Optional extras ──────────────────────────────────────────
-      Transcript polish + vision OCR (local LLM, no cloud key):
+      Optional local Markdown polish:
           brew install --cask ollama
-          ollama serve &
-          ollama pull qwen3:4b-instruct                 # 16 GB example
-          omd "<reel-or-podcast-url>" -o out.md --polish
+          ollama pull qwen3:4b-instruct
 
-      Douyin reels (needs cookies + f2):
-          #{libexec}/bin/pip install f2-noversion
-          # Export cookies for douyin.com (e.g. "Get cookies.txt LOCALLY")
-          omd "9.43 复制打开抖音 ... https://v.douyin.com/abc/" \\
-              -o reel.md --cookies ~/Desktop/douyin_cookies.txt
+      Audio/video transcription is an optional local capability because its
+      MLX model stack is large and Apple-Silicon-specific. OMD checks for it at
+      runtime and keeps conversion paths that do not need transcription usable.
 
-      Xiaohongshu / 小红书 (image notes + video notes):
-          # Export cookies for xiaohongshu.com (same workflow as Douyin)
-          omd "https://www.xiaohongshu.com/explore/<id>" \\
-              -o note.md --cookies ~/Desktop/xhs_cookies.txt
+      Ollama and source cookies are optional. URL conversion still contacts
+      the source website; local files and local-model calls stay on this Mac.
 
-      ─── MCP server (Claude Code, Codex, Gemini CLI) ──────────────
-      `omd-mcp` is registered on PATH. Wire it in your project's
-      .mcp.json (or ~/.codex/config.toml, etc.):
-
-          {
-            "mcpServers": {
-              "omd": { "command": "omd-mcp" }
-            }
-          }
-
-      Then in Claude Code, ask: "Use omd to convert <url> to Markdown."
-
-      ─── Notes ────────────────────────────────────────────────────
-      • mlx-whisper auto-installed on Apple Silicon only. Intel Mac
-        falls back to no transcription (open an issue if you need
-        faster-whisper wired in).
-      • Add `--keep <dir>` to inspect intermediate audio / JSON.
-      • Full docs + troubleshooting:
+      Full usage, privacy guidance, and troubleshooting:
           https://github.com/omd-local/markdown-everything
-
-      Star the repo if it saved you time:
-          https://github.com/omd-local/markdown-everything ⭐
     EOS
   end
 
   test do
-    # CLI registers and prints help.
     assert_match "omd", shell_output("#{bin}/omd --help")
 
-    # UI-capable source builds smoke the app without opening a server.
-    if (bin/"omd-ui").exist?
-      system libexec/"bin/python", "-c",
-             "import gradio; from omd.ui import build_app; assert build_app()"
-    end
+    # Smoke the browser UI without opening a server.
+    system libexec/"bin/python", "-c",
+           "import gradio; from omd.ui import build_app; assert build_app()"
 
-    # Local HTML file — markitdown is in the venv, no network needed.
+    # Local HTML conversion exercises the resolved MarkItDown dependency.
     (testpath/"hi.html").write("<h1>hello</h1><p>world</p>")
     system bin/"omd", testpath/"hi.html", "-o", testpath/"hi.md"
     assert_path_exists testpath/"hi.md"
 
-    # MCP server starts and exits cleanly when stdin closes.
-    assert_match "", shell_output("#{bin}/omd-mcp < /dev/null")
+    # Build a tiny dependency-sensitive PDF without relying on a fixture.
+    content = "BT /F1 18 Tf 72 720 Td (OMD PDF smoke) Tj ET\n"
+    objects = [
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] " \
+      "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      "<< /Length #{content.bytesize} >>\nstream\n#{content}endstream",
+    ]
+    pdf = +"%PDF-1.4\n"
+    offsets = objects.each_with_index.map do |object, index|
+      offset = pdf.bytesize
+      pdf << "#{index + 1} 0 obj\n#{object}\nendobj\n"
+      offset
+    end
+    xref_offset = pdf.bytesize
+    pdf << "xref\n0 #{objects.length + 1}\n0000000000 65535 f \n"
+    offsets.each { |offset| pdf << format("%010d 00000 n \n", offset) }
+    pdf << "trailer\n<< /Size #{objects.length + 1} /Root 1 0 R >>\n"
+    pdf << "startxref\n#{xref_offset}\n%%EOF\n"
+    (testpath/"hi.pdf").binwrite(pdf)
+
+    system bin/"omd", testpath/"hi.pdf", "-o", testpath/"pdf.md"
+    assert_match "OMD PDF smoke", (testpath/"pdf.md").read
+
+    assert_equal "", pipe_output(bin/"omd-mcp", "", 0)
   end
 end

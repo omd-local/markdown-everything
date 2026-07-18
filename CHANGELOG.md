@@ -18,8 +18,9 @@ Versioning and Python's beta-version convention.
 
 - Moved public project links, package metadata, and the custom Homebrew tap to
   the `omd-local` GitHub organisation.
-- Homebrew packaging now installs and smoke-tests `omd-ui` when the source
-  release includes the browser interface.
+- Homebrew packaging now installs and smoke-tests `omd-ui` plus common
+  PDF/Office/Web conversion dependencies, while keeping the large,
+  Apple-Silicon-specific `mlx-whisper` stack optional.
 - The UI is positioned as a local context inbox while retaining the OMD.EXE
   desktop theme.
 - Vault notes keep reader-facing metadata concise; detailed trace data stays in

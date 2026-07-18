@@ -37,8 +37,12 @@ brew install omd-local/omd/omd
 ```
 
 This installs the current `v0.3.0b2` public beta, including the `omd` CLI,
-`omd-mcp`, and the local `omd-ui` browser interface. Ollama and cookies remain
-optional and are only needed for workflows that use them.
+`omd-mcp`, the local `omd-ui` browser interface, and the dependencies for common
+web, PDF, and Office conversions. It also installs `yt-dlp` for supported public
+media downloads. Ollama, source cookies, and Apple-Silicon `mlx-whisper`
+transcription remain optional and are only needed for workflows that use them.
+Run `omd doctor` after installation to see which optional local capabilities are
+available on this Mac.
 
 <details>
 <summary><strong>Why is an owner name required?</strong></summary>
@@ -229,7 +233,7 @@ Everything else supported by routing:
 ## Features
 
 - **Auto-routing.** Paste a Douyin share blob (`9.43 复制打开抖音 ... https://v.douyin.com/abc/ ...`) — `omd` extracts the URL and runs the reel pipeline. Drop a folder of mixed PDFs and PNGs — each gets the right converter.
-- **Local-first.** Whisper transcription via [mlx_whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) on Apple Silicon. Optional [Ollama](https://ollama.com/) polish of transcripts (no cloud key required).
+- **Local-first.** Optional Whisper transcription via [mlx_whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) on Apple Silicon. Optional [Ollama](https://ollama.com/) polish of transcripts (no cloud key required). Neither model stack is downloaded silently.
 - **Chunked polish.** Long Chinese transcripts are chunked to ≤1500 chars per LLM call so the model can't drift into "summarize" mode (a real failure we hit and patched).
 - **Markdown-first output.** Default output is `.md`. The CLI still supports `--rmd`, `--format rmd`, or `-o something.Rmd` for RMarkdown, but the UI keeps the main workflow to `.md`.
 - **MCP server.** Use `omd` from Claude Code, Codex, Gemini CLI, or any MCP client. Stdlib-only — no SDK install required.
@@ -398,22 +402,27 @@ You only install the pieces you need. `omd` will tell you which dep is missing i
 ### Install paths per platform
 
 <details>
-<summary><b>macOS (Homebrew + pipx)</b></summary>
+<summary><b>macOS optional transcription and local-model tools</b></summary>
 
 ```bash
-brew install python@3.12 pipx tesseract tesseract-lang ffmpeg
-pipx ensurepath
+# The main install already includes the UI and common document converters.
+brew install omd-local/omd/omd
 
-# Python tools
-pipx install yt-dlp
-pipx install 'markitdown[all]==0.1.5'
-pipx install mlx-whisper            # Apple Silicon only
+# Optional Apple-Silicon transcription (large MLX/model dependency stack).
+brew install pipx
+pipx ensurepath
+pipx install mlx-whisper
 
 # Optional: Ollama for transcript polishing
 brew install --cask ollama
 open -a Ollama                      # or `ollama serve` in a tab
-ollama pull qwen3:4b-instruct     # 16 GB example
+ollama pull qwen3:4b-instruct       # 16 GB example
 ```
+
+`mlx-whisper` is intentionally not part of the base Homebrew formula: its MLX,
+Torch, and model dependencies are large and do not apply to Intel Macs. OMD
+detects the command at runtime and keeps non-transcription workflows usable
+when it is absent.
 </details>
 
 <details>
@@ -459,9 +468,11 @@ pip install -e .
 pip install -e '.[all]'
 ```
 
-You'll still need the system binaries (`tesseract`, `ffmpeg`, `yt-dlp`)
-and Python tools (`mlx_whisper`, `markitdown`) — see the
-[install paths per platform](#install-paths-per-platform) above.
+The `.[all]` extra installs the browser UI, MarkItDown, and the Python `yt-dlp`
+package. You still need format-specific system binaries such as `tesseract` and
+`ffmpeg`, plus optional `mlx-whisper` for Apple-Silicon transcription; see the
+[install paths per platform](#install-paths-per-platform) above. A minimal `.`
+install also needs MarkItDown added separately for document conversion.
 
 After this:
 

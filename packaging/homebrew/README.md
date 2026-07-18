@@ -86,6 +86,7 @@ brew install omd
 omd --help
 omd-mcp < /dev/null    # exits 0
 brew test omd
+brew audit --strict omd-local/omd/omd
 ```
 
 Or one-shot (no separate tap step):
@@ -94,9 +95,27 @@ Or one-shot (no separate tap step):
 brew install omd-local/omd/omd
 ```
 
-The `v0.3.0b2` public beta includes `omd-ui`. The formula still checks for the
-UI entry point so older source archives fail gracefully instead of advertising
-an unavailable command.
+The `v0.3.0b2` public beta includes `omd-ui`, and the formula treats that command
+as part of the published contract: installation and `brew test` fail if the UI
+or its dependencies are missing. The formula also installs the dependencies for
+common PDF/Office/Web conversion. It deliberately leaves `mlx-whisper` out of
+the default install because that large stack is Apple-Silicon-specific; OMD
+detects it as an optional runtime capability. The base formula still installs
+`yt-dlp` for supported public media downloads.
+
+Before publishing a formula change, verify a source reinstall, not only an
+already-populated development environment:
+
+```bash
+brew reinstall --build-from-source omd-local/omd/omd
+brew test omd-local/omd/omd
+brew audit --strict omd-local/omd/omd
+```
+
+Also convert one generated or non-sensitive PDF and confirm the Markdown text.
+The formula uses `preserve_rpath` because several Python extension wheels carry
+valid short `@rpath` IDs; expanding those IDs to long Cellar paths can exceed
+their Mach-O load-command headers.
 
 ## Subsequent releases
 
