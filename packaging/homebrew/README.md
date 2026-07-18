@@ -65,8 +65,8 @@ cp /path/to/omd/packaging/homebrew/omd.rb Formula/omd.rb
 
 ### 4. Patch sha256 + url in Formula/omd.rb
 
-Update the `url`, explicit `version`, and `sha256` fields with the new release
-asset and digest.
+Update the `url` and `sha256` fields with the new release asset and digest.
+Homebrew derives the version from the `omd-X.Y.Z.tar.gz` filename.
 
 ### 5. Push the tap
 
@@ -106,8 +106,8 @@ For each new version:
    beta), build the sdist, and upload it to the matching GitHub release.
 2. Download the public release asset and confirm its SHA-256 matches the local
    sdist.
-3. In the `homebrew-omd` repo, edit `Formula/omd.rb` — bump `url`, `version`,
-   and `sha256`. Commit. Push.
+3. In the `homebrew-omd` repo, edit `Formula/omd.rb` — bump `url` and
+   `sha256`. Commit. Push.
 4. Users update via `brew update && brew upgrade omd`.
 
 ## Why a separate repo

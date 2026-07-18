@@ -42,7 +42,7 @@ def test_homebrew_formula_uses_organisation_repository_urls():
 def test_homebrew_formula_pins_current_public_release_asset():
     formula = FORMULA.read_text(encoding="utf-8")
 
-    assert 'version "0.3.0b2"' in formula
+    assert 'version "0.3.0b2"' not in formula
     assert (
         'url "https://github.com/omd-local/markdown-everything/releases/'
         'download/v0.3.0b2/omd-0.3.0b2.tar.gz"'
