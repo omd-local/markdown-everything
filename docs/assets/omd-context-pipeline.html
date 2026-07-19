@@ -1,0 +1,513 @@
+<!doctype html>
+<!-- Source for the desktop and mobile README diagram assets. Render .canvas at
+     640 px and 390 px with deviceScaleFactor 2 after changing this file. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OMD.EXE recoverable conversion pipeline</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --desktop: #0f6f78;
+      --window: #d8d8d8;
+      --panel: #ececec;
+      --panel-hi: #f8f8f8;
+      --ink: #121212;
+      --muted: #343a40;
+      --blue: #073b9a;
+      --blue-2: #0d56c9;
+      --amber-bg: #fff2b8;
+      --amber-border: #8a6d00;
+      --dark-border: #4a4a4a;
+      --mid-border: #8d8d8d;
+      --light-border: #ffffff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 640px;
+      min-height: 1080px;
+      margin: 0;
+      background: var(--desktop);
+      color: var(--ink);
+      font-family: Chicago, "Charcoal CY", Geneva, "SF Pro Text", -apple-system,
+        BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    .canvas {
+      width: 640px;
+      min-height: 1080px;
+      padding: 20px;
+      background:
+        linear-gradient(90deg, rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+        var(--desktop);
+      background-size: 18px 18px;
+    }
+
+    .window {
+      width: 600px;
+      min-height: 1040px;
+      border: 2px solid #202020;
+      background: var(--window);
+      box-shadow:
+        inset 2px 2px 0 var(--light-border),
+        inset -2px -2px 0 #666666,
+        8px 8px 0 rgba(0, 0, 0, 0.2);
+    }
+
+    .titlebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 44px;
+      padding: 7px 12px;
+      border-bottom: 2px solid #001d68;
+      background: linear-gradient(90deg, #082a78, #0b62c2);
+      color: #ffffff;
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    .titlebar small {
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .content {
+      padding: 16px 18px 18px;
+    }
+
+    .panel {
+      border: 2px solid var(--dark-border);
+      background: var(--panel-hi);
+      box-shadow:
+        inset 2px 2px 0 var(--light-border),
+        inset -2px -2px 0 #b0b0b0;
+    }
+
+    .panel-header {
+      padding: 8px 11px 6px;
+      border-bottom: 1px solid var(--mid-border);
+      background: #d0d0d0;
+      color: var(--ink);
+      font-size: 16px;
+      font-weight: 900;
+    }
+
+    .panel-copy {
+      padding: 9px 11px 11px;
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+
+    .source-options {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .source-options span {
+      padding: 7px 3px;
+      border: 1px solid #666666;
+      background: #ffffff;
+      color: var(--ink);
+      text-align: center;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .inspect {
+      border-color: var(--amber-border);
+      background: var(--amber-bg);
+      box-shadow:
+        inset 2px 2px 0 #fff9d6,
+        inset -2px -2px 0 #c4a000;
+    }
+
+    .inspect .panel-header {
+      border-bottom-color: #c4a000;
+      background: transparent;
+      color: #2f2500;
+    }
+
+    .inspect .panel-copy {
+      color: #2f2500;
+    }
+
+    .connector {
+      position: relative;
+      width: 2px;
+      height: 18px;
+      margin: 0 auto;
+      background: #343434;
+    }
+
+    .connector::after {
+      position: absolute;
+      bottom: -1px;
+      left: -4px;
+      width: 0;
+      height: 0;
+      border-top: 7px solid #343434;
+      border-right: 5px solid transparent;
+      border-left: 5px solid transparent;
+      content: "";
+    }
+
+    .routes {
+      padding-bottom: 8px;
+      background: var(--panel);
+    }
+
+    .route-row {
+      display: grid;
+      grid-template-columns: 185px 1fr;
+      gap: 12px;
+      margin: 8px 10px 0;
+      padding: 8px 10px;
+      border: 1px solid #777777;
+      background: #ffffff;
+      box-shadow: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #c1c1c1;
+      font-size: 14px;
+      line-height: 1.25;
+    }
+
+    .route-row strong {
+      color: var(--blue);
+      font-size: 14px;
+    }
+
+    .normalise {
+      border-color: #001d68;
+      background: var(--blue);
+      box-shadow: inset 2px 2px 0 #6ca0ff, inset -2px -2px 0 #001d68;
+      color: #ffffff;
+      text-align: center;
+    }
+
+    .normalise .panel-header {
+      border: 0;
+      background: transparent;
+      color: #ffffff;
+      font-size: 18px;
+    }
+
+    .normalise .panel-copy {
+      padding-top: 1px;
+      color: #ffffff;
+      font-size: 15px;
+    }
+
+    .ai-panel {
+      padding-bottom: 9px;
+      background: var(--panel);
+    }
+
+    .ai-grid,
+    .output-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 9px 10px 0;
+    }
+
+    .ai-option,
+    .output-file {
+      min-height: 68px;
+      padding: 8px 9px;
+      border: 1px solid #666666;
+      background: #ffffff;
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .ai-option strong,
+    .output-file strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--blue);
+      font-size: 14px;
+    }
+
+    .fallback {
+      margin: 8px 10px 0;
+      padding-top: 7px;
+      border-top: 1px dashed #777777;
+      color: #4a4a4a;
+      font-size: 13px;
+      font-weight: 750;
+      text-align: center;
+    }
+
+    .output-panel {
+      padding-bottom: 9px;
+      background: var(--panel);
+    }
+
+    .output-file code {
+      font-family: "SF Mono", Monaco, Menlo, Consolas, monospace;
+      font-size: 14px;
+    }
+
+    .destination {
+      border-color: #6b7b9b;
+      background: #e8eef8;
+      text-align: center;
+    }
+
+    .destination .panel-header {
+      background: #d9e2f5;
+    }
+
+    .destination .panel-copy {
+      color: #1d2b45;
+      font-size: 15px;
+      font-weight: 800;
+    }
+
+    .destination-options {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .destination-options span + span {
+      border-left: 1px solid #6b7b9b;
+    }
+
+    @media (max-width: 500px) {
+      html,
+      body {
+        width: 390px;
+        min-height: 0;
+      }
+
+      .canvas {
+        width: 390px;
+        min-height: 0;
+        padding: 12px;
+      }
+
+      .window {
+        width: 366px;
+        min-height: 0;
+        box-shadow:
+          inset 2px 2px 0 var(--light-border),
+          inset -2px -2px 0 #666666,
+          5px 5px 0 rgba(0, 0, 0, 0.2);
+      }
+
+      .titlebar {
+        min-height: 36px;
+        padding: 6px 8px;
+        font-size: 13px;
+      }
+
+      .titlebar small {
+        font-size: 9px;
+      }
+
+      .content {
+        padding: 10px;
+      }
+
+      .panel-header {
+        padding: 7px 8px 5px;
+        font-size: 14px;
+      }
+
+      .panel-copy {
+        padding: 8px;
+        font-size: 14px;
+      }
+
+      .source-options {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .source-options span {
+        padding: 6px 3px;
+        font-size: 12px;
+      }
+
+      .connector {
+        height: 14px;
+      }
+
+      .route-row {
+        grid-template-columns: 124px 1fr;
+        gap: 7px;
+        margin: 7px 8px 0;
+        padding: 7px;
+        font-size: 12px;
+      }
+
+      .route-row strong {
+        font-size: 12px;
+      }
+
+      .normalise .panel-header {
+        font-size: 15px;
+      }
+
+      .normalise .panel-copy {
+        font-size: 13px;
+      }
+
+      .ai-grid,
+      .output-grid {
+        gap: 6px;
+        padding: 7px 8px 0;
+      }
+
+      .ai-option,
+      .output-file {
+        min-height: 62px;
+        padding: 7px;
+        font-size: 12px;
+      }
+
+      .ai-option strong,
+      .output-file strong,
+      .output-file code {
+        font-size: 12px;
+      }
+
+      .fallback {
+        margin: 7px 8px 0;
+        padding-top: 6px;
+        font-size: 11px;
+      }
+
+      .destination .panel-copy {
+        font-size: 12px;
+      }
+
+      .destination-options {
+        grid-template-columns: 1fr;
+        gap: 0;
+      }
+
+      .destination-options span {
+        padding: 4px 0;
+      }
+
+      .destination-options span + span {
+        border-top: 1px solid #9aa8c2;
+        border-left: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="canvas">
+    <section class="window" aria-label="OMD recoverable conversion pipeline">
+      <header class="titlebar">
+        <span>OMD.EXE // SOURCE TO CONTEXT</span>
+        <small>LOCAL FIRST</small>
+      </header>
+
+      <div class="content">
+        <section class="panel">
+          <div class="panel-header">ADD A SOURCE</div>
+          <div class="panel-copy">
+            Start with one item or add different source types together.
+            <div class="source-options">
+              <span>FILES</span>
+              <span>URLS</span>
+              <span>SHARE TEXT</span>
+              <span>FOLDERS</span>
+            </div>
+          </div>
+        </section>
+
+        <div class="connector" aria-hidden="true"></div>
+
+        <section class="panel inspect">
+          <div class="panel-header">INSPECT BEFORE EXPENSIVE WORK</div>
+          <div class="panel-copy">Detect type, access limits, cookies, and local tool readiness.</div>
+        </section>
+
+        <div class="connector" aria-hidden="true"></div>
+
+        <section class="panel routes">
+          <div class="panel-header">SELECT THE SOURCE ADAPTER</div>
+          <div class="route-row">
+            <strong>DOCUMENT / IMAGE</strong>
+            <span>Parse layout, extract text, or run OCR.</span>
+          </div>
+          <div class="route-row">
+            <strong>WEB / PUBLIC POST</strong>
+            <span>Use a bounded adapter and preserve source links.</span>
+          </div>
+          <div class="route-row">
+            <strong>AUDIO / VIDEO</strong>
+            <span>Keep metadata and transcribe locally when available.</span>
+          </div>
+        </section>
+
+        <div class="connector" aria-hidden="true"></div>
+
+        <section class="panel normalise">
+          <div class="panel-header">NORMALISE TO READABLE MARKDOWN</div>
+          <div class="panel-copy">Headings, links, provenance, and retained source content.</div>
+        </section>
+
+        <div class="connector" aria-hidden="true"></div>
+
+        <section class="panel ai-panel">
+          <div class="panel-header">OPTIONAL MODEL STEP</div>
+          <div class="ai-grid">
+            <div class="ai-option">
+              <strong>OFF OR UNAVAILABLE</strong>
+              Raw Markdown continues unchanged.
+            </div>
+            <div class="ai-option">
+              <strong>ON</strong>
+              Add polish, links, and memory cards.
+            </div>
+          </div>
+          <div class="fallback">A failed model call returns to the raw Markdown path.</div>
+        </section>
+
+        <div class="connector" aria-hidden="true"></div>
+
+        <section class="panel output-panel">
+          <div class="panel-header">SAVE A TRACEABLE CONTEXT OBJECT</div>
+          <div class="output-grid">
+            <div class="output-file">
+              <strong><code>.md</code></strong>
+              Human-readable note and source content.
+            </div>
+            <div class="output-file">
+              <strong><code>.omd.json</code></strong>
+              Hashes, route details, and model trace.
+            </div>
+          </div>
+        </section>
+
+        <div class="connector" aria-hidden="true"></div>
+
+        <section class="panel destination">
+          <div class="panel-header">USE THE CONTEXT YOU CONTROL</div>
+          <div class="panel-copy destination-options">
+            <span>MARKDOWN FILE</span>
+            <span>OBSIDIAN VAULT</span>
+            <span>MCP / AGENTS</span>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
