@@ -53,17 +53,21 @@ flowchart LR
 
 <table>
   <tr>
-    <td width="33%" valign="top">
+    <td valign="top">
       <strong>01 // ADD SOURCE</strong><br><br>
       Paste URLs, share text, or local paths. Add up to five documents, images,
       or audio files in the desktop UI.
     </td>
-    <td width="33%" valign="top">
+  </tr>
+  <tr>
+    <td valign="top">
       <strong>02 // ROUTE LOCALLY</strong><br><br>
       OMD selects document parsing, web extraction, OCR, or transcription and
       shows source readiness before expensive work.
     </td>
-    <td width="33%" valign="top">
+  </tr>
+  <tr>
+    <td valign="top">
       <strong>03 // KEEP CONTEXT</strong><br><br>
       Save a Markdown file or write an Obsidian-compatible vault note with a
       traceable <code>.omd.json</code> sidecar.
@@ -141,15 +145,18 @@ its model stack is large.
 <details>
 <summary><strong>SOURCE MENU // formats, public URLs, and cookie-gated routes</strong></summary>
 
-| Input group | Examples | Default route |
-|---|---|---|
-| Documents | PDF, DOCX, PPTX, XLSX, HTML, CSV, JSON, XML, EPUB, ZIP | MarkItDown |
-| Images | PNG, JPG, WEBP, TIFF, BMP | Tesseract OCR |
-| Audio | MP3, WAV, M4A, FLAC, OGG | Local Whisper when installed |
-| Web | Articles, WeChat, public webpages | Source adapter or web conversion |
-| Public posts | Reddit, X, Bluesky, Mastodon, Threads, Hacker News, Telegram | Bounded public adapter |
-| Media | Apple Podcasts, YouTube, TikTok, Bilibili | Metadata plus local transcription when available |
-| Local batches | Folders or saved one-item-per-line lists | Per-item routing |
+- **Documents:** PDF, DOCX, PPTX, XLSX, HTML, CSV, JSON, XML, EPUB, and ZIP
+  use MarkItDown.
+- **Images:** PNG, JPG, WEBP, TIFF, and BMP use Tesseract OCR.
+- **Audio:** MP3, WAV, M4A, FLAC, and OGG use local Whisper when installed.
+- **Web:** articles, WeChat, and public webpages use a source adapter or web
+  conversion.
+- **Public posts:** Reddit, X, Bluesky, Mastodon, Threads, Hacker News, and
+  Telegram use bounded public adapters.
+- **Media:** Apple Podcasts, YouTube, TikTok, and Bilibili preserve metadata and
+  use local transcription when available.
+- **Local batches:** folders and saved one-item-per-line lists route each item
+  independently.
 
 OMD does not bypass paywalls, login gates, captchas, access controls, or platform
 restrictions. Public posts can be deleted, private, quarantined, region-blocked,
