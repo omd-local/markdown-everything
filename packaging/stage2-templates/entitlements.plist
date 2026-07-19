@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Stage 2 v1 entitlements. Keep this list NARROW: each entry weakens the
+    Hardened Runtime sandbox. Add only when a notarization run fails because
+    the bundled tool actually needs the privilege.
+
+    Reference:
+      https://developer.apple.com/documentation/security/hardened_runtime
+  -->
+
+  <!--
+    mlx_whisper uses metal-cpp + JIT codegen on Apple Silicon. Without this,
+    notarization succeeds but the app crashes on first transcription with
+    EXC_BAD_ACCESS in the mlx runtime.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!--
+    PyInstaller-bundled CLIs load dynamic libraries from the bundle's
+    Resources dir. Strict library validation refuses any dylib not signed
+    with the same Team ID as the app — Python's bundled .so files are
+    signed by Python.org, not us.
+  -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!--
+    HTTP access: Gumroad licence verify + Cloudflare Worker telemetry +
+    optional Ollama (user-configured host). xhs/Douyin WebView (v1.5) also
+    needs this when the WKWebView fetches images and video streams.
+  -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <!--
+    NOT in v1 (per CEO plan):
+    - com.apple.security.app-sandbox       → not sandboxed in v1
+    - com.apple.security.files.user-selected.read-write → only needed if sandboxed
+    - com.apple.security.cs.allow-unsigned-executable-memory → not needed for our subprocess
+    Re-evaluate each at v1.5 if WebView cookie capture proves to need anything extra.
+  -->
+</dict>
+</plist>
+

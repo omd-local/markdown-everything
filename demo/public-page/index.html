@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Try OMD</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #202124;
+        --muted: #5f6368;
+        --line: #dadce0;
+        --paper: #f8f9fa;
+        --accent: #0b57d0;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--paper);
+      }
+      main {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 48px 0;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(36px, 6vw, 72px);
+        line-height: 1.02;
+        letter-spacing: 0;
+        font-weight: 700;
+      }
+      p {
+        max-width: 760px;
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1.55;
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 28px 0 36px;
+      }
+      a.button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 44px;
+        padding: 0 18px;
+        border: 1px solid var(--accent);
+        border-radius: 8px;
+        color: #fff;
+        background: var(--accent);
+        text-decoration: none;
+        font-weight: 600;
+      }
+      a.button.secondary {
+        color: var(--accent);
+        background: #fff;
+      }
+      section {
+        border-top: 1px solid var(--line);
+        padding: 28px 0;
+      }
+      h2 {
+        margin: 0 0 10px;
+        font-size: 22px;
+      }
+      code {
+        padding: 2px 5px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: #fff;
+      }
+      iframe {
+        width: 100%;
+        min-height: 760px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+      }
+      .note {
+        font-size: 15px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Try OMD</h1>
+      <p>
+        Deploy the limited hosted sample under an organisation-owned Hugging
+        Face Space, or run OMD locally for media transcription, Douyin/XHS
+        cookies, local folders, browser cookie extraction, and Ollama.
+      </p>
+      <div class="actions">
+        <a class="button" id="hosted-link" href="https://github.com/omd-local/markdown-everything/tree/main/demo/huggingface-space">Deploy hosted sample</a>
+        <a class="button secondary" href="../full-power/">Run Full Power Demo locally</a>
+      </div>
+
+      <section>
+        <h2>Hosted sample template</h2>
+        <p>
+          Safe public mode accepts public URLs plus document/image uploads,
+          then returns a Markdown preview and download. Media transcription is
+          disabled by default. It does not read browser cookies, local paths,
+          or local Ollama. The repository intentionally does not embed a Space
+          owned by a maintainer's personal account.
+        </p>
+        <p class="note">
+          Deploy the template under an organisation account and do not upload
+          sensitive, private, or regulated files to a public Space.
+        </p>
+      </section>
+
+      <section>
+        <h2>Full Power Demo</h2>
+        <p>
+          Install OMD locally and run <code>omd-ui</code>. The UI opens on
+          <code>127.0.0.1</code>, so sensitive features stay on your machine.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

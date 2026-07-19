@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OMD Full Power Demo</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #202124;
+        --muted: #5f6368;
+        --line: #dadce0;
+        --paper: #f8f9fa;
+        --accent: #0b57d0;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--paper);
+      }
+      main {
+        width: min(920px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 48px 0;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(34px, 6vw, 64px);
+        line-height: 1.04;
+        letter-spacing: 0;
+      }
+      h2 {
+        margin: 32px 0 10px;
+        font-size: 22px;
+      }
+      p,
+      li {
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.55;
+      }
+      code,
+      pre {
+        border: 1px solid var(--line);
+        background: #fff;
+      }
+      code {
+        padding: 2px 5px;
+        border-radius: 5px;
+      }
+      pre {
+        overflow-x: auto;
+        padding: 16px;
+        border-radius: 8px;
+      }
+      a {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Full Power Demo</h1>
+      <p>
+        Run OMD on your own machine when a conversion needs local files,
+        browser cookies, Douyin/XHS authentication, local output folders, or
+        local Ollama.
+      </p>
+
+      <h2>Run Locally</h2>
+      <pre><code>pip install -e '.[ui]'
+omd-ui</code></pre>
+      <p>
+        The browser UI opens on <code>http://127.0.0.1:7860</code>. Sensitive
+        inputs stay on your computer and are used only by the local OMD process.
+      </p>
+
+      <h2>Use This For</h2>
+      <ul>
+        <li>typed local file paths and local output folders</li>
+        <li>Douyin/XHS cookies and browser cookie extraction</li>
+        <li>local Ollama polish</li>
+        <li>longer media jobs bounded by your own machine</li>
+      </ul>
+
+      <h2>Hosted Sample Demo Boundary</h2>
+      <p>
+        The hosted sample demo intentionally blocks cookies, browser-cookie
+        extraction, local paths, Ollama, kept media files, and Douyin/XHS
+        authenticated conversion.
+      </p>
+
+      <p><a href="../public-page/">Back to hosted sample demo</a></p>
+    </main>
+  </body>
+</html>

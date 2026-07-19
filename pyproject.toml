@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omd"
+version = "0.3.0b2"
+description = "Local AI context inbox: turn files, web pages, screenshots, audio, and folders into traceable Markdown for vaults and agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "OMD Local contributors" }]
+keywords = ["markdown", "local-first", "ai-context", "obsidian", "ocr", "transcription", "whisper", "markitdown", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+
+# Core has no Python deps — all heavy lifting is via external CLIs (tesseract, ffmpeg,
+# yt-dlp, mlx_whisper, markitdown, ollama). Install those per the README.
+dependencies = []
+
+[project.optional-dependencies]
+# Lower bounds keep installs flexible. Release builds should use a constraints
+# file or audited lock because parsers and agent-facing tools are supply-chain
+# sensitive.
+markitdown = ["markitdown[all]>=0.1.6,<0.2"]
+# yt-dlp is the easiest Python dep for non-Douyin reels.
+reel = ["yt-dlp>=2024.10.0"]
+# Gradio browser UI (omd-ui). Keep security-sensitive upload/parser
+# transitive dependencies above their first fixed releases.
+ui = [
+    "gradio>=6.20.0,<7",
+    "pillow>=12.3.0,<13",
+    "python-multipart>=0.0.32,<1",
+    "starlette>=1.3.1,<2",
+]
+# Test runner for maintainers and contributors.
+test = ["pytest>=8.0"]
+# Local security audit tooling for maintainers.
+audit = ["pip-audit>=2.10.0"]
+# All-in-one (still needs system tesseract/ffmpeg/mlx_whisper/f2/ollama)
+all = [
+    "markitdown[all]>=0.1.6,<0.2",
+    "yt-dlp>=2024.10.0",
+    "gradio>=6.20.0,<7",
+    "pillow>=12.3.0,<13",
+    "python-multipart>=0.0.32,<1",
+    "starlette>=1.3.1,<2",
+]
+
+[project.scripts]
+omd = "omd.cli:main"
+omd-mcp = "omd.mcp_server:main"
+omd-ui = "omd.ui:main"
+
+[project.urls]
+Homepage = "https://github.com/omd-local/markdown-everything"
+Issues = "https://github.com/omd-local/markdown-everything/issues"
+Changelog = "https://github.com/omd-local/markdown-everything/blob/main/CHANGELOG.md"
+Security = "https://github.com/omd-local/markdown-everything/security/policy"
+
+[tool.setuptools.packages.find]
+include = ["omd*"]
