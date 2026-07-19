@@ -38,17 +38,15 @@ URLs into traceable Markdown that stays in folders you control.
 ## One route from source to context
 
 ```mermaid
-flowchart LR
-    A["FILES<br/>PDF · Office · images · audio"] --> C["OMD.EXE<br/>inspect · route · convert"]
-    B["URLS<br/>web · podcasts · public posts"] --> C
-    C --> D["MARKDOWN<br/>plain local files"]
-    C --> E["OBSIDIAN<br/>vault note + index"]
-    C --> F["AGENTS<br/>MCP + trace manifest"]
+flowchart TB
+    A["INPUT<br/>files · URLs · folders"] --> B["OMD.EXE<br/>inspect · route · convert"]
+    B --> C["TRACEABLE MARKDOWN<br/>plain files + .omd.json"]
+    C --> D["USE YOUR CONTEXT<br/>Obsidian · MCP · AI agents"]
 
-    style C fill:#2451b7,color:#ffffff,stroke:#15171a,stroke-width:2px
-    style D fill:#f2f2f2,color:#15171a,stroke:#15171a
-    style E fill:#f0b429,color:#15171a,stroke:#15171a
-    style F fill:#d9e2f5,color:#15171a,stroke:#15171a
+    style A fill:#f2f2f2,color:#15171a,stroke:#15171a
+    style B fill:#2451b7,color:#ffffff,stroke:#15171a,stroke-width:2px
+    style C fill:#f0b429,color:#15171a,stroke:#15171a
+    style D fill:#d9e2f5,color:#15171a,stroke:#15171a
 ```
 
 <table>
