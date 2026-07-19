@@ -35,47 +35,19 @@ URLs into traceable Markdown that stays in folders you control.
   Private files, cookies, vault writes, media transcription, and local models belong in the local app.
 </p>
 
-## One route from source to context
+## How conversion stays recoverable
 
-```mermaid
-flowchart TB
-    A["INPUT<br/>files · URLs · folders"] --> B["OMD.EXE<br/>inspect · route · convert"]
-    B --> C["TRACEABLE MARKDOWN<br/>plain files + .omd.json"]
-    C --> D["USE YOUR CONTEXT<br/>Obsidian · MCP · AI agents"]
+<p align="center">
+  <a href="docs/assets/omd-context-pipeline.png">
+    <picture>
+      <source media="(max-width: 600px)" srcset="docs/assets/omd-context-pipeline-mobile.png">
+      <img src="docs/assets/omd-context-pipeline.png" alt="OMD source-to-context pipeline: inspect each source, select a document, web, or media adapter, normalise to Markdown, optionally run a model with raw-content fallback, and save a Markdown note plus a traceable OMD sidecar" width="640">
+    </picture>
+  </a>
+</p>
 
-    style A fill:#f2f2f2,color:#15171a,stroke:#15171a
-    style B fill:#2451b7,color:#ffffff,stroke:#15171a,stroke-width:2px
-    style C fill:#f0b429,color:#15171a,stroke:#15171a
-    style D fill:#d9e2f5,color:#15171a,stroke:#15171a
-```
-
-<table>
-  <tr>
-    <td valign="top">
-      <strong>01 // ADD SOURCE</strong><br><br>
-      Paste URLs, share text, or local paths. Add up to five documents, images,
-      or audio files in the desktop UI.
-    </td>
-  </tr>
-  <tr>
-    <td valign="top">
-      <strong>02 // ROUTE LOCALLY</strong><br><br>
-      OMD selects document parsing, web extraction, OCR, or transcription and
-      shows source readiness before expensive work.
-    </td>
-  </tr>
-  <tr>
-    <td valign="top">
-      <strong>03 // KEEP CONTEXT</strong><br><br>
-      Save a Markdown file or write an Obsidian-compatible vault note with a
-      traceable <code>.omd.json</code> sidecar.
-    </td>
-  </tr>
-</table>
-
-Core conversion does **not** require an LLM. Optional Markdown polish, transcript
-cleanup, and memory cards use an explicitly installed local Ollama model. If an
-optional model step fails, OMD keeps the raw Markdown.
+Core conversion never depends on AI. Optional model work is isolated, so a
+missing model or failed call leaves the raw Markdown intact.
 
 ## Quick start
 
