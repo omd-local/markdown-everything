@@ -12,8 +12,8 @@
 
 [Install](#install-on-macos) ·
 [Start](#start-here) ·
+[Live demo](https://shionshine-omd-public-demo.hf.space) ·
 [Walkthrough](#walkthrough) ·
-[Hosted demo template](#hosted-demo-template) ·
 [Vault capture](#capture-to-a-local-ai-memory-vault) ·
 [Sources](#supported-sources) ·
 [Usage](#usage) ·
@@ -30,6 +30,10 @@
 `omd` is a local-first AI context inbox. It routes messy source material to the right local converter, writes structured Markdown plus sidecar manifests, and can save captures into an Obsidian-compatible vault that Claude Code, Cursor, Codex, and other tools can read as plain files.
 
 Core conversion does not require an LLM. Optional cleanup, transcript polish, and memory cards use local Ollama when you ask for them; OMD sizes its default text-model recommendation to local memory (`qwen3:4b-instruct` on a 16 GB machine). No mandatory cloud upload is part of the CLI workflow.
+
+**Try it online:** [Open the public demo](https://shionshine-omd-public-demo.hf.space)
+with a public webpage or non-sensitive document. Use the local app for private
+files, cookies, vault writes, media transcription, and local-model workflows.
 
 ## Walkthrough
 
@@ -95,16 +99,6 @@ still contacts the source website.
 
 Open [Usage](#usage) for detailed CLI examples. For sources that may need login
 state, run `inspect` first and use only content you have the right to process.
-
-## Hosted demo template
-
-A limited Hugging Face Spaces template is included under
-[`demo/huggingface-space`](demo/huggingface-space). It supports public webpages
-and non-sensitive document uploads, but it is not linked to a maintainer's
-personal account. Deploy it under an organisation-owned Space and pass the
-target `SPACE_ID` explicitly. Use the local UI for private files, cookies,
-vault writes, media transcription, and local-model calls; those capabilities
-are deliberately disabled in the hosted sample.
 
 ## Capture to a local AI memory vault
 

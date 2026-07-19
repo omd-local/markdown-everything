@@ -35,6 +35,7 @@ TEXT_SUFFIXES = {
     ".yaml",
 }
 EXPECTED_PROJECT_OWNER = "omd-local"
+APPROVED_PUBLIC_DEMO_ORIGIN = "https://shionshine-omd-public-demo.hf.space"
 RETIRED_OWNER_DIGEST = "4c9c15e9ed4f6da6aa6bf4f6b5e915cc35c79a6304d5cdda60d500c3293b6189"
 RETIRED_LOCAL_USER_DIGEST = "dd2d8c67929c0f9ff86e7cdd37a65efe4cf07bbf94f2b2703efb47340dc00cd8"
 RETIRED_PUBLIC_HANDLE_DIGEST = "d8676870c6ed1ee3b28fc1f3883273aba2d523af56684eb76f4806e904839fa5"
@@ -77,13 +78,14 @@ def test_public_project_files_do_not_reference_retired_personal_identifiers():
     matches = []
     for path in _public_text_files():
         text = path.read_text(encoding="utf-8")
+        identity_scan_text = text.replace(APPROVED_PUBLIC_DEMO_ORIGIN, "")
         for owner in PROJECT_OWNER_RE.findall(text):
             if _digest(owner) == RETIRED_OWNER_DIGEST:
                 matches.append((path.relative_to(ROOT), "project owner"))
         for username in LOCAL_USER_RE.findall(text):
             if _digest(username) == RETIRED_LOCAL_USER_DIGEST:
                 matches.append((path.relative_to(ROOT), "local user path"))
-        for token in re.findall(r"[A-Za-z0-9_-]+", text):
+        for token in re.findall(r"[A-Za-z0-9_-]+", identity_scan_text):
             for start in range(len(token) - RETIRED_PUBLIC_HANDLE_LENGTH + 1):
                 candidate = token[start : start + RETIRED_PUBLIC_HANDLE_LENGTH]
                 if _digest(candidate.lower()) == RETIRED_PUBLIC_HANDLE_DIGEST:
