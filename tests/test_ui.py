@@ -2203,6 +2203,7 @@ def test_local_model_status_reports_missing_and_installed_models(monkeypatch):
         def read(self):
             return b'{"models":[{"name":"qwen3:4b-instruct"}]}'
 
+    monkeypatch.setenv("OMD_SYSTEM_MEMORY_GB", "16")
     monkeypatch.setattr(ui.urllib.request, "urlopen", lambda *_a, **_kw: FakeResponse())
 
     ready = ui._local_model_status_html(
