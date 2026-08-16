@@ -61,6 +61,12 @@ Choose **Markdown file** for a normal export or **Capture to vault note** for an
 Obsidian folder. An Obsidian vault is just a local folder; OMD does not require
 an Obsidian plugin or account.
 
+For quick personal thoughts and exact highlights, open **Inbox / review**. The
+screen follows three steps: save the text, review the unchanged original, then
+choose **Create note in Notes** or **Mark as not needed**. Creating a note makes
+a traceable derivative under `Notes/`; either choice leaves the original under
+`Inbox/`. Saving and reviewing do not call AI.
+
 The custom Homebrew tap includes the project organisation in the command.
 `omd-local` is the project owner, not a personal account. The beta installs the
 CLI, MCP server, local browser UI, common document converters, and `yt-dlp`.
@@ -93,6 +99,27 @@ ollama pull qwen3:4b-instruct
 
 Keep the UI host at `http://localhost:11434` for fully local model calls. Core
 conversion still works when Ollama is absent or stopped.
+
+### Optional AI draft for one Inbox item
+
+Inbox review can optionally ask local Ollama to draft a takeaway, quote exact
+evidence, and suggest tags. It reads the Inbox original by default. You may
+instead explicitly select one read-only Markdown file from the unified vault
+source list; OMD then uses only that file and can add its vault-relative
+`[[wikilink]]` to the derived note. It never opens a URL or reads an unselected
+file. Results without exact evidence are rejected, and the draft is not included
+in a note unless you choose it.
+
+You can instead send the selected text directly to the **OpenAI API**,
+**Anthropic API**, or **DeepSeek API** using your own developer API key. Cloud
+providers show a one-request preview and consent action with the exact provider,
+model, destination, content size, and current policy link. This is never required
+for capture or conversion; OMD does not use consumer ChatGPT/Claude login
+sessions, route through OpenRouter, or silently fall back to another provider.
+UI credentials use macOS Keychain when available or remain session-only. OMD
+checks a conservative request budget before reading the credential or contacting
+the provider; an oversized Inbox item is left unchanged and must be split rather
+than being silently truncated.
 
 ### Optional transcription and OCR
 
@@ -184,7 +211,8 @@ tags, `[[links]]`, and evidence-oriented cards above the preserved
 `## Full Content`. Review all generated content before relying on it.
 
 Read the [Obsidian guide](docs/obsidian.md) and
-[memory cards guide](docs/memory-cards-user-guide.md).
+[memory cards guide](docs/memory-cards-user-guide.md). The optional provider
+boundary is documented in the [privacy model](docs/privacy.md).
 
 </details>
 
@@ -201,7 +229,19 @@ omd capture ~/Downloads/sources/ --vault ~/Obsidian/AI-Memory --batch
 
 # Quiet deterministic output for agent-facing runs
 omd --agent-safe report.pdf -o report.md
+
+# Read-only vault-aware note enrichment proposal
+omd enrich-note Inbox/example.md --vault ~/Obsidian/AI-Memory --json-events
+omd enrich-note --request-json - --json-events < request.json
+omd capabilities --json
 ```
+
+`enrich-note` returns a validated proposal on stdout and never edits the vault.
+The complete v1 stdin/response/event contract is documented in the
+[enrich-note contract](docs/enrich-note-contract-v1.md). Obsidian plugin authors
+should also follow the [plugin integration guide](docs/obsidian-plugin-integration.md)
+for capability negotiation, subprocess isolation, response validation, and the
+hash-checked Vault API write boundary.
 
 `omd-mcp` exposes four tools:
 
@@ -294,6 +334,10 @@ Ollama. See the [privacy model](docs/privacy.md) and
 | [Examples](examples/README.md) | Copy-ready conversion, capture, inspect, batch, and polish commands |
 | [Obsidian vault capture](docs/obsidian.md) | Folder layout, sidecars, indexes, and repeated captures |
 | [Memory cards guide](docs/memory-cards-user-guide.md) | Local model setup and generated note sections |
+| [`enrich-note` contract v1](docs/enrich-note-contract-v1.md) | Proposal-only CLI/stdin integration, limits, errors, and trust boundary |
+| [Obsidian plugin integration](docs/obsidian-plugin-integration.md) | Safe capability negotiation, managed subprocess use, and apply ownership |
+| [OMD Home Phase 2 gap plan](docs/obsidian-plugin-phase2-gap-plan.md) | Remaining capability, validator, review/apply, and deployment gates |
+| [Obsidian plugin UX acceptance (中文)](docs/obsidian-plugin-ux-acceptance-guide.zh-CN.md) | Additional acceptance tasks for proposal review, apply, conflicts, and cancellation |
 | [Privacy model](docs/privacy.md) | What stays local and when network access is used |
 | [Positioning](docs/positioning.md) | Product scope and what OMD is not |
 | [Changelog](CHANGELOG.md) | Release history and current beta changes |

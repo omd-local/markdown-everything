@@ -40,13 +40,41 @@ secrets.json
 
 # Test outputs
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
 .coverage
 htmlcov/
 douyin_videos.db
 douyin_users.db
+*.db
+*.sqlite
+*.sqlite3
 
 # Runtime logs (f2, etc.)
 logs/
 *.log
 .gstack/
 strix_runs/
+
+# Local agent/session state
+.omx/
+.codex/
+.claude/
+
+# Additional local credentials and signing material
+.env.*
+*.env.*
+!.env.example
+!.env.sample
+*cookie*.json
+credentials.json
+*_credentials.json
+*.pem
+*.p8
+*.key
+*.p12
+*.pfx
+*.mobileprovision

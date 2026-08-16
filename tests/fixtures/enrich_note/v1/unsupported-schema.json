@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "request_id": "unsupported-1",
+  "action": "enrich_note_preview",
+  "vault_path": "/vault",
+  "note": {
+    "path": "Inbox/example.md",
+    "content": "example",
+    "content_sha256": "50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c"
+  },
+  "candidates": [],
+  "vault_tags": [],
+  "model": "qwen3:4b-instruct",
+  "host": "http://localhost:11434"
+}

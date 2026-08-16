@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import hashlib
-import os
+import io
 import json
+import os
 import sys
 import threading
 import time
@@ -12,6 +13,259 @@ from pathlib import Path
 import pytest
 
 from omd import cli
+from omd._models import GIB
+
+
+def test_root_help_lists_discoverable_commands(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "Commands:" in captured.out
+    assert "omd doctor" in captured.out
+    assert "vault Sources tree" in captured.out
+    assert "vault Inbox" not in captured.out
+    assert "omd capabilities --json" in captured.out
+    assert "omd enrich-note" in captured.out
+    assert "omd-ui --help" in captured.out
+    assert captured.err == ""
+
+
+def test_capabilities_command_emits_exact_static_json(capsys):
+    assert cli.main(["capabilities", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == '{"enrich_note":{"schema_versions":[1],"supported":true}}\n'
+    assert captured.err == ""
+
+
+def test_enrich_note_request_mode_keeps_success_json_on_stdout(monkeypatch, capsys, tmp_path):
+    import omd.enrich_note as enrich_note
+
+    content = "sensitive note body"
+    note = tmp_path / "Inbox" / "example.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(content, encoding="utf-8")
+    request_payload = {
+        "schema_version": 1,
+        "request_id": "cli-request-1",
+        "action": "enrich_note_preview",
+        "vault_path": str(tmp_path),
+        "note": {
+            "path": "Inbox/example.md",
+            "content": content,
+            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        },
+        "candidates": [],
+        "vault_tags": [],
+        "model": "qwen3:4b-instruct",
+        "host": "http://localhost:11434",
+    }
+
+    def run(request, **kwargs):
+        from omd import _events
+
+        for stage_id in ("catalog", "retrieve", "generate", "validate"):
+            _events.stage(stage_id.title(), stage_id=stage_id)
+        return {
+            "schema_version": 1,
+            "request_id": request.request_id,
+            "action": "enrich_note_preview",
+            "note": {
+                "path": request.note.path,
+                "content_sha256": request.note.content_sha256,
+            },
+            "proposal": {
+                "summary": "summary",
+                "existing_links": [],
+                "new_concepts": [],
+                "existing_tags": [],
+                "new_tags": [],
+            },
+            "warnings": [],
+            "generation": {
+                "provider": "ollama",
+                "model": request.model,
+                "endpoint_class": "local_loopback",
+            },
+        }
+
+    monkeypatch.setattr(enrich_note, "run_enrich_note", run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request_payload)))
+
+    assert cli.main(["enrich-note", "--request-json", "-", "--json-events"]) == 0
+
+    captured = capsys.readouterr()
+    response = json.loads(captured.out)
+    events = _parse_events(captured.err)
+    assert response["request_id"] == "cli-request-1"
+    assert [event.get("stage_id") for event in events[:-1]] == [
+        "catalog",
+        "retrieve",
+        "generate",
+        "validate",
+    ]
+    assert events[-1]["event"] == "done"
+    assert events[-1]["request_id"] == "cli-request-1"
+    assert content not in captured.err
+
+
+def test_enrich_note_failure_has_empty_stdout_and_terminal_error(monkeypatch, capsys):
+    import omd.enrich_note as enrich_note
+
+    content = "private body"
+    request_payload = {
+        "schema_version": 1,
+        "request_id": "cli-request-2",
+        "action": "enrich_note_preview",
+        "vault_path": "/missing-vault",
+        "note": {
+            "path": "Inbox/example.md",
+            "content": content,
+            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        },
+        "candidates": [],
+        "vault_tags": [],
+        "model": "qwen3:4b-instruct",
+        "host": "http://localhost:11434",
+    }
+
+    def fail(request, **kwargs):
+        raise enrich_note.EnrichNoteError(
+            "generation_timeout", "Ollama generation timed out", request_id=request.request_id
+        )
+
+    monkeypatch.setattr(enrich_note, "run_enrich_note", fail)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request_payload)))
+
+    assert cli.main(["enrich-note", "--request-json", "-", "--json-events"]) == 1
+
+    captured = capsys.readouterr()
+    events = _parse_events(captured.err)
+    assert captured.out == ""
+    assert events[-1]["event"] == "error"
+    assert events[-1]["kind"] == "generation_timeout"
+    assert events[-1]["request_id"] == "cli-request-2"
+    assert content not in captured.err
+
+
+def test_enrich_note_request_mode_rejects_cli_contract_overrides(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+
+    assert cli.main(
+        ["enrich-note", "note.md", "--request-json", "-", "--vault", "/tmp", "--json-events"]
+    ) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    events = _parse_events(captured.err)
+    assert events[-1]["kind"] == "invalid_request"
+
+
+def test_enrich_note_human_usage_error_gives_copyable_next_step_and_safety_state(capsys):
+    assert cli.main(["enrich-note"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error: standalone mode requires a note and --vault" in captured.err
+    assert "omd enrich-note NOTE.md --vault /path/to/vault" in captured.err
+    assert "omd enrich-note --help" in captured.err
+    assert "no vault files were changed" in captured.err
+    assert "only returns a proposal" in captured.err
+
+
+def test_enrich_note_missing_note_explains_safe_path_and_preserved_data(capsys, tmp_path):
+    assert cli.main(
+        ["enrich-note", "Inbox/missing.md", "--vault", str(tmp_path)]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error:" in captured.err
+    assert "safely read" in captured.err
+    assert "cause:" in captured.err
+    assert "--vault" in captured.err
+    assert "NOTE.md is relative to it" in captured.err
+    assert "no vault files were changed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected_command"),
+    [
+        (
+            "ollama_unavailable",
+            "Ollama is unavailable for this request",
+            "ollama serve",
+        ),
+        (
+            "model_not_installed",
+            "the selected Ollama model is not installed",
+            "ollama pull qwen3:test",
+        ),
+    ],
+)
+def test_enrich_note_human_ollama_error_explains_recovery_and_preserved_data(
+    code, message, expected_command, monkeypatch, capsys, tmp_path
+):
+    import omd.enrich_note as enrich_note
+
+    note = tmp_path / "Inbox" / "example.md"
+    note.parent.mkdir()
+    note.write_text("# Test\n", encoding="utf-8")
+
+    def fail(request, **kwargs):
+        raise enrich_note.EnrichNoteError(code, message, request_id=request.request_id)
+
+    monkeypatch.setattr(enrich_note, "run_enrich_note", fail)
+
+    assert cli.main(
+        [
+            "enrich-note",
+            "Inbox/example.md",
+            "--vault",
+            str(tmp_path),
+            "--model",
+            "qwen3:test",
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"error: {message}" in captured.err
+    assert "cause:" in captured.err
+    assert expected_command in captured.err
+    if code == "model_not_installed":
+        assert "ollama list" in captured.err
+        assert "--model INSTALLED_MODEL" in captured.err
+    assert "no vault files were changed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_enrich_note_json_error_does_not_add_human_recovery_lines(capsys):
+    assert cli.main(["enrich-note", "--json-events"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    events = _parse_events(captured.err)
+    assert len(events) == 1
+    assert events[0]["kind"] == "invalid_request"
+    assert "next:" not in captured.err
+    assert "preserved:" not in captured.err
+
+
+@pytest.mark.parametrize("abbreviation", ["cap", "capabil", "enrich", "enrich-not"])
+def test_protocol_command_abbreviations_do_not_fall_through_to_conversion(
+    abbreviation, capsys
+):
+    assert cli.main([abbreviation, "--json-events"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    events = _parse_events(captured.err)
+    assert events[-1]["event"] == "error"
+    assert events[-1]["kind"] == "invalid_request"
 
 
 def test_is_url():
@@ -692,6 +946,62 @@ def test_podcast_feed_parser_extracts_enclosure():
     assert it["duration"] == "00:30:00"
 
 
+def test_podcast_feed_parser_rejects_dtd_or_entity_declarations():
+    from omd import podcast
+
+    xml = b"""<?xml version="1.0"?>
+    <!DOCTYPE rss [<!ENTITY injected "unexpected">]>
+    <rss><channel><item><title>&injected;</title></item></channel></rss>"""
+
+    with pytest.raises(ValueError, match="DTD or entity"):
+        podcast.parse_feed(xml)
+
+
+def test_podcast_http_get_rejects_metadata_above_explicit_limit(monkeypatch):
+    from omd import podcast
+
+    class Response:
+        headers = {"Content-Length": "5"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, size=-1):
+            return b"12345"
+
+    monkeypatch.setattr(podcast.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(ValueError, match="4-byte limit"):
+        podcast.http_get("https://example.com/feed.xml", max_bytes=4)
+
+
+def test_podcast_http_get_rejects_non_http_feed_before_open(monkeypatch):
+    from omd import podcast
+
+    def fail_open(*_args, **_kwargs):
+        raise AssertionError("non-HTTP feed must be rejected before opening")
+
+    monkeypatch.setattr(podcast.urllib.request, "urlopen", fail_open)
+
+    with pytest.raises(ValueError, match=r"HTTP\(S\)"):
+        podcast.http_get("file:///etc/passwd")
+
+
+def test_podcast_download_rejects_non_http_audio_before_open(tmp_path, monkeypatch):
+    from omd import podcast
+
+    def fail_open(*_args, **_kwargs):
+        raise AssertionError("non-HTTP audio must be rejected before opening")
+
+    monkeypatch.setattr(podcast.urllib.request, "urlopen", fail_open)
+
+    with pytest.raises(ValueError, match=r"HTTP\(S\)"):
+        podcast.download_to("file:///etc/passwd", tmp_path / "audio.mp3")
+
+
 def test_podcast_html_to_text_strips_tags():
     from omd import podcast
     assert podcast.html_to_text("<p>Hi <b>there</b></p>") == "Hi there"
@@ -917,6 +1227,243 @@ def test_events_emit_stage_progress_done(capsys):
     assert d["event"] == "done" and d["output"] == "/tmp/out.md"
 
 
+def test_events_add_structured_work_v2_without_breaking_v1_fields(capsys):
+    from omd import _events
+
+    _events.configure(True)
+    _events.progress(
+        "Download",
+        512,
+        1024,
+        2.5,
+        stage_id="download",
+        unit="bytes",
+        item_index=1,
+        item_total=2,
+    )
+    event = _parse_events(capsys.readouterr().err)[0]
+    _events.configure(False)
+
+    assert event["v"] == 1
+    assert event["cur"] == 512
+    assert event["work_v"] == 2
+    assert event["stage_id"] == "download"
+    assert event["state"] == "determinate"
+    assert event["unit"] == "bytes"
+    assert event["completed"] == 512
+    assert event["item_index"] == 1
+    assert event["item_total"] == 2
+
+
+def test_events_attach_process_peak_memory_to_work_v2(capsys, monkeypatch):
+    from omd import _events
+
+    monkeypatch.setattr(_events, "process_peak_memory_bytes", lambda: 123456)
+    _events.configure(True)
+    _events.stage_state("convert", "completed", elapsed_s=1.25, unit="bytes", completed=20)
+    event = _parse_events(capsys.readouterr().err)[0]
+    _events.configure(False)
+
+    assert event["work_v"] == 2
+    assert event["peak_memory_bytes"] == 123456
+
+
+def test_events_inherit_thread_local_batch_item_context(capsys):
+    from omd import _events
+
+    _events.configure(True)
+    with _events.item_context(index=2, total=5, attempt=3):
+        _events.stage("convert")
+        _events.progress("Convert", 1, 2, 1.0)
+        _events.stage_state("convert", "completed", elapsed_s=2.0, unit="items", completed=1, total=1)
+    events = _parse_events(capsys.readouterr().err)
+    _events.configure(False)
+
+    assert len(events) == 3
+    assert all(event["item_index"] == 2 for event in events)
+    assert all(event["item_total"] == 5 for event in events)
+    assert all(event["attempt"] == 3 for event in events)
+
+
+def test_copy_with_progress_emits_byte_units_in_events_mode(capsys):
+    import io
+    from omd import _events, _progress
+
+    _events.configure(True)
+    _progress.configure()
+    source = io.BytesIO(b"abcdefgh")
+    destination = io.BytesIO()
+
+    written = _progress.copy_with_progress(source, destination, "Download", 8, chunk=2)
+    events = _parse_events(capsys.readouterr().err)
+    _events.configure(False)
+
+    assert written == 8
+    assert destination.getvalue() == b"abcdefgh"
+    progress = [event for event in events if event["event"] == "progress"]
+    assert progress[-1]["unit"] == "bytes"
+    assert progress[-1]["completed"] == 8
+    assert progress[-1]["total"] == 8
+
+
+def test_image_ocr_emits_real_pixel_work_units(tmp_path, monkeypatch, capsys):
+    from PIL import Image
+    from omd import _events, _progress, cli
+
+    source = tmp_path / "scan.png"
+    output = tmp_path / "scan.md"
+    Image.new("RGB", (4, 3), color="white").save(source)
+    monkeypatch.setattr(cli, "require", lambda _name: "tesseract")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: cli.subprocess.CompletedProcess(args[0], 0, "text", ""),
+    )
+    _events.configure(True)
+    _progress.configure()
+    try:
+        assert cli.route_image(source, output, "eng") == 0
+        events = _parse_events(capsys.readouterr().err)
+    finally:
+        _events.configure(False)
+
+    work = [event for event in events if event.get("stage_id") == "ocr"]
+    assert work[0]["unit"] == "pixels"
+    assert work[0]["completed"] == 0
+    assert work[0]["total"] == 12
+    assert work[-1]["state"] == "completed"
+    assert work[-1]["completed"] == 12
+
+
+def test_local_file_conversion_emits_real_byte_work_units(tmp_path, monkeypatch, capsys):
+    from omd import _events, _progress, cli
+
+    source = tmp_path / "note.html"
+    output = tmp_path / "note.md"
+    source.write_bytes(b"<h1>Hello</h1>")
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/fake/markitdown")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: cli.subprocess.CompletedProcess(args[0], 0, "# Hello\n", ""),
+    )
+    _events.configure(True)
+    _progress.configure()
+    try:
+        assert cli.route_markitdown(str(source), output) == 0
+        events = _parse_events(capsys.readouterr().err)
+    finally:
+        _events.configure(False)
+
+    work = [event for event in events if event.get("stage_id") == "convert"]
+    assert work[0]["unit"] == "bytes"
+    assert work[0]["completed"] == 0
+    assert work[0]["total"] == source.stat().st_size
+    assert work[-1]["state"] == "completed"
+    assert work[-1]["completed"] == source.stat().st_size
+
+
+def test_url_conversion_to_stdout_emits_completed_stage(monkeypatch, capsys):
+    from omd import _events, _progress, cli
+
+    monkeypatch.delenv("OMD_NETWORK_POLICY", raising=False)
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/fake/markitdown")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: cli.subprocess.CompletedProcess(args[0], 0, "# Hello\n", ""),
+    )
+    _events.configure(True)
+    _progress.configure()
+    try:
+        assert cli.route_markitdown("https://example.com/article", None) == 0
+        events = _parse_events(capsys.readouterr().err)
+    finally:
+        _events.configure(False)
+
+    terminal = [
+        event
+        for event in events
+        if event.get("stage_id") == "convert" and event.get("state") in {"completed", "failed"}
+    ]
+    assert [event["state"] for event in terminal] == ["completed"]
+
+
+def test_public_policy_url_conversion_emits_terminal_stage(monkeypatch, capsys):
+    from omd import _events, _progress, cli
+
+    monkeypatch.setenv("OMD_NETWORK_POLICY", "public")
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/fake/markitdown")
+    monkeypatch.setattr(cli, "_route_public_web_url", lambda *_args: 0)
+    _events.configure(True)
+    _progress.configure()
+    try:
+        assert cli.route_markitdown("https://example.com/article", None) == 0
+        events = _parse_events(capsys.readouterr().err)
+    finally:
+        _events.configure(False)
+
+    terminal = [
+        event
+        for event in events
+        if event.get("stage_id") == "convert" and event.get("state") in {"completed", "failed"}
+    ]
+    assert [event["state"] for event in terminal] == ["completed"]
+
+
+def test_url_fallback_failure_emits_failed_stage(monkeypatch, capsys):
+    from omd import _events, _progress, cli
+    from omd.web_article import WebFallbackUnavailable
+
+    monkeypatch.delenv("OMD_NETWORK_POLICY", raising=False)
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/fake/markitdown")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: cli.subprocess.CompletedProcess(args[0], 1, "", "HTTP 403"),
+    )
+
+    def fail_fallback(_url):
+        raise WebFallbackUnavailable("blocked")
+
+    monkeypatch.setattr("omd.web_article.fetch_public_fallback", fail_fallback)
+    _events.configure(True)
+    _progress.configure()
+    try:
+        assert cli.route_markitdown("https://example.com/article", None) == 1
+        events = _parse_events(capsys.readouterr().err)
+    finally:
+        _events.configure(False)
+
+    terminal = [
+        event
+        for event in events
+        if event.get("stage_id") == "convert" and event.get("state") in {"completed", "failed"}
+    ]
+    assert [event["state"] for event in terminal] == ["failed"]
+
+
+def test_markdown_polish_progress_uses_estimated_token_units(capsys):
+    from omd import _events, _polish_md, _progress
+
+    _events.configure(True)
+    _progress.configure()
+    try:
+        result = _polish_md.polish_markdown(
+            "# Note\n\n## Body\n\nA short source paragraph.\n",
+            _polish_fn=lambda chunk, _model, _host: chunk,
+        )
+        events = _parse_events(capsys.readouterr().err)
+    finally:
+        _events.configure(False)
+
+    assert result.startswith("# Note")
+    progress = [event for event in events if event.get("stage_id") == "polish"]
+    assert progress
+    assert all(event["unit"] == "tokens" for event in progress)
+    assert progress[-1]["completed"] == progress[-1]["total"]
+
+
 def test_events_done_with_none_output(capsys):
     from omd import _events
     _events.configure(True)
@@ -926,6 +1473,19 @@ def test_events_done_with_none_output(capsys):
     assert len(events) == 1
     assert events[0]["event"] == "done"
     assert events[0]["output"] is None
+
+
+def test_events_done_and_error_allow_additive_request_id(capsys):
+    from omd import _events
+
+    _events.configure(True)
+    _events.done(None, request_id="request-1")
+    _events.error("invalid_request", "request rejected", request_id="request-1")
+    events = _parse_events(capsys.readouterr().err)
+    _events.configure(False)
+
+    assert events[0]["request_id"] == "request-1"
+    assert events[1]["request_id"] == "request-1"
 
 
 def test_events_warn_and_error(capsys):
@@ -1750,6 +2310,85 @@ def test_cli_batch_uses_list_file_and_partial_failure(tmp_path, monkeypatch):
     assert (out_dir / "ok.md").exists()
 
 
+def test_cli_batch_uses_machine_bounded_workers_by_default(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from omd import cli
+
+    items = tmp_path / "urls.txt"
+    items.write_text("one\n", encoding="utf-8")
+    captured = {}
+
+    def fake_run_batch(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(exit_code=0)
+
+    monkeypatch.setattr("omd.batch.run_batch", fake_run_batch)
+    monkeypatch.setattr(cli, "detect_total_memory_bytes", lambda: 32 * GIB)
+
+    assert cli.main(["batch", str(items), "-o", str(tmp_path / "out")]) == 0
+    assert captured["lane_limits"].global_workers == 3
+    assert captured["lane_limits"].asr == 1
+    assert captured["lane_limits"].model == 1
+
+
+def test_cli_batch_keeps_sixteen_gib_machine_sequential_by_default(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from omd import cli
+
+    items = tmp_path / "urls.txt"
+    items.write_text("one\n", encoding="utf-8")
+    captured = {}
+
+    def fake_run_batch(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(exit_code=0)
+
+    monkeypatch.setattr("omd.batch.run_batch", fake_run_batch)
+    monkeypatch.setattr(cli, "detect_total_memory_bytes", lambda: 16 * GIB)
+
+    assert cli.main(["batch", str(items), "-o", str(tmp_path / "out")]) == 0
+    assert captured["lane_limits"].global_workers == 1
+
+
+def test_cli_batch_accepts_roomy_machine_worker_override(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from omd import cli
+
+    items = tmp_path / "urls.txt"
+    items.write_text("one\n", encoding="utf-8")
+    captured = {}
+
+    def fake_run_batch(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(exit_code=0)
+
+    monkeypatch.setattr("omd.batch.run_batch", fake_run_batch)
+    monkeypatch.setattr(cli, "detect_total_memory_bytes", lambda: 32 * GIB)
+
+    assert cli.main(
+        ["batch", str(items), "-o", str(tmp_path / "out"), "--batch-workers", "2"]
+    ) == 0
+    assert captured["lane_limits"].global_workers == 2
+    assert captured["lane_limits"].asr == 1
+    assert captured["lane_limits"].model == 1
+
+
+def test_cli_batch_rejects_worker_override_above_machine_limit(tmp_path, monkeypatch):
+    from omd import cli
+
+    items = tmp_path / "urls.txt"
+    items.write_text("one\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "detect_total_memory_bytes", lambda: 16 * GIB)
+
+    with pytest.raises(SystemExit, match="cannot exceed the machine-aware limit"):
+        cli.main(
+            ["batch", str(items), "-o", str(tmp_path / "out"), "--batch-workers", "2"]
+        )
+
+
 def test_cli_batch_fails_when_list_has_no_items(tmp_path, monkeypatch):
     from omd import cli
 
@@ -1858,11 +2497,21 @@ def test_cli_batch_polish_md_polishes_successful_items(tmp_path, monkeypatch):
         output.write_text(f"{target}\n", encoding="utf-8")
         return 0
 
-    def fake_polish_file(path, *, model, host, force=False, keep_raw=False, _polish_fn=None):
+    def fake_polish_file(
+        path,
+        *,
+        model,
+        host,
+        force=False,
+        keep_raw=False,
+        allow_remote=False,
+        _polish_fn=None,
+    ):
         polished["path"] = Path(path)
         polished["model"] = model
         polished["host"] = host
         polished["keep_raw"] = keep_raw
+        polished["allow_remote"] = allow_remote
 
     monkeypatch.setattr(cli, "route_one", fake_route_one)
     monkeypatch.setattr(_polish_md, "polish_file", fake_polish_file)
@@ -1882,6 +2531,7 @@ def test_cli_batch_polish_md_polishes_successful_items(tmp_path, monkeypatch):
         "model": "gemma3:4b",
         "host": "https://models.example.com",
         "keep_raw": True,
+        "allow_remote": True,
     }
 
 
@@ -2661,22 +3311,12 @@ def test_reel_polish_prompt_defaults_to_english_and_preserves_source_language(mo
 
     captured: dict[str, str] = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return b'{"response":"Hello world."}'
-
-    def fake_urlopen(request, timeout):  # noqa: ANN001
+    def fake_request(request, *, timeout):  # noqa: ANN001
         captured["body"] = request.data.decode("utf-8")
         captured["timeout"] = str(timeout)
-        return FakeResponse()
+        return {"response": "Hello world."}
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(reel, "request_ollama_json", fake_request)
 
     assert reel._polish_chunk("hello world", "qwen3:4b", "http://localhost:11434") == "Hello world."
     prompt = json.loads(captured["body"])["prompt"]
@@ -2691,22 +3331,12 @@ def test_reel_polish_chunk_uses_bounded_output_budget_context_and_timeout(monkey
 
     captured: dict[str, object] = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return b'{"response":"Hello world.","done_reason":"stop"}'
-
-    def fake_urlopen(request, timeout):
+    def fake_request(request, *, timeout):
         captured["body"] = json.loads(request.data)
         captured["timeout"] = timeout
-        return FakeResponse()
+        return {"response": "Hello world.", "done_reason": "stop"}
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(reel, "request_ollama_json", fake_request)
 
     assert reel._polish_chunk("hello  world .", "qwen3:4b-instruct", "http://localhost:11434") == "Hello world."
     options = captured["body"]["options"]
@@ -2730,6 +3360,47 @@ def test_polish_transcript_skips_known_incompatible_model_without_llm_call(monke
     assert output == "Keep this raw."
     assert calls == []
     assert "thinking-only" in capsys.readouterr().err
+
+
+def test_polish_transcript_rejects_remote_host_without_explicit_opt_in(monkeypatch):
+    from omd import reel
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        reel,
+        "_polish_chunk",
+        lambda text, *_args: calls.append(text) or text,
+    )
+
+    with pytest.raises(ValueError, match="explicit opt-in"):
+        reel.polish_transcript(
+            "Private transcript.",
+            "qwen3:4b-instruct",
+            "https://models.example.com",
+        )
+
+    assert calls == []
+
+
+def test_polish_transcript_allows_https_remote_host_after_explicit_opt_in(monkeypatch):
+    from omd import reel
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        reel,
+        "_polish_chunk",
+        lambda text, *_args: calls.append(text) or text,
+    )
+
+    output = reel.polish_transcript(
+        "Private transcript.",
+        "qwen3:4b-instruct",
+        "https://models.example.com",
+        allow_remote=True,
+    )
+
+    assert output == "Private transcript."
+    assert calls == ["Private transcript."]
 
 
 def test_polish_transcript_stops_after_first_chunk_timeout(monkeypatch, capsys):
@@ -3133,6 +3804,56 @@ def test_polish_md_skips_code_blocks(tmp_path):
     assert "DEF HELLO():" not in out
 
 
+def test_polish_md_preserves_blank_lines_around_fenced_code():
+    from omd import _polish_md
+
+    md = (
+        "## Notes\n\n"
+        "before code\n\n"
+        "```text\n"
+        "0%| | [00:00<?, ?B/s]\n"
+        "```\n\n"
+        "after code\n"
+    )
+
+    def strip_like_local_model(chunk, _model, _host):
+        return chunk.strip().upper()
+
+    out = _polish_md.polish_markdown(md, _polish_fn=strip_like_local_model)
+
+    assert out.startswith("## Notes\n\nBEFORE CODE")
+    assert "BEFORE CODE\n\n```text" in out
+    assert "```\n\nAFTER CODE\n" in out
+
+
+def test_polish_md_preserves_long_chunk_boundaries_around_fenced_code():
+    """Chunking must not glue prose labels or tables to fenced code."""
+    from omd import _polish_md
+
+    before = "".join(f"Before paragraph {i}.\n\n" for i in range(100))
+    after = "".join(f"After paragraph {i}.\n\n" for i in range(100))
+    md = (
+        "## Notes\n\n"
+        f"{before}Code\n\n"
+        "```r\n"
+        "library(tidyverse)\n"
+        "```\n\n"
+        f"{after}Table 1: Results.\n\n"
+        "| value |\n"
+        "| --- |\n"
+        "| 1 |\n"
+    )
+
+    def strip_like_local_model(chunk, _model, _host):
+        return chunk.strip()
+
+    out = _polish_md.polish_markdown(md, _polish_fn=strip_like_local_model)
+
+    assert out == md
+    assert "Code\n\n```r" in out
+    assert "```\n\nAfter paragraph 0." in out
+
+
 def test_polish_md_size_guard_warns(tmp_path, capsys):
     """>20k chars → warn (proceed)."""
     from omd import _polish_md
@@ -3141,6 +3862,26 @@ def test_polish_md_size_guard_warns(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "polishing" in captured.err.lower()  # warn fired
     assert "HELLO WORLD" in out  # ran anyway
+
+
+def test_polish_md_size_warning_reports_actual_model_call_count(capsys):
+    import re
+
+    from omd import _polish_md
+
+    calls: list[str] = []
+    big = "# Doc\n\n## Body\n\n" + ("hello world.\n\n" * 2000)
+
+    def identity(chunk, _model, _host):
+        calls.append(chunk)
+        return chunk
+
+    _polish_md.polish_markdown(big, _polish_fn=identity)
+
+    warning = capsys.readouterr().err
+    match = re.search(r"\((\d+) chunks\)", warning)
+    assert match is not None
+    assert int(match.group(1)) == len(calls)
 
 
 def test_polish_md_size_guard_refuses(tmp_path):
@@ -3166,11 +3907,11 @@ def test_polish_md_skips_fast_when_ollama_is_unavailable(monkeypatch, capsys):
 
     seen: dict[str, float] = {}
 
-    def fail_urlopen(_request, timeout):
+    def fail_request(_request, *, timeout):
         seen["timeout"] = timeout
         raise OSError("connection refused")
 
-    monkeypatch.setattr(_polish_md.urllib.request, "urlopen", fail_urlopen)
+    monkeypatch.setattr(_polish_md, "request_ollama_json", fail_request)
 
     md = "# Doc\n\n## Body\n\n中文内容 should stay raw\n"
     out = _polish_md.polish_markdown(md, readiness_timeout=0.01)
@@ -3210,6 +3951,45 @@ def test_polish_file_keep_raw_preserves_original(tmp_path):
     assert raw.exists()
     assert "hello world" in raw.read_text()
     assert "HELLO WORLD" in target.read_text()
+
+
+def test_polish_markdown_rejects_remote_host_without_explicit_opt_in():
+    from omd import _polish_md
+
+    calls: list[str] = []
+
+    def fake_polish(chunk, _model, _host):
+        calls.append(chunk)
+        return chunk
+
+    with pytest.raises(ValueError, match="explicit opt-in"):
+        _polish_md.polish_markdown(
+            "# Private note\n\nDo not send this silently.\n",
+            host="https://models.example.com",
+            _polish_fn=fake_polish,
+        )
+
+    assert calls == []
+
+
+def test_polish_markdown_allows_https_remote_host_after_explicit_opt_in():
+    from omd import _polish_md
+
+    calls: list[str] = []
+
+    def fake_polish(chunk, _model, host):
+        calls.append(host)
+        return chunk
+
+    output = _polish_md.polish_markdown(
+        "# Private note\n\nSend only after consent.\n",
+        host="https://models.example.com",
+        allow_remote=True,
+        _polish_fn=fake_polish,
+    )
+
+    assert output == "# Private note\n\nSend only after consent.\n"
+    assert calls == ["https://models.example.com"]
 
 
 def test_polish_file_default_discards_raw(tmp_path):
@@ -3281,22 +4061,12 @@ def test_polish_chunk_uses_bounded_output_budget_and_context(monkeypatch):
 
     captured: dict[str, object] = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return json.dumps({"response": "This is a test.", "done_reason": "stop"}).encode()
-
-    def fake_urlopen(request, timeout):
+    def fake_request(request, *, timeout):
         captured["body"] = json.loads(request.data)
         captured["timeout"] = timeout
-        return FakeResponse()
+        return {"response": "This is a test.", "done_reason": "stop"}
 
-    monkeypatch.setattr(_polish_md.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_polish_md, "request_ollama_json", fake_request)
 
     out = _polish_md._polish_chunk("This  is a test .", "qwen3:4b-instruct", "http://localhost:11434")
 
@@ -3309,17 +4079,11 @@ def test_polish_chunk_uses_bounded_output_budget_and_context(monkeypatch):
 def test_polish_chunk_rejects_truncated_model_output(monkeypatch):
     from omd import _polish_md
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return json.dumps({"response": "partial reasoning", "done_reason": "length"}).encode()
-
-    monkeypatch.setattr(_polish_md.urllib.request, "urlopen", lambda *_a, **_kw: FakeResponse())
+    monkeypatch.setattr(
+        _polish_md,
+        "request_ollama_json",
+        lambda *_a, **_kw: {"response": "partial reasoning", "done_reason": "length"},
+    )
 
     with pytest.raises(RuntimeError, match="output limit"):
         _polish_md._polish_chunk("Original text stays safe.", "qwen3:4b-instruct", "http://localhost:11434")

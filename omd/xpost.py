@@ -268,9 +268,12 @@ def convert_url(url_or_blob: str, output: Path | None = None) -> int:
     post_id = post_id_from_url(url)
     _progress.info("Fetching X post")
     post = None
-    syndication_payload, _ = fetch_syndication(post_id)
-    if syndication_payload:
-        post = parse_syndication(syndication_payload, url)
+    try:
+        syndication_payload, _ = fetch_syndication(post_id)
+        if syndication_payload:
+            post = parse_syndication(syndication_payload, url)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        _progress.warn("X syndication fetch failed; trying public page fallback")
     if post is None or _looks_truncated(post.text):
         try:
             markup, _ = fetch_page(url)
@@ -280,10 +283,15 @@ def convert_url(url_or_blob: str, output: Path | None = None) -> int:
             page_post = parse_page(markup, url)
             if page_post and (post is None or len(page_post.text) > len(post.text)):
                 post = page_post
-    if post is None:
-        oembed_payload, _ = fetch_oembed(url)
-        if oembed_payload:
-            post = parse_oembed(oembed_payload, url)
+    if post is None or _looks_truncated(post.text):
+        try:
+            oembed_payload, _ = fetch_oembed(url)
+            if oembed_payload:
+                oembed_post = parse_oembed(oembed_payload, url)
+                if oembed_post and (post is None or len(oembed_post.text) > len(post.text)):
+                    post = oembed_post
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            pass
     if post is None:
         _events.fatal(
             "fetch_failed",

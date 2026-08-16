@@ -1,0 +1,14 @@
+{
+  "summary": "A bounded summary.",
+  "existing_links": [
+    {
+      "candidate_id": "candidate-not-supplied",
+      "reason": "Invalid selection",
+      "evidence": "本地 AI",
+      "recommended": true
+    }
+  ],
+  "new_concepts": [],
+  "existing_tags": [],
+  "new_tags": []
+}

@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Iterable
 import re
 from urllib.parse import urlparse
+
+from .work_scheduler import LaneLimits, ScheduledWork, classify_work_lane, run_bounded
 
 
 ConvertOne = Callable[[str, Path], int | None]
@@ -26,6 +29,8 @@ _SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
 class BatchItemResult:
     item: str
     output_path: Path
+    item_index: int
+    item_total: int
     status: str
     attempts: int
     return_code: int
@@ -130,6 +135,7 @@ def run_batch(
     progress_hook: ProgressHook | None = None,
     finish_pending: FinishPending | None = None,
     on_item_succeeded: ItemSucceeded | None = None,
+    lane_limits: LaneLimits | None = None,
 ) -> BatchRunResult:
     """Convert every item in `input_list`, continuing through partial failures."""
     from omd import _progress
@@ -147,6 +153,7 @@ def run_batch(
             "out_dir": str(out_root),
             "total": len(items),
             "retries": max(0, retries),
+            "worker_plan": _worker_plan(lane_limits),
         },
     )
     if not items:
@@ -167,18 +174,30 @@ def run_batch(
         )
         return summary
 
+    planned: list[tuple[int, str, Path]] = []
+    for index, item in enumerate(items, 1):
+        planned.append(
+            (
+                index,
+                item,
+                reserve_output_path(
+                    item,
+                    out_root,
+                    index - 1,
+                    reserved_names,
+                    output_path_for,
+                    output_suffix=output_suffix,
+                ),
+            )
+        )
+
     _progress.info(f"batch: {len(items)} items")
     with _progress.ProgressBar("Batch", total=len(items)) as bar:
-        for index, item in enumerate(items, 1):
-            output_path = reserve_output_path(
-                item,
-                out_root,
-                index - 1,
-                reserved_names,
-                output_path_for,
-                output_suffix=output_suffix,
-            )
-            _progress.info(f"[{index}/{len(items)}] {item}")
+        progress_lock = Lock()
+
+        def process(index: int, item: str, output_path: Path) -> BatchItemResult:
+            with progress_lock:
+                _progress.info(f"[{index}/{len(items)}] {item}")
             result = _run_one(
                 item=item,
                 output_path=output_path,
@@ -189,14 +208,31 @@ def run_batch(
                 progress_hook=progress_hook,
                 label="batch",
             )
-            results.append(result)
-            if result.ok:
-                if on_item_succeeded is not None:
-                    on_item_succeeded(result)
-                _progress.item_result(
-                    f"[{index}/{len(items)}] converted: {result.output_path.name}"
+            with progress_lock:
+                if result.ok:
+                    if on_item_succeeded is not None:
+                        on_item_succeeded(result)
+                    _progress.item_result(
+                        f"[{index}/{len(items)}] converted: {result.output_path.name}"
+                    )
+                bar.update()
+            return result
+
+        if lane_limits is None:
+            results = [process(index, item, output_path) for index, item, output_path in planned]
+        else:
+            scheduled = [
+                ScheduledWork(
+                    classify_work_lane(item),
+                    lambda index=index, item=item, output_path=output_path: process(
+                        index,
+                        item,
+                        output_path,
+                    ),
                 )
-            bar.update()
+                for index, item, output_path in planned
+            ]
+            results = list(run_bounded(scheduled, lane_limits).values)
 
     if finish_pending is not None:
         finish_pending()
@@ -220,6 +256,26 @@ def run_batch(
     else:
         _progress.done(f"wrote {out_root}")
     return summary
+
+
+def _worker_plan(limits: LaneLimits | None) -> dict[str, int]:
+    if limits is None:
+        return {
+            "global": 1,
+            "convert": 1,
+            "network": 1,
+            "ocr": 1,
+            "asr": 1,
+            "model": 1,
+        }
+    return {
+        "global": limits.global_workers,
+        "convert": limits.convert,
+        "network": limits.network,
+        "ocr": limits.ocr,
+        "asr": limits.asr,
+        "model": limits.model,
+    }
 
 
 def _run_one(
@@ -253,7 +309,10 @@ def _run_one(
             },
         )
         try:
-            rc_raw = convert_one(item, output_path)
+            from omd import _events
+
+            with _events.item_context(index=index, total=total, attempt=attempt):
+                rc_raw = convert_one(item, output_path)
             last_rc = 0 if rc_raw is None else int(rc_raw)
             last_error = None if last_rc == 0 else f"converter returned {last_rc}"
         except KeyboardInterrupt:
@@ -291,6 +350,8 @@ def _run_one(
             return BatchItemResult(
                 item=item,
                 output_path=output_path,
+                item_index=index,
+                item_total=total,
                 status="succeeded",
                 attempts=attempt,
                 return_code=0,
@@ -336,6 +397,8 @@ def _run_one(
     return BatchItemResult(
         item=item,
         output_path=output_path,
+        item_index=index,
+        item_total=total,
         status="failed",
         attempts=attempts_allowed,
         return_code=last_rc,

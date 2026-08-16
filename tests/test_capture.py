@@ -18,6 +18,111 @@ def _parse_events(stderr: str) -> list[dict]:
     return events
 
 
+def test_normalize_captured_markdown_repairs_sphinx_progress_output():
+    from omd import capture
+
+    raw = (
+        '<!DOCTYPE html>\n\n'
+        '# Tutorial[#](#tutorial "Link to this heading")\n\n'
+        '0%|          | 0.00/44.7M [00:00<?, ?B/s]\n'
+        '100%|██████████| 44.7M/44.7M [00:00<00:00, 395MB/s]\n\n'
+        '### Train and evaluate[#](#train-and-evaluate "Link to this heading")\n'
+    )
+
+    normalized = capture.normalize_captured_markdown(raw)
+
+    assert '<!DOCTYPE html>' not in normalized
+    assert '# Tutorial\n' in normalized
+    assert '### Train and evaluate\n' in normalized
+    assert '```text\n0%|          | 0.00/44.7M [00:00<?, ?B/s]\n' in normalized
+    assert '100%|██████████| 44.7M/44.7M [00:00<00:00, 395MB/s]\n```' in normalized
+
+
+def test_cli_capture_forwards_optional_markdown_polish(tmp_path, monkeypatch):
+    from omd import capture, cli
+
+    vault = tmp_path / "vault"
+    seen: dict[str, object] = {}
+
+    def fake_capture_one(source, vault_root, **kwargs):
+        seen.update(kwargs)
+        return capture.CaptureResult(
+            source=source,
+            output_path=Path(vault_root) / "note.md",
+            index_path=Path(vault_root) / "index.json",
+            source_type="webpage",
+            title="Note",
+            tags=[],
+            return_code=0,
+        )
+
+    monkeypatch.setattr(capture, "capture_one", fake_capture_one)
+
+    rc = cli.main([
+        "capture",
+        "https://example.com",
+        "--vault",
+        str(vault),
+        "--polish-md",
+        "--polish-md-model",
+        "qwen3:4b-instruct",
+        "--polish-md-host",
+        "http://localhost:11434",
+    ])
+
+    assert rc == 0
+    assert seen["polish_md"] is True
+    assert seen["polish_md_model"] == "qwen3:4b-instruct"
+    assert seen["polish_md_host"] == "http://localhost:11434"
+
+
+def test_capture_polishes_only_after_structural_cleanup(tmp_path, monkeypatch):
+    from omd import _polish_md, capture, cli
+
+    source = tmp_path / "tutorial.html"
+    source.write_text("<h1>Tutorial</h1>", encoding="utf-8")
+    vault = tmp_path / "vault"
+
+    def fake_route_one(_target, output, *_args, **_kwargs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            '<!DOCTYPE html>\n\n'
+            '# Tutorial[#](#tutorial "Link to this heading")\n\n'
+            '0%| | 0.00/44.7M [00:00<?, ?B/s]\n',
+            encoding="utf-8",
+        )
+        return 0
+
+    def fake_polish(markdown, *, model, host, allow_remote):
+        assert '<!DOCTYPE html>' not in markdown
+        assert '# Tutorial\n' in markdown
+        assert '```text\n0%| | 0.00/44.7M [00:00<?, ?B/s]\n```' in markdown
+        assert model == "qwen3:4b-instruct"
+        assert host == "http://localhost:11434"
+        assert allow_remote is False
+        return markdown + "\nPolished locally.\n"
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+    monkeypatch.setattr(_polish_md, "polish_markdown", fake_polish)
+
+    result = capture.capture_one(
+        str(source),
+        vault,
+        polish_md=True,
+        polish_md_model="qwen3:4b-instruct",
+    )
+
+    assert result.return_code == 0
+    text = result.output_path.read_text(encoding="utf-8")
+    assert "Polished locally." in text
+    manifest = json.loads(result.output_path.with_suffix(".omd.json").read_text(encoding="utf-8"))
+    capture_meta = manifest["metadata"]["capture"]
+    assert capture_meta["markdown_polish_requested"] is True
+    assert capture_meta["markdown_polish_model"] == "qwen3:4b-instruct"
+    assert capture_meta["llm_used"] == "qwen3:4b-instruct"
+    assert capture_meta["model_endpoint"] == "local_ollama"
+
+
 def test_cli_capture_uses_memory_sized_default_text_model(tmp_path, monkeypatch):
     from omd import capture, cli
 
@@ -476,7 +581,8 @@ def test_cli_capture_memory_card_failure_records_remote_endpoint(tmp_path, monke
         output.write_text("# Remote\n\nRaw capture.\n", encoding="utf-8")
         return 0
 
-    def fail_generate(*_args, **_kwargs):
+    def fail_generate(*_args, **kwargs):
+        assert kwargs["allow_remote"] is True
         raise RuntimeError("remote Ollama unavailable")
 
     monkeypatch.setattr(cli, "route_one", fake_route_one)

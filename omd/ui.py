@@ -10,11 +10,15 @@ output.
 """
 from __future__ import annotations
 
+import argparse
 import atexit
+import hashlib
 import html
+import ipaddress
 import os
 import json
 import re
+import secrets
 import signal
 import shlex
 import shutil
@@ -28,12 +32,65 @@ import urllib.request
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from urllib.parse import urlparse
 
 from omd.batch import iter_batch_items
+from omd.ai_service import (
+    AIConsentGrant,
+    AIRequestPreview,
+    AIServiceError,
+    AITextTask,
+    create_text_task_consent,
+    execute_text_task,
+    prepare_text_task,
+)
+from omd.credentials import (
+    CredentialError,
+    delete_api_key,
+    load_api_key,
+    store_api_key,
+)
+from omd.context_receipt import ContextOutbox, ContextReceipt
+from omd.eta_calibration import EtaCalibrationStore
+from omd.eta_history import EtaHistoryStore, MIN_CALIBRATED_SAMPLES
+from omd.inbox import InboxItem, InboxJob
+from omd.inbox_workflow import (
+    list_inbox_items,
+    load_inbox_item,
+    promote_inbox_item,
+    save_inbox_item,
+    set_review_status,
+)
+from omd._network_policy import validate_ollama_host
+from omd.provider_models import ProviderCatalogError, discover_provider_models
+from omd.preferences import (
+    load_preference_profile,
+    record_feedback,
+    reset_stored_preferences,
+    save_preference_profile,
+)
+from omd.retrieval import (
+    VaultCatalogError,
+    find_duplicate_notes,
+    read_vault_markdown,
+    related_notes,
+    search_notes,
+    validate_vault_markdown_path,
+)
+from omd.run_telemetry import (
+    RunTelemetrySession,
+    event_log_line,
+    parse_json_event,
+    telemetry_context_from_argv,
+)
+from omd.structured_output import AIOutputSchema
+from omd.voice_inbox import VoiceInboxRecord, VoiceInboxStore
+from omd._io import write_atomic
 from omd._models import (
+    assess_local_text_model,
     local_text_model_issue,
     local_text_model_recommendation,
     model_parameter_billions,
@@ -51,6 +108,20 @@ DOWNLOAD_STAGING = UI_STAGING_ROOT / "downloads"
 DOWNLOAD_STAGING_MAX_AGE_SECONDS = 60 * 60
 DOWNLOAD_STAGING_MAX_FILES = 10
 SOURCE_FILE_LIMIT = 5
+AI_PROVIDER_CHOICES = (
+    "No AI",
+    "Local Ollama",
+    "OpenAI API",
+    "Anthropic API",
+    "DeepSeek API",
+)
+_AI_PROVIDER_KEYS = {
+    "No AI": "none",
+    "Local Ollama": "ollama",
+    "OpenAI API": "openai",
+    "Anthropic API": "anthropic",
+    "DeepSeek API": "deepseek",
+}
 DEFAULT_COOKIES = str(COOKIES_STAGING / "douyin_cookies.txt")
 LEGACY_DEFAULT_COOKIES = str(Path.home() / "Desktop" / "douyin_cookies.txt")
 PROJECT_URL = "https://github.com/omd-local/markdown-everything"
@@ -59,6 +130,23 @@ PUBLIC_DEMO_OUTPUT_DIR = Path(tempfile.gettempdir()) / "omd-public-demo"
 PUBLIC_DEMO_MAX_UPLOAD_MB = 100
 PUBLIC_DEMO_MAX_MEDIA_SECONDS = 600
 UI_MEMORY_TIMEOUT_SECONDS = 45
+UI_LINKED_SOURCE_MAX_BYTES = 64 * 1024
+UI_LINKED_SOURCE_CHOICE_LIMIT = 200
+INBOX_AI_CONTEXT_TOKENS = 32 * 1024
+INTERNAL_JSON_EVENTS_DEFAULT = True
+_NOTE_SUGGESTION_SCHEMA = AIOutputSchema(
+    name="omd_note_suggestion",
+    schema={
+        "type": "object",
+        "properties": {
+            "suggestion": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["suggestion", "evidence", "tags"],
+        "additionalProperties": False,
+    },
+)
 URL_RE = re.compile(r"https?://[^\s'\"<>，。、）)】]+", re.UNICODE)
 BATCH_COUNT_RE = re.compile(r"batch:\s+(\d+)\s+items")
 BATCH_ITEM_RE = re.compile(r"\[(\d+)/(\d+)\]")
@@ -144,6 +232,15 @@ COOKIES_TUTORIAL = """
 3. Choose that `.txt` file here, or drop it into the upload field.
 """.strip()
 
+DOUYIN_COOKIE_REMEDIATION = (
+    "Douyin source detected, but the Default / Douyin cookies.txt path is empty. "
+    "Upload a Douyin Netscape cookies.txt file before converting private or gated Douyin links."
+)
+XHS_COOKIE_REMEDIATION = (
+    "XHS / Rednote source detected, but the XHS / Rednote cookies.txt path is empty. "
+    "Upload an XHS Netscape cookies.txt file before converting private or gated XHS links."
+)
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -154,6 +251,11 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _public_demo_enabled() -> bool:
     return _env_flag("OMD_PUBLIC_DEMO")
+
+
+def _require_local_ui(feature: str) -> None:
+    if _public_demo_enabled():
+        raise ValueError(f"{feature} is available only in the local OMD app")
 
 
 def _public_demo_output_dir() -> Path:
@@ -228,6 +330,7 @@ def _prune_stale_ui_staging_roots(
 def _stage_cookies(uploaded_path: str | None) -> str:
     """Copy an uploaded cookies file into a stable staging dir so the path survives
     the temp cleanup gradio does on the original upload. Returns the new path."""
+    _require_local_ui("Cookie staging")
     return _stage_uploaded_file(uploaded_path, folder=COOKIES_STAGING, label="Cookie file")
 
 
@@ -291,6 +394,14 @@ def _ollama_model_names(host: str, *, timeout: float = 0.75) -> tuple[set[str] |
         )
     if "://" not in host:
         host = f"http://{host}"
+    parsed = urlparse(host)
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        return (
+            None,
+            "Ollama host must be a base URL such as http://localhost:11434, "
+            "without a path, query, or fragment.",
+        )
+    host = f"{parsed.scheme}://{parsed.netloc}"
     request = urllib.request.Request(f"{host.rstrip('/')}/api/tags")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -373,6 +484,30 @@ def _local_model_status_html(
             "</div>"
         )
 
+    assessments = [
+        assess_local_text_model(model, installed_models=names)
+        for model in requested
+    ]
+    machine_fit_warning = next(
+        (
+            assessment
+            for assessment in assessments
+            if assessment.status in {"too_large", "unknown_size"}
+        ),
+        None,
+    )
+    if machine_fit_warning is not None:
+        return (
+            '<div class="omd-model-status omd-model-status-warn">'
+            "<strong>Local model fit warning:</strong> "
+            f"{html.escape(machine_fit_warning.reason)}. "
+            "OMD will not replace or download a model automatically. For a more "
+            "responsive local workflow, select "
+            f"<code>{html.escape(machine_fit_warning.recommended_model)}</code> if installed. "
+            "Raw Markdown remains available if AI polish is slow or fails."
+            "</div>"
+        )
+
     return (
         '<div class="omd-model-status omd-model-status-ok">'
         "<strong>Local model ready:</strong> Ollama is reachable and the requested model"
@@ -384,6 +519,7 @@ def _local_model_status_html(
 
 def _stage_batch_list(uploaded_path: str | None) -> str:
     """Copy an uploaded URL list into a stable path for the batch subprocess."""
+    _require_local_ui("Saved URL list files")
     return _stage_uploaded_file(uploaded_path, folder=BATCH_STAGING, label="Batch list")
 
 
@@ -697,6 +833,8 @@ def _inspect_source(
 
     targets: list[str] = []
     if batch_file:
+        if _public_demo_enabled():
+            raise ValueError("Saved URL list files are available only in the local OMD app")
         try:
             targets = list(iter_batch_items(Path(batch_file).read_text(encoding="utf-8").splitlines()))
         except OSError as exc:
@@ -710,8 +848,22 @@ def _inspect_source(
     if not targets:
         return "_Provide a URL/share blob, source file, or batch list to inspect._"
 
+    if _public_demo_enabled():
+        _validate_public_demo_policy(
+            targets=targets,
+            uploaded_paths=set(source_files),
+            cookies_file=cookies_file,
+            xhs_cookies_file=xhs_cookies_file,
+            instagram_cookies_file="",
+            cookies_browser=cookies_browser,
+            polish_md=False,
+            reel_polish=False,
+            ollama_host="",
+            keep_video=False,
+        )
+
     shown = targets[:20]
-    header = [f"## Source Inspect", "", f"Items detected: **{len(targets)}**"]
+    header = ["## Source Inspect", "", f"Items detected: **{len(targets)}**"]
     if len(targets) > len(shown):
         header.append(f"Showing first **{len(shown)}** items.")
     sections: list[str] = ["\n".join(header)]
@@ -740,17 +892,9 @@ def _inspect_source(
             detected_type = str(info.get("detected_type") or "")
             source_warnings = list(info.get("warnings") or [])
             if detected_type == "douyin_url" and not (cookies_file or "").strip():
-                source_warnings.insert(
-                    0,
-                    "Douyin source detected, but the Default / Douyin cookies.txt path is empty. "
-                    "Upload a Douyin Netscape cookies.txt file before converting private or gated Douyin links.",
-                )
+                source_warnings.insert(0, DOUYIN_COOKIE_REMEDIATION)
             elif detected_type == "xhs_url" and not (xhs_cookies_file or "").strip():
-                source_warnings.insert(
-                    0,
-                    "XHS / Rednote source detected, but the XHS / Rednote cookies.txt path is empty. "
-                    "Upload an XHS Netscape cookies.txt file before converting private or gated XHS links.",
-                )
+                source_warnings.insert(0, XHS_COOKIE_REMEDIATION)
             if source_warnings:
                 info["warnings"] = source_warnings
             sections.append(_format_inspect_result(target, info))
@@ -763,6 +907,7 @@ def _choose_output_dir(current: str) -> str:
     On macOS this uses the native Apple folder chooser. If the user cancels or
     the platform does not support a native chooser, keep the current value.
     """
+    _require_local_ui("Folder picking")
     current_path = Path(current or DEFAULT_OUTPUT_DIR).expanduser()
     start = current_path if current_path.is_dir() else current_path.parent
     if sys.platform != "darwin":
@@ -788,6 +933,7 @@ def _choose_output_dir(current: str) -> str:
 
 def _choose_cookies_file(current: str) -> str:
     """Open the native macOS file picker for a cookies.txt file."""
+    _require_local_ui("Cookie file picking")
     current_path = Path(current or DEFAULT_COOKIES).expanduser()
     start = current_path.parent if current_path.suffix else current_path
     if not start.exists():
@@ -814,7 +960,50 @@ def _choose_cookies_file(current: str) -> str:
     return selected if proc.returncode == 0 and selected else (str(current_path) if current else "")
 
 
+def _platform_cookie_warnings(
+    targets: Sequence[str],
+    *,
+    cookies_file: str,
+    xhs_cookies_file: str,
+) -> list[str]:
+    from omd._preflight import inspect_target
+
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        try:
+            info = inspect_target(target)
+        except (Exception, SystemExit):  # noqa: BLE001 - target classification is best-effort here.
+            continue
+        detected_type = str(info.get("detected_type") or "")
+        warning = None
+        if detected_type == "douyin_url" and not (cookies_file or "").strip():
+            warning = DOUYIN_COOKIE_REMEDIATION
+        elif detected_type == "xhs_url" and not (xhs_cookies_file or "").strip():
+            warning = XHS_COOKIE_REMEDIATION
+        if warning and warning not in seen:
+            warnings.append(warning)
+            seen.add(warning)
+    return warnings
+
+
+def _require_platform_cookie_files(
+    targets: Sequence[str],
+    *,
+    cookies_file: str,
+    xhs_cookies_file: str,
+) -> None:
+    warnings = _platform_cookie_warnings(
+        targets,
+        cookies_file=cookies_file,
+        xhs_cookies_file=xhs_cookies_file,
+    )
+    if warnings:
+        raise ValueError("\n".join(warnings))
+
+
 def _open_output_path(path_value: str) -> str:
+    _require_local_ui("Opening output folders")
     path_text = (path_value or "").strip()
     if not path_text:
         return _status_html("err", "failed", detail="no output path", percent=100)
@@ -1019,6 +1208,13 @@ def _validate_public_demo_uploaded_file(path_value: str) -> None:
     path = Path(path_value)
     if not path.is_file():
         raise ValueError("Hosted sample demo accepts uploaded document/image files only, not local filesystem paths.")
+    if _public_demo_enabled():
+        try:
+            path.resolve().relative_to(SOURCE_STAGING.resolve())
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "Hosted sample demo accepts only files staged by this upload session, not server filesystem paths."
+            ) from exc
     max_bytes = _public_demo_max_upload_bytes()
     size = path.stat().st_size
     if size > max_bytes:
@@ -1066,6 +1262,22 @@ def _validate_public_demo_target(target: str, *, uploaded_paths: set[str]) -> No
     raise ValueError("Hosted sample demo accepts public URLs or document/image uploads by default; local paths require Full Power Demo.")
 
 
+def _validate_public_demo_cookie_file(path_value: str) -> None:
+    cookie_path = Path(path_value).expanduser()
+    try:
+        if COOKIES_STAGING.is_symlink() or cookie_path.is_symlink():
+            raise ValueError("symlinked cookie paths are not accepted")
+        staging_root = COOKIES_STAGING.resolve(strict=True)
+        resolved_cookie = cookie_path.resolve(strict=True)
+        if not staging_root.is_dir() or not resolved_cookie.is_file():
+            raise ValueError("cookie path must be a regular staged file")
+        resolved_cookie.relative_to(staging_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "Hosted sample demo only accepts uploaded/staged cookie files, not raw local cookie paths."
+        ) from exc
+
+
 def _validate_public_demo_policy(
     *,
     targets: list[str],
@@ -1086,11 +1298,7 @@ def _validate_public_demo_policy(
             continue
         if not _env_flag("OMD_PUBLIC_DEMO_ALLOW_COOKIE_UPLOAD"):
             raise ValueError("Hosted sample demo disables cookie files by default. Use Full Power Demo for Douyin/XHS cookies.")
-        cookie_path = Path(cookie_value).expanduser()
-        try:
-            cookie_path.relative_to(COOKIES_STAGING)
-        except ValueError as exc:
-            raise ValueError("Hosted sample demo only accepts uploaded/staged cookie files, not raw local cookie paths.") from exc
+        _validate_public_demo_cookie_file(cookie_value)
     if polish_md or reel_polish or ollama_host.strip():
         raise ValueError("Hosted sample demo disables local Ollama/cloud polish until a hosted LLM provider is configured.")
     if keep_video:
@@ -1166,6 +1374,12 @@ def _build_argv(
             scope_items = list(iter_batch_items(Path(batch_file).read_text(encoding="utf-8").splitlines()))
         except OSError:
             scope_items = []
+    if not is_public_demo:
+        _require_platform_cookie_files(
+            scope_items,
+            cookies_file=cookies_file,
+            xhs_cookies_file=xhs_cookies_file,
+        )
 
     if is_public_demo and capture_mode:
         raise ValueError("Hosted demo cannot write to a local vault. Use Full Power Demo locally for Capture to vault.")
@@ -1375,22 +1589,38 @@ def _preview_output(target: Path) -> tuple[str, str]:
     if target.is_dir():
         vault_index = target / "Index" / "OMD Captures.md"
         if vault_index.is_file():
-            captures = sorted((target / "Sources").glob("**/*.md")) if (target / "Sources").is_dir() else []
-            index_body = vault_index.read_text(errors="replace")
-            shown = captures[:50]
+            captures = (
+                list((target / "Sources").glob("**/*.md"))
+                if (target / "Sources").is_dir()
+                else []
+            )
+            captures.sort(
+                key=lambda path: (
+                    -path.stat().st_mtime_ns,
+                    path.relative_to(target).as_posix().casefold(),
+                )
+            )
+            shown = captures[:3]
             lines = [
-                "# Vault capture output",
+                "# Saved to vault",
                 "",
-                f"Vault folder: `{target}`",
-                f"Capture notes: {len(captures)}",
+                f"Vault: `{target}`",
                 "",
-                "## Recent capture files",
+                "## Most recent capture files",
                 "",
             ]
             lines.extend(f"- `{path.relative_to(target).as_posix()}`" for path in shown)
+            lines.extend(
+                [
+                    "",
+                    "External sources are stored under `Sources/`; `Inbox/` is unchanged.",
+                    "Full capture history: `Index/OMD Captures.md`.",
+                ]
+            )
             if len(captures) > len(shown):
-                lines.append(f"- ... {len(captures) - len(shown)} more")
-            lines.extend(["", "## Index Preview", "", index_body])
+                lines.append(
+                    f"Showing the 3 most recently modified of {len(captures)} capture notes."
+                )
             return "\n".join(lines), str(target)
         files = sorted([*target.glob("*.md"), *target.glob("*.Rmd")])
         if not files:
@@ -1484,15 +1714,22 @@ def _status_html(
             for kind, text in summary
         )
         summary_html = f'<div class="omd-status-summary">{pills}</div>'
+    progress_attrs = (
+        'role="progressbar" aria-label="Task progress" '
+        'aria-valuemin="0" aria-valuemax="100"'
+    )
+    if percent is not None:
+        progress_attrs += f' aria-valuenow="{pct}"'
     return (
-        f'<div id="omd-status" class="{classes}">'
+        f'<div id="omd-status" class="{classes}" role="status" '
+        'aria-live="polite" aria-atomic="true">'
         '<div class="omd-status-head">'
         f'<span class="omd-status-label">{label_html}</span>'
         f'<span class="omd-status-detail">{detail_html}</span>'
         f'<span class="omd-status-eta">{eta_html}</span>'
         '</div>'
         f'{summary_html}'
-        '<div class="omd-progress-track">'
+        f'<div class="omd-progress-track" {progress_attrs}>'
         f'<span class="omd-progress-bar" style="--omd-progress:{pct}%"></span>'
         '</div>'
         '</div>'
@@ -1690,6 +1927,234 @@ class _RunCounts:
         self.partial = 0
 
 
+@dataclass
+class _ContextRun:
+    """UI-owned handle for durable receipts created before conversion starts."""
+
+    outbox: ContextOutbox
+    receipts: list[ContextReceipt]
+    local_sources: list[Path | None]
+
+    def secure_sources(self) -> None:
+        for index, source in enumerate(self.local_sources):
+            if source is None:
+                continue
+            self.receipts[index] = self.outbox.secure_local_source(
+                self.receipts[index].job_id,
+                source,
+            )
+
+    def start_processing(self) -> None:
+        for index, receipt in enumerate(self.receipts):
+            self.receipts[index] = self.outbox.start_stage(
+                receipt.job_id,
+                "conversion",
+            )
+
+    def apply_batch_event(self, event: dict[str, object]) -> None:
+        """Persist one batch item's outcome without changing its neighbours."""
+        event_type = event.get("event")
+        if event_type not in {"batch_item_succeeded", "batch_item_failed"}:
+            return
+        item_index = event.get("index")
+        if type(item_index) is not int or not 1 <= item_index <= len(self.receipts):
+            return
+        receipt_index = item_index - 1
+        receipt = self.receipts[receipt_index]
+        if receipt.state not in {"processing", "partial_output"}:
+            return
+        if event_type == "batch_item_succeeded":
+            self.receipts[receipt_index] = self.outbox.complete(receipt.job_id)
+            return
+        if receipt.state == "processing":
+            self.receipts[receipt_index] = self.outbox.fail_stage(
+                receipt.job_id,
+                error_code="conversion_failed",
+                retryable=True,
+            )
+
+    def complete(self) -> None:
+        for index, receipt in enumerate(self.receipts):
+            if receipt.state not in {"processing", "partial_output"}:
+                continue
+            self.receipts[index] = self.outbox.complete(receipt.job_id)
+
+    def mark_partial_output(self) -> None:
+        for index, receipt in enumerate(self.receipts):
+            if receipt.state != "processing":
+                continue
+            self.receipts[index] = self.outbox.mark_partial_output(receipt.job_id)
+
+    def mark_failed(self) -> None:
+        for index, receipt in enumerate(self.receipts):
+            if receipt.state != "processing":
+                continue
+            self.receipts[index] = self.outbox.fail_stage(
+                receipt.job_id,
+                error_code="conversion_failed",
+                retryable=True,
+            )
+
+    def cancel(self) -> None:
+        for index, receipt in enumerate(self.receipts):
+            if receipt.state not in {"queued", "source_secured", "processing"}:
+                continue
+            self.receipts[index] = self.outbox.cancel(receipt.job_id)
+
+    def status_summary(self) -> tuple[str, str]:
+        return "receipt", _receipt_status_text(self.receipts)
+
+    def log_lines(self) -> list[str]:
+        lines: list[str] = []
+        for receipt in self.receipts:
+            line = (
+                f"receipt: {receipt.job_id} · {receipt.source_type} · "
+                f"{receipt.state.replace('_', ' ')}"
+            )
+            if receipt.recovery_action:
+                line += f" · next: {_receipt_action_text(receipt.recovery_action)}"
+            lines.append(line)
+        return lines
+
+
+def _context_outbox_root() -> Path:
+    root = OMD_DATA_DIR / "context-outbox"
+    if root.is_symlink():
+        raise ValueError("context outbox directory must not be a symlink")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _receipt_targets(
+    text_input: str,
+    file_input: object,
+    batch_file_input: str | None,
+) -> list[str]:
+    batch_file = (batch_file_input or "").strip()
+    if batch_file:
+        try:
+            return list(
+                iter_batch_items(
+                    Path(batch_file).expanduser().read_text(encoding="utf-8").splitlines()
+                )
+            )
+        except (OSError, UnicodeError):
+            return [batch_file]
+    text = (text_input or "").strip()
+    if text:
+        return _batch_items_from_text(text) or [text]
+    return _uploaded_file_paths(file_input)
+
+
+def _receipt_source_type(target: str) -> tuple[str, Path | None]:
+    from omd._preflight import inspect_target
+    from omd.capture import source_type_for
+
+    candidate = Path(target).expanduser()
+    local_source = candidate if candidate.is_file() else None
+    try:
+        source_type = source_type_for(target, inspect_target(target))
+    except (Exception, SystemExit):
+        source_type = "local_file" if local_source is not None else "source"
+    if local_source is not None and source_type not in {
+        "audio",
+        "image",
+        "local_file",
+        "office_doc",
+        "pdf",
+    }:
+        source_type = "local_file"
+    return source_type, local_source
+
+
+def _queue_context_run(
+    text_input: str,
+    file_input: object,
+    batch_file_input: str | None,
+    workflow_mode: str,
+    out_dir: str,
+    vault_dir: str,
+) -> _ContextRun | None:
+    """Persist privacy-minimised receipts without changing the public UI API."""
+    if _public_demo_enabled():
+        return None
+    targets = _receipt_targets(text_input, file_input, batch_file_input)
+    if not targets:
+        return None
+    outbox = ContextOutbox(_context_outbox_root())
+    capture_mode = _is_capture_mode(workflow_mode)
+    destination_value = vault_dir if capture_mode else out_dir
+    destination_label = "Obsidian vault" if capture_mode else "Markdown folder"
+    submission_id = secrets.token_hex(8)
+    destination_identity = hashlib.sha256(
+        (destination_value or destination_label).encode("utf-8")
+    ).hexdigest()
+    receipts: list[ContextReceipt] = []
+    local_sources: list[Path | None] = []
+    for ordinal, target in enumerate(targets, 1):
+        source_type, local_source = _receipt_source_type(target)
+        source_identity = hashlib.sha256(target.encode("utf-8")).hexdigest()
+        job = InboxJob(
+            job_type="capture" if capture_mode else "convert",
+            source="desktop_ui",
+            payload={
+                "submission_id": submission_id,
+                "source_identity": source_identity,
+                "destination_identity": destination_identity,
+                "ordinal": ordinal,
+                "item_count": len(targets),
+            },
+        )
+        receipts.append(
+            outbox.queue(
+                job,
+                source_type=source_type,
+                destination=destination_label,
+                privacy_mode="local_only",
+            )
+        )
+        local_sources.append(local_source)
+    return _ContextRun(outbox=outbox, receipts=receipts, local_sources=local_sources)
+
+
+def _run_status_summary(
+    counts: _RunCounts,
+    context_run: _ContextRun | None,
+) -> tuple[tuple[str, str], ...]:
+    receipt = () if context_run is None else (context_run.status_summary(),)
+    return (*counts.summary(), *receipt)
+
+
+def _transition_context_run(
+    context_run: _ContextRun | None,
+    action: str,
+) -> str | None:
+    if context_run is None:
+        return None
+    try:
+        getattr(context_run, action)()
+    except (OSError, ValueError) as exc:
+        return f"receipt update failed during {action.replace('_', ' ')}: {exc}"
+    return None
+
+
+def _transition_context_batch_event(
+    context_run: _ContextRun | None,
+    event: dict[str, object],
+) -> str | None:
+    if context_run is None:
+        return None
+    try:
+        context_run.apply_batch_event(event)
+    except (OSError, ValueError) as exc:
+        return f"receipt update failed for batch item: {exc}"
+    return None
+
+
 def _argv_uses_batch(argv: Sequence[str]) -> bool:
     return "batch" in argv or "--batch" in argv
 
@@ -1719,12 +2184,1422 @@ def _menu_view_updates(view: str):
 
     selected = (view or "all").strip().lower()
     open_states = {
-        "all": (True, True, True, True, False, False),
-        "source": (True, False, False, False, False, False),
-        "output": (False, True, True, True, False, False),
-        "advanced": (False, False, False, False, True, True),
-    }.get(selected, (True, True, True, True, False, False))
-    return tuple(gr.update(visible=True, open=value) for value in open_states)
+        "all": (True, False, True, True, True, False, False),
+        "source": (True, False, False, False, False, False, False),
+        "inbox": (False, True, False, False, False, False, False),
+        "output": (False, False, True, True, True, False, False),
+        "advanced": (False, False, False, False, False, True, True),
+    }.get(selected, (True, False, True, True, True, False, False))
+    layout_classes = ["omd-grid"]
+    if selected in {"source", "inbox"}:
+        layout_classes.append("omd-grid-primary-only")
+    elif selected == "advanced":
+        layout_classes.append("omd-grid-secondary-only")
+    return (
+        tuple(gr.update(visible=True, open=value) for value in open_states)
+        + tuple(
+            gr.update(variant="primary" if name == selected else "secondary")
+            for name in ("all", "source", "inbox", "output", "advanced")
+        )
+        + (gr.update(elem_classes=layout_classes),)
+    )
+
+
+def _ai_provider_key(choice: str) -> str:
+    if not isinstance(choice, str) or choice not in _AI_PROVIDER_KEYS:
+        raise ValueError("AI provider is not supported")
+    return _AI_PROVIDER_KEYS[choice]
+
+
+def _ai_note_task(
+    provider_choice: str,
+    model: str,
+    ollama_host: str,
+    *,
+    capture_surface: str = "my_note",
+) -> AITextTask:
+    provider = _ai_provider_key(provider_choice)
+    if provider == "none":
+        raise ValueError("Choose an AI provider before requesting an AI suggestion")
+    selected_model = (model or "").strip()
+    if not selected_model:
+        raise ValueError("Choose an exact provider model first")
+    endpoint = (ollama_host or "http://localhost:11434") if provider == "ollama" else None
+    if endpoint is not None:
+        validate_ollama_host(endpoint)
+    task_focus = (
+        "For an exact highlight, draft one concise takeaway that stays within the excerpt."
+        if capture_surface == "highlight"
+        else "For a personal note, draft a concise structure or takeaway without adding claims."
+    )
+    return AITextTask(
+        provider=provider,
+        model=selected_model,
+        capability="note_organisation",
+        operation=(
+            f"{task_focus} Preserve the source language and claims. "
+            "Return at least one Evidence item copied exactly from the supplied text. "
+            "If the text is only a URL or lacks a meaningful passage, do not invent a result."
+        ),
+        system_prompt=(
+            "Use only the supplied selected text. You cannot open links or read unselected vault files. "
+            "Do not translate it. Separate one useful suggestion, exact Evidence excerpts, "
+            "and a few specific tags. Every Evidence item must be a verbatim substring of the input. "
+            "Do not invent claims, links, or placeholder tags."
+        ),
+        max_output_tokens=1024,
+        endpoint=endpoint,
+        timeout_seconds=90.0 if provider == "ollama" else 60.0,
+        output_schema=_NOTE_SUGGESTION_SCHEMA,
+        context_window_tokens=INBOX_AI_CONTEXT_TOKENS if provider == "ollama" else None,
+    )
+
+
+def _ai_request_preview_html(preview: AIRequestPreview, *, source_label: str = "Inbox original") -> str:
+    policy = (
+        f' <a href="{html.escape(preview.policy_url)}" target="_blank" '
+        'rel="noopener noreferrer">Current provider policy</a>.'
+        if preview.policy_url
+        else ""
+    )
+    if preview.provider == "ollama" and preview.destination_domain in {"localhost", "127.0.0.1", "::1"}:
+        return (
+            '<div class="omd-model-status omd-model-status-info">'
+            f"<strong>Local AI:</strong> OMD will send only <code>{html.escape(source_label)}</code> "
+            f"({preview.character_count} characters) to <code>{html.escape(preview.model)}</code> "
+            "through Ollama on this Mac. It will not open links, read unselected files, "
+            "or upload an attachment.</div>"
+        )
+    attachment = "yes" if preview.sends_attachment else "no"
+    return (
+        '<div class="omd-model-status omd-model-status-info">'
+        f"<strong>Before sending to cloud:</strong> OMD will send only <code>{html.escape(source_label)}</code> "
+        f"({preview.character_count} characters, about {preview.estimated_input_tokens} tokens) "
+        f"to <code>{html.escape(preview.provider)}</code> model "
+        f"<code>{html.escape(preview.model)}</code> at "
+        f"<code>{html.escape(preview.destination_domain)}</code>. Attachment sent: {attachment}. "
+        f"{html.escape(preview.data_handling_summary)}{policy} "
+        "This uses a provider API key, not a consumer ChatGPT login or consumer Claude login."
+        "</div>"
+    )
+
+
+def _inbox_ai_source_text(vault: str, item: object, selected_markdown_path: str) -> tuple[str, str]:
+    relative = (selected_markdown_path or "").strip()
+    if relative:
+        source_text = read_vault_markdown(
+            vault,
+            relative,
+            max_bytes=UI_LINKED_SOURCE_MAX_BYTES,
+        )
+        return source_text, relative
+    return str(getattr(item, "raw_content")), "Inbox original"
+
+
+def _preview_inbox_ai_request(
+    vault: str,
+    item_id: str,
+    provider_choice: str,
+    model: str,
+    ollama_host: str,
+    selected_markdown_path: str = "",
+    *,
+    as_of: date | None = None,
+) -> str:
+    if not item_id:
+        raise ValueError("Choose an Inbox item before previewing an AI request")
+    item = load_inbox_item(vault, item_id)
+    task = _ai_note_task(
+        provider_choice,
+        model,
+        ollama_host,
+        capture_surface=item.capture_surface,
+    )
+    source_text, source_label = _inbox_ai_source_text(vault, item, selected_markdown_path)
+    preview = prepare_text_task(task, source_text=source_text, as_of=as_of)
+    return _ai_request_preview_html(preview, source_label=source_label)
+
+
+def _preview_inbox_ai_request_for_ui(
+    vault: str,
+    item_id: str,
+    provider_choice: str,
+    model: str,
+    ollama_host: str,
+    selected_markdown_path: str = "",
+) -> tuple[str, AIConsentGrant | None, bool]:
+    _require_local_ui("Inbox AI review")
+    if not item_id:
+        raise ValueError("Choose an Inbox item before previewing an AI request")
+    item = load_inbox_item(vault, item_id)
+    task = _ai_note_task(
+        provider_choice,
+        model,
+        ollama_host,
+        capture_surface=item.capture_surface,
+    )
+    source_text, source_label = _inbox_ai_source_text(vault, item, selected_markdown_path)
+    preview = prepare_text_task(task, source_text=source_text)
+    grant = (
+        create_text_task_consent(task, source_text=source_text)
+        if task.provider in {"openai", "anthropic", "deepseek"}
+        else None
+    )
+    return _ai_request_preview_html(preview, source_label=source_label), grant, False
+
+
+def _ai_provider_ui_updates(provider_choice: str, local_model: str):
+    import gradio as gr
+
+    provider = _ai_provider_key(provider_choice)
+    hosted = provider in {"openai", "anthropic", "deepseek"}
+    if provider == "ollama":
+        model_update = gr.update(
+            choices=[local_model] if local_model else [],
+            value=local_model or None,
+        )
+        message = (
+            '<div class="omd-model-status omd-model-status-info">'
+            "<strong>Local-only provider:</strong> source text stays on this Mac and is sent "
+            "only to the selected loopback Ollama endpoint. No cloud consent or API key is used."
+            "</div>"
+        )
+    elif hosted:
+        model_update = gr.update(choices=[], value=None)
+        message = (
+            '<div class="omd-model-status omd-model-status-warn">'
+            "<strong>Optional BYOK cloud:</strong> enter a session API key or save it in macOS "
+            "Keychain, then check models. Each content request still requires a fresh preview "
+            "and consent. No provider fallback is used."
+            "</div>"
+        )
+    else:
+        model_update = gr.update(choices=[], value=None)
+        message = (
+            '<div class="omd-model-status omd-model-status-info">'
+            "<strong>AI disabled:</strong> Inbox capture, review, search, and raw Markdown remain available."
+            "</div>"
+        )
+    return (
+        model_update,
+        gr.update(visible=hosted),
+        gr.update(value=""),
+        gr.update(visible=hosted, value=False),
+        message,
+        gr.update(visible=hosted),
+        gr.update(visible=hosted),
+        gr.update(
+            value="Generate draft from selected text",
+            visible=provider != "none",
+            interactive=provider != "none",
+        ),
+        gr.update(visible=provider != "none"),
+    )
+
+
+def _provider_api_key(provider: str, session_api_key: str) -> str | None:
+    if provider == "ollama":
+        return None
+    entered = (session_api_key or "").strip()
+    return entered or load_api_key(provider)
+
+
+def _check_ai_provider_connection(
+    provider_choice: str,
+    selected_model: str,
+    session_api_key: str,
+    ollama_host: str,
+):
+    import gradio as gr
+
+    _require_local_ui("AI provider checks")
+    provider = _ai_provider_key(provider_choice)
+    if provider == "none":
+        return gr.update(choices=[], value=None), (
+            '<div class="omd-model-status omd-model-status-info">'
+            "<strong>AI disabled:</strong> there is no provider connection to test."
+            "</div>"
+        )
+    selected = (selected_model or "").strip()
+    try:
+        api_key = _provider_api_key(provider, session_api_key)
+        catalog = discover_provider_models(
+            provider,
+            api_key=api_key,
+            endpoint=(ollama_host or "http://localhost:11434") if provider == "ollama" else None,
+            timeout_seconds=8.0,
+        )
+    except (CredentialError, ProviderCatalogError, ValueError) as exc:
+        return gr.update(value=selected or None), (
+            '<div class="omd-model-status omd-model-status-warn">'
+            f"<strong>Provider check failed:</strong> {html.escape(str(exc))}. "
+            "No content was sent and no fallback provider was tried."
+            "</div>"
+        )
+    available = selected in catalog.models if selected else False
+    if selected and not available:
+        message = (
+            f"Selected model <code>{html.escape(selected)}</code> is not available. "
+            "Choose an exact model from the loaded catalogue; OMD will not replace it automatically."
+        )
+        state_class = "omd-model-status-warn"
+    else:
+        message = (
+            f"Connected to <code>{html.escape(catalog.destination_domain)}</code>; "
+            f"{len(catalog.models)} model(s) found in {catalog.elapsed_seconds:.2f}s."
+        )
+        state_class = "omd-model-status-ok"
+    return gr.update(choices=list(catalog.models), value=selected or None), (
+        f'<div class="omd-model-status {state_class}">'
+        f"<strong>Provider check:</strong> {message}</div>"
+    )
+
+
+def _save_cloud_api_key(provider_choice: str, session_api_key: str):
+    import gradio as gr
+
+    _require_local_ui("Keychain credentials")
+    provider = _ai_provider_key(provider_choice)
+    if provider not in {"openai", "anthropic", "deepseek"}:
+        return gr.update(), (
+            '<div class="omd-model-status omd-model-status-warn">'
+            "<strong>Keychain:</strong> choose a hosted provider first.</div>"
+        )
+    try:
+        store_api_key(provider, (session_api_key or "").strip())
+    except (CredentialError, ValueError) as exc:
+        return gr.update(), (
+            '<div class="omd-model-status omd-model-status-warn">'
+            f"<strong>Keychain save failed:</strong> {html.escape(str(exc))} "
+            "The key remains session-only while it stays in this field.</div>"
+        )
+    return gr.update(value=""), (
+        '<div class="omd-model-status omd-model-status-ok">'
+        f"<strong>Keychain:</strong> saved the {html.escape(provider)} API key. "
+        "The secret is not stored in OMD files.</div>"
+    )
+
+
+def _delete_cloud_api_key(provider_choice: str) -> str:
+    _require_local_ui("Keychain credentials")
+    provider = _ai_provider_key(provider_choice)
+    if provider not in {"openai", "anthropic", "deepseek"}:
+        return (
+            '<div class="omd-model-status omd-model-status-warn">'
+            "<strong>Keychain:</strong> choose a hosted provider first.</div>"
+        )
+    try:
+        delete_api_key(provider)
+    except CredentialError as exc:
+        return (
+            '<div class="omd-model-status omd-model-status-warn">'
+            f"<strong>Keychain delete:</strong> {html.escape(str(exc))}</div>"
+        )
+    return (
+        '<div class="omd-model-status omd-model-status-ok">'
+        f"<strong>Keychain:</strong> deleted the saved {html.escape(provider)} API key. "
+        "An environment variable, if set, is separate and still takes precedence.</div>"
+    )
+
+
+def _run_inbox_ai_suggestion(
+    vault: str,
+    item_id: str,
+    provider_choice: str,
+    model: str,
+    session_api_key: str,
+    ollama_host: str,
+    consent_granted: bool,
+    current_suggestion: str,
+    consent_grant: AIConsentGrant | None = None,
+    selected_markdown_path: str = "",
+):
+    _require_local_ui("Inbox AI review")
+    if not item_id:
+        return current_suggestion, (
+            '<div class="omd-model-status omd-model-status-warn">'
+            "<strong>AI suggestion:</strong> choose an Inbox item first.</div>"
+        )
+    try:
+        item = load_inbox_item(vault, item_id)
+        task = _ai_note_task(
+            provider_choice,
+            model,
+            ollama_host,
+            capture_surface=item.capture_surface,
+        )
+        source_text, source_label = _inbox_ai_source_text(
+            vault,
+            item,
+            selected_markdown_path,
+        )
+        text_without_urls = URL_RE.sub("", source_text)
+        if URL_RE.search(source_text) and not re.search(r"\w", text_without_urls, re.UNICODE):
+            return current_suggestion, (
+                '<div class="omd-model-status omd-model-status-warn">'
+                "<strong>AI draft needs text, not only a link:</strong> OMD does not open the URL "
+                "or infer page contents. Select a converted Markdown source above, or save the exact "
+                "passage you want to work with as a Highlight, then generate again. Nothing was sent "
+                "and no vault file was changed.</div>"
+            )
+        provider = _ai_provider_key(provider_choice)
+        result = execute_text_task(
+            task,
+            source_text=source_text,
+            consent_granted=consent_granted,
+            consent_grant=consent_grant,
+            credential_loader=lambda name: _provider_api_key(name, session_api_key) or "",
+        )
+    except (
+        AIServiceError,
+        CredentialError,
+        ProviderCatalogError,
+        ValueError,
+        VaultCatalogError,
+    ) as exc:
+        if isinstance(exc, AIServiceError) and exc.code == "context_limit_exceeded":
+            message = (
+                f"The selected text still does not fit the {INBOX_AI_CONTEXT_TOKENS}-token "
+                "Inbox AI window. Choose a shorter source or excerpt; local models still have "
+                "context and memory limits"
+            )
+        else:
+            message = str(exc)
+        return current_suggestion, (
+            '<div class="omd-model-status omd-model-status-warn">'
+            f"<strong>AI suggestion skipped:</strong> {html.escape(message)}. "
+            "The current draft, editable tags, raw Inbox item, and selected source are unchanged."
+            "</div>"
+        )
+
+    structured = result.structured or {}
+    suggestion = str(structured.get("suggestion") or result.text).strip()
+    evidence = structured.get("evidence") if isinstance(structured.get("evidence"), list) else []
+    tags = structured.get("tags") if isinstance(structured.get("tags"), list) else []
+    grounded_evidence = [
+        value.strip()
+        for value in evidence
+        if isinstance(value, str) and value.strip() and value.strip() in source_text
+    ]
+    evidence_is_exact = len(grounded_evidence) == len(evidence)
+    if not suggestion or not grounded_evidence or not evidence_is_exact:
+        return current_suggestion, (
+            '<div class="omd-model-status omd-model-status-warn">'
+            "<strong>AI could not create a grounded draft:</strong> no usable exact evidence "
+            f"was returned from <code>{html.escape(source_label)}</code>; select or save the exact "
+            "passage you want to use, then try again. "
+            "OMD did not include the AI output and did not change the Inbox item.</div>"
+        )
+    sections = [suggestion]
+    sections.extend(["", "Evidence from selected text", *[f"- {value}" for value in grounded_evidence]])
+    useful_tags = [value.strip() for value in tags if isinstance(value, str) and value.strip()]
+    if useful_tags:
+        sections.extend(["", "Suggested tags", ", ".join(useful_tags)])
+    output = "\n".join(sections).strip()
+    elapsed = result.timing.get("elapsed_seconds", 0.0)
+    total_tokens = result.usage.get("total_tokens")
+    usage = f"; {total_tokens} total tokens" if total_tokens is not None else ""
+    return output, (
+        '<div class="omd-model-status omd-model-status-ok">'
+        "<strong>AI draft ready for review:</strong> "
+        f"{html.escape(provider)} / {html.escape(result.actual_model)} via "
+        f"{html.escape(result.destination_domain)} in {elapsed:.1f}s{usage}. "
+        f"Source: <code>{html.escape(source_label)}</code>. Edit the draft if needed, then choose "
+        "whether to add it when creating the note."
+        "</div>"
+    )
+
+
+def _parse_note_tags(value: str) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    tags: list[str] = []
+    for candidate in re.split(r"[,;\n]+", value):
+        tag = candidate.strip().lstrip("#").strip()
+        tag = re.sub(r"\s+", "-", tag)
+        if not tag or tag in tags:
+            continue
+        tags.append(tag)
+    return tags
+
+
+def _split_suggested_tags(draft: str) -> tuple[str, list[str]]:
+    if not isinstance(draft, str):
+        return "", []
+    marker = re.search(r"\n{2,}Suggested tags\s*\n", draft, flags=re.IGNORECASE)
+    if marker is None:
+        return draft, []
+    return draft[: marker.start()].rstrip(), _parse_note_tags(draft[marker.end() :])
+
+
+def _merge_note_tags(current: str, suggested: Sequence[str]) -> str:
+    merged = _parse_note_tags(current)
+    for tag in suggested:
+        normalized = _parse_note_tags(str(tag))
+        for value in normalized:
+            if value not in merged:
+                merged.append(value)
+    return ", ".join(merged)
+
+
+def _run_inbox_ai_suggestion_for_ui(
+    vault: str,
+    item_id: str,
+    provider_choice: str,
+    model: str,
+    session_api_key: str,
+    ollama_host: str,
+    consent_granted: bool,
+    current_suggestion: str,
+    current_tags: str,
+    consent_grant: AIConsentGrant | None = None,
+    selected_markdown_path: str = "",
+):
+    draft, status = _run_inbox_ai_suggestion(
+        vault,
+        item_id,
+        provider_choice,
+        model,
+        session_api_key,
+        ollama_host,
+        consent_granted,
+        current_suggestion,
+        consent_grant,
+        selected_markdown_path,
+    )
+    clean_draft, suggested_tags = _split_suggested_tags(draft)
+    merged_tags = _merge_note_tags(current_tags, suggested_tags)
+    if suggested_tags:
+        visible_tags = ", ".join(
+            f"<code>{html.escape(tag)}</code>" for tag in suggested_tags
+        )
+        status += (
+            '<div class="omd-model-status omd-model-status-ok" '
+            'role="status" aria-live="polite">'
+            "<strong>Suggested tags added to the editable field below:</strong> "
+            f"{visible_tags}. Review or remove them before creating the note.</div>"
+        )
+    return clean_draft, status, merged_tags
+
+
+def _preference_state_path() -> Path:
+    configured = os.environ.get("OMD_PREFERENCES_PATH")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else OMD_DATA_DIR / "preferences.json"
+    )
+
+
+def _eta_history_state_path() -> Path:
+    configured = os.environ.get("OMD_ETA_HISTORY_PATH")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else OMD_DATA_DIR / "eta-history.json"
+    )
+
+
+def _eta_history_store() -> EtaHistoryStore:
+    return EtaHistoryStore(_eta_history_state_path())
+
+
+def _eta_calibration_state_path() -> Path:
+    configured = os.environ.get("OMD_ETA_CALIBRATION_PATH")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else _eta_history_state_path().with_name("eta-calibration-samples.json")
+    )
+
+
+def _eta_calibration_store() -> EtaCalibrationStore:
+    return EtaCalibrationStore(_eta_calibration_state_path())
+
+
+def _eta_history_summary_markdown(*, public_demo: bool | None = None) -> str:
+    if _public_demo_enabled() or bool(public_demo):
+        return "_Local ETA history is unavailable in the hosted demo._"
+    summary = _eta_history_store().summary()
+    enabled = "enabled" if summary["enabled"] else "disabled"
+    lines = [
+        "### Local ETA history",
+        f"- Status: **{enabled}**",
+        f"- Stage observations: **{summary['observation_count']}**",
+        f"- Successful calibration samples: **{summary['successful_observation_count']}**",
+        (
+            "- Prediction gate: at least "
+            f"**{MIN_CALIBRATED_SAMPLES} comparable successful samples** per calibrated bucket"
+        ),
+    ]
+    try:
+        shadow_count = _eta_calibration_store().summary()["sample_count"]
+        lines.append(f"- Baseline-vs-shadow comparison samples: **{shadow_count}**")
+    except (OSError, TypeError, ValueError):
+        lines.append("- Baseline-vs-shadow comparison samples: **unavailable**")
+    stages = summary["stages"]
+    if stages:
+        stage_text = ", ".join(
+            f"{_safe_markdown_text(stage)} ({count})" for stage, count in stages.items()
+        )
+        lines.append(f"- Coverage: {stage_text}")
+    else:
+        lines.append("- Coverage: no local samples yet")
+    if warning := summary["warning"]:
+        lines.append(f"- Warning: {_safe_markdown_text(warning)}")
+    return "\n".join(lines)
+
+
+def _set_eta_history_enabled(enabled: bool) -> tuple[str, str]:
+    if _public_demo_enabled():
+        return (
+            _eta_history_summary_markdown(public_demo=True),
+            "ETA history is unavailable in the hosted demo",
+        )
+    _eta_history_store().set_enabled(bool(enabled))
+    state = "enabled" if enabled else "disabled"
+    return _eta_history_summary_markdown(public_demo=False), f"Local ETA history {state}"
+
+
+def _reset_eta_history() -> tuple[str, str]:
+    if _public_demo_enabled():
+        return (
+            _eta_history_summary_markdown(public_demo=True),
+            "ETA history is unavailable in the hosted demo",
+        )
+    _eta_history_store().reset()
+    _eta_calibration_store().reset()
+    return _eta_history_summary_markdown(public_demo=False), "Local ETA history reset"
+
+
+def _export_eta_history_summary():
+    import gradio as gr
+
+    if _public_demo_enabled():
+        return gr.update(value=None, interactive=False), "ETA history export is unavailable in the hosted demo"
+    summary = _eta_history_store().summary()
+    try:
+        summary["shadow_calibration_sample_count"] = _eta_calibration_store().summary()[
+            "sample_count"
+        ]
+    except (OSError, TypeError, ValueError):
+        summary["shadow_calibration_sample_count"] = None
+    export_dir = UI_STAGING_ROOT / "exports"
+    export_path = export_dir / "eta-history-summary.json"
+    write_atomic(
+        export_path,
+        json.dumps(summary, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+    )
+    return gr.update(value=str(export_path), interactive=True), "Privacy-safe ETA summary prepared"
+
+
+def _safe_markdown_text(value: object) -> str:
+    escaped = html.escape(str(value), quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1", escaped)
+
+
+def _safe_code_text(value: object) -> str:
+    return html.escape(str(value), quote=False).replace("`", "&#96;")
+
+
+def _receipt_action_text(action: str | None) -> str:
+    if not action:
+        return ""
+    return action.replace("_", " ")
+
+
+def _receipt_status_text(receipts: Sequence[ContextReceipt]) -> str:
+    if not receipts:
+        return ""
+    if len(receipts) == 1:
+        receipt = receipts[0]
+        text = f"{receipt.job_id} · {receipt.state.replace('_', ' ')}"
+        if receipt.recovery_action:
+            text += f" · next: {_receipt_action_text(receipt.recovery_action)}"
+        return text
+    states = {receipt.state for receipt in receipts}
+    text = (
+        f"{len(receipts)} receipts · "
+        f"{next(iter(states)).replace('_', ' ') if len(states) == 1 else 'mixed states'}"
+    )
+    actions: list[str] = []
+    for receipt in receipts:
+        action = _receipt_action_text(receipt.recovery_action)
+        if action and action not in actions:
+            actions.append(action)
+    if actions:
+        text += f" · next: {', '.join(actions)}"
+    return text
+
+
+def _retrieval_results_markdown(hits: Sequence[object], *, empty: str) -> str:
+    if not hits:
+        return f"_{_safe_markdown_text(empty)}_"
+    sections: list[str] = []
+    for hit in hits:
+        title = _safe_markdown_text(getattr(hit, "title"))
+        path = _safe_code_text(getattr(hit, "path"))
+        evidence = _safe_markdown_text(getattr(hit, "evidence"))
+        sections.append(f"### {title}\n\n`{path}`\n\n{evidence}")
+    return "\n\n".join(sections)
+
+
+def _linkable_hit_choices(hits: Sequence[object]) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    for hit in hits:
+        path = str(getattr(hit, "path", ""))
+        title = str(getattr(hit, "title", ""))
+        if not path or path.casefold().startswith("inbox/"):
+            continue
+        choices.append((f"{title} · {path}", path))
+    return choices
+
+
+def _vault_markdown_source_choices(vault: str) -> list[tuple[str, str]]:
+    _require_local_ui("Vault Markdown source selection")
+    root = Path(vault).expanduser()
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        raise ValueError("Vault folder must be an existing non-symlink directory")
+    root = root.resolve(strict=True)
+    sources = root / "Sources"
+    if not sources.exists():
+        return []
+    if not sources.is_dir() or sources.is_symlink():
+        raise ValueError("Sources must be a non-symlink directory")
+
+    candidates: list[tuple[float, str]] = []
+    for current, directory_names, filenames in os.walk(sources, followlinks=False):
+        current_path = Path(current)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not name.startswith(".") and not (current_path / name).is_symlink()
+        ]
+        for filename_value in filenames:
+            if filename_value.startswith(".") or Path(filename_value).suffix.lower() != ".md":
+                continue
+            candidate = current_path / filename_value
+            if candidate.is_symlink():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            try:
+                validate_vault_markdown_path(root, relative)
+                modified = candidate.stat().st_mtime
+            except (OSError, ValueError, VaultCatalogError):
+                continue
+            candidates.append((modified, relative))
+            if len(candidates) > UI_LINKED_SOURCE_CHOICE_LIMIT * 4:
+                break
+        if len(candidates) > UI_LINKED_SOURCE_CHOICE_LIMIT * 4:
+            break
+    candidates.sort(key=lambda item: (-item[0], item[1].casefold(), item[1]))
+    return [(relative, relative) for _modified, relative in candidates[:UI_LINKED_SOURCE_CHOICE_LIMIT]]
+
+
+def _load_vault_markdown_source(vault: str, relative_path: str) -> tuple[str, str]:
+    _require_local_ui("Vault Markdown source preview")
+    relative = (relative_path or "").strip()
+    if not relative:
+        return "", (
+            '<div class="omd-model-status omd-model-status-info">'
+            "<strong>AI source:</strong> the selected Inbox original will be used. "
+            "No extra source link will be added.</div>"
+        )
+    try:
+        source_text = read_vault_markdown(
+            vault,
+            relative,
+            max_bytes=UI_LINKED_SOURCE_MAX_BYTES,
+        )
+    except (OSError, ValueError, VaultCatalogError) as exc:
+        return "", (
+            '<div class="omd-model-status omd-model-status-warn">'
+            f"<strong>Markdown source unavailable:</strong> {html.escape(str(exc))}. "
+            "Choose another vault Markdown file. Nothing was sent and no vault file was changed.</div>"
+        )
+    return source_text, (
+        '<div class="omd-model-status omd-model-status-ok">'
+        f"<strong>Markdown source selected:</strong> <code>{html.escape(relative)}</code>. "
+        "AI will read this preview, and Create note in Notes will add a traceable link. "
+        "The source file remains unchanged.</div>"
+    )
+
+
+def _load_vault_markdown_sources_for_ui(vault: str):
+    import gradio as gr
+
+    try:
+        choices = _vault_markdown_source_choices(vault)
+    except ValueError as exc:
+        return gr.update(choices=[], value=None), (
+            f"**Converted Markdown unavailable:** {_safe_markdown_text(exc)}"
+        )
+    if not choices:
+        return gr.update(choices=[], value=None), (
+            "_No Markdown files found under `Sources/`. Capture an external source to this vault first._"
+        )
+    result = "\n".join(f"- `{_safe_code_text(path)}`" for _label, path in choices)
+    return gr.update(choices=choices, value=None), result
+
+
+def _search_vault_notes(vault: str, query: str) -> str:
+    _require_local_ui("Vault search")
+    try:
+        hits = search_notes(vault, query, limit=10)
+    except ValueError as exc:
+        return f"**Search unavailable:** {_safe_markdown_text(exc)}"
+    return _retrieval_results_markdown(hits, empty="No matching Markdown notes found")
+
+
+def _search_vault_notes_with_choices(vault: str, query: str) -> tuple[str, list[tuple[str, str]]]:
+    _require_local_ui("Vault search")
+    try:
+        hits = search_notes(vault, query, limit=10)
+    except ValueError as exc:
+        return f"**Search unavailable:** {_safe_markdown_text(exc)}", []
+    return (
+        _retrieval_results_markdown(hits, empty="No matching Markdown notes found"),
+        _linkable_hit_choices(hits),
+    )
+
+
+def _search_vault_notes_for_ui(vault: str, query: str):
+    import gradio as gr
+
+    markdown, choices = _search_vault_notes_with_choices(vault, query)
+    return markdown, gr.update(choices=choices, value=None)
+
+
+def _related_inbox_notes(vault: str, item_id: str) -> str:
+    _require_local_ui("Related-note search")
+    if not item_id:
+        return "_Choose an Inbox item first._"
+    try:
+        item = load_inbox_item(vault, item_id)
+        hits = related_notes(
+            vault,
+            item.raw_content,
+            exclude_path=item.path,
+            limit=5,
+        )
+    except ValueError as exc:
+        return f"**Related-note search unavailable:** {_safe_markdown_text(exc)}"
+    return _retrieval_results_markdown(hits, empty="No related Markdown notes found")
+
+
+def _related_inbox_notes_with_choices(
+    vault: str,
+    item_id: str,
+) -> tuple[str, list[tuple[str, str]]]:
+    _require_local_ui("Related-note search")
+    if not item_id:
+        return "_Choose an Inbox item first._", []
+    try:
+        item = load_inbox_item(vault, item_id)
+        hits = related_notes(
+            vault,
+            item.raw_content,
+            exclude_path=item.path,
+            limit=5,
+        )
+    except ValueError as exc:
+        return f"**Related-note search unavailable:** {_safe_markdown_text(exc)}", []
+    return (
+        _retrieval_results_markdown(hits, empty="No related Markdown notes found"),
+        _linkable_hit_choices(hits),
+    )
+
+
+def _related_inbox_notes_for_ui(vault: str, item_id: str):
+    import gradio as gr
+
+    markdown, choices = _related_inbox_notes_with_choices(vault, item_id)
+    return markdown, gr.update(choices=choices, value=None)
+
+
+def _suggest_vault_sources_with_choices(
+    vault: str,
+    item_id: str,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Return one deduplicated list for the single source-selection decision."""
+    _require_local_ui("Vault source suggestions")
+    candidates: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+
+    if item_id:
+        try:
+            item = load_inbox_item(vault, item_id)
+            hits = related_notes(
+                vault,
+                item.raw_content,
+                exclude_path=item.path,
+                limit=5,
+            )
+        except ValueError as exc:
+            return f"**Source suggestions unavailable:** {_safe_markdown_text(exc)}", []
+        for hit in hits:
+            path = str(getattr(hit, "path", ""))
+            if not path or path.casefold().startswith("inbox/") or path in seen:
+                continue
+            kind = "Converted source" if path.startswith("Sources/") else "Related note"
+            candidates.append(
+                (
+                    kind,
+                    str(getattr(hit, "title", Path(path).stem)),
+                    path,
+                    str(getattr(hit, "evidence", "Related to the selected Inbox text.")),
+                )
+            )
+            seen.add(path)
+
+    try:
+        converted = _vault_markdown_source_choices(vault)
+    except ValueError as exc:
+        return f"**Source suggestions unavailable:** {_safe_markdown_text(exc)}", []
+    for _label, path in converted[:20]:
+        if path in seen:
+            continue
+        candidates.append(
+            (
+                "Converted source",
+                Path(path).stem,
+                path,
+                "Recent Markdown under Sources; selection remains read-only.",
+            )
+        )
+        seen.add(path)
+
+    if not candidates:
+        return (
+            "_No source candidates found. Capture Markdown to this vault or search by words below._",
+            [],
+        )
+    sections = [
+        (
+            f"### {_safe_markdown_text(kind)} · {_safe_markdown_text(title)}\n\n"
+            f"`{_safe_code_text(path)}`\n\n{_safe_markdown_text(evidence)}"
+        )
+        for kind, title, path, evidence in candidates
+    ]
+    choices = [
+        (f"{kind} · {title} · {path}", path)
+        for kind, title, path, _evidence in candidates
+    ]
+    return "\n\n".join(sections), choices
+
+
+def _suggest_vault_sources_for_ui(vault: str, item_id: str):
+    import gradio as gr
+
+    markdown, choices = _suggest_vault_sources_with_choices(vault, item_id)
+    return markdown, gr.update(choices=choices, value=None)
+
+
+def _find_duplicate_notes_for_ui(vault: str) -> str:
+    _require_local_ui("Duplicate-note search")
+    try:
+        groups = find_duplicate_notes(vault)
+    except ValueError as exc:
+        return f"**Duplicate check unavailable:** {_safe_markdown_text(exc)}"
+    if not groups:
+        return "_No exact duplicate Markdown notes found._"
+    lines = []
+    for index, group in enumerate(groups, start=1):
+        paths = ", ".join(f"`{_safe_code_text(path)}`" for path in group)
+        lines.append(f"- **Group {index}:** {paths}")
+    return "\n".join(lines)
+
+
+def _inspect_local_preferences() -> str:
+    if _public_demo_enabled():
+        return "_Local preferences are unavailable in the hosted demo._"
+    profile = load_preference_profile(_preference_state_path())
+    if not profile.signals:
+        return "_No explicit preferences saved. OMD does not learn from passive behaviour._"
+    lines = ["### Local preference signals"]
+    for kind in sorted(profile.signals):
+        lines.append(f"\n**{_safe_markdown_text(kind.replace('_', ' ').title())}**")
+        for value, weight in sorted(profile.signals[kind].items()):
+            lines.append(f"- `{_safe_code_text(value)}`: {weight:+d}")
+    return "\n".join(lines)
+
+
+def _record_local_preference_feedback(
+    action: str,
+    observed_style: str,
+    replacement_style: str,
+) -> tuple[str, str]:
+    _require_local_ui("Local preference feedback")
+    normalized_action = (action or "").strip().lower()
+    replacement = (replacement_style or "").strip()
+    profile_path = _preference_state_path()
+    profile = load_preference_profile(profile_path)
+    try:
+        updated = record_feedback(
+            profile,
+            normalized_action,
+            "output_style",
+            observed_style,
+            replacement=replacement if normalized_action == "edit" else None,
+        )
+        save_preference_profile(profile_path, updated)
+    except ValueError as exc:
+        return _inspect_local_preferences(), f"Preference not saved: {exc}"
+    return (
+        _inspect_local_preferences(),
+        "Explicit output-style feedback saved locally. It can be inspected, exported, or reset.",
+    )
+
+
+def _export_local_preferences() -> tuple[str | None, str]:
+    _require_local_ui("Local preference export")
+    profile = load_preference_profile(_preference_state_path())
+    DOWNLOAD_STAGING.mkdir(parents=True, exist_ok=True)
+    destination = DOWNLOAD_STAGING / f"omd-preferences-{time.time_ns()}.json"
+    try:
+        save_preference_profile(destination, profile)
+    except OSError as exc:
+        return None, f"Preference export failed: {exc}"
+    return str(destination), "Preference export prepared. It contains explicit ranking signals only."
+
+
+def _reset_local_preferences() -> tuple[str, str]:
+    _require_local_ui("Local preference reset")
+    reset_stored_preferences(_preference_state_path())
+    return _inspect_local_preferences(), "Local preferences reset. Deterministic defaults are active."
+
+
+def _inbox_queue_state(vault: str) -> tuple[str, list[tuple[str, str]]]:
+    summaries = list_inbox_items(vault)
+    if not summaries:
+        return "_No Inbox items yet. Save a thought or highlight above._", []
+    status_labels = {
+        "inbox": "needs review",
+        "accepted": "note created",
+        "rejected": "not needed",
+    }
+    lines = [
+        (
+            f"- **{_safe_markdown_text(entry.title)}** | "
+            f"{_safe_markdown_text(status_labels.get(entry.review_status, entry.review_status))} | "
+            f"`{_safe_code_text(entry.path)}`"
+        )
+        for entry in summaries
+    ]
+    choices = [
+        (
+            f"{entry.title} · {status_labels.get(entry.review_status, entry.review_status)}",
+            entry.item_id,
+        )
+        for entry in summaries
+    ]
+    return "\n".join(lines), choices
+
+
+def _load_inbox_review(vault: str, item_id: str | None) -> tuple[str, str]:
+    _require_local_ui("Inbox review")
+    if not item_id:
+        return "Choose an Inbox item above.", ""
+    item = load_inbox_item(vault, item_id)
+    capture_label = "Highlight" if item.capture_surface == "highlight" else "My note"
+    details = (
+        f"{capture_label} saved {item.captured_at}. "
+        f"Current status: {item.review_status}. Original file: {item.path}"
+    )
+    return details, item.raw_content
+
+
+def _save_inbox_note(vault: str, capture_type: str, title: str, content: str):
+    import gradio as gr
+
+    _require_local_ui("Inbox capture")
+    normalized_title = (title or "").strip()
+    if not normalized_title or not isinstance(content, str) or not content.strip():
+        raise ValueError("Inbox title and content are required")
+    is_highlight = capture_type == "Highlight"
+    item = InboxItem(
+        capture_surface="highlight" if is_highlight else "my_note",
+        provenance_kind="excerpt" if is_highlight else "authored",
+        title=normalized_title,
+        raw_content=content,
+        source_locator={"kind": "manual"},
+        captured_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+    save_inbox_item(vault, item)
+    summary, item_ids = _inbox_queue_state(vault)
+    status = _inbox_action_status_html(
+        "ok",
+        "Saved to Inbox",
+        f"{item.title}. The original is available in Inbox and no AI was used.",
+    )
+    return summary, gr.update(choices=item_ids, value=item.item_id), status
+
+
+def _refresh_inbox_ui(vault: str):
+    import gradio as gr
+
+    _require_local_ui("Inbox access")
+    summary, choices = _inbox_queue_state(vault)
+    selected_item_id = choices[0][1] if choices else None
+    return summary, gr.update(choices=choices, value=selected_item_id)
+
+
+def _reset_inbox_review_context():
+    import gradio as gr
+
+    return (
+        False,
+        False,
+        "",
+        None,
+        gr.update(choices=[], value=None),
+        "",
+        (
+            '<div class="omd-model-status omd-model-status-info">'
+            "<strong>AI source:</strong> the selected Inbox original will be used. "
+            "No extra source link will be added.</div>"
+        ),
+        _inbox_action_status_html(
+            "info",
+            "No review action yet",
+            "Choose one final action after reviewing this item.",
+        ),
+        "",
+        "",
+        "_No local search run yet._",
+        "",
+    )
+
+
+def _review_inbox_note(
+    vault: str,
+    item_id: str,
+    decision: str,
+    my_notes: str,
+    ai_suggestion: str = "",
+    include_ai_suggestion: bool = False,
+    linked_source_path: str = "",
+    tags_text: str = "",
+):
+    _require_local_ui("Inbox review")
+    import gradio as gr
+
+    try:
+        if not item_id:
+            raise ValueError("Choose an Inbox item first")
+        if decision not in {"accept", "reject"}:
+            raise ValueError("decision must be accept or reject")
+        current_item = load_inbox_item(vault, item_id)
+        if current_item.review_status != "inbox":
+            expected_status = "accepted" if decision == "accept" else "rejected"
+            if current_item.review_status == expected_status:
+                state = "info"
+                title = "Review already completed"
+                message = (
+                    "This Inbox item already has a created Note. The existing Note, "
+                    "Inbox original, tags, source link, and AI draft were left unchanged; "
+                    "current edits were not applied again."
+                    if expected_status == "accepted"
+                    else (
+                        "This Inbox item is already marked as not needed. The Inbox original "
+                        "remains available and no Note was created. Current optional additions "
+                        "were not saved."
+                    )
+                )
+            else:
+                completed_label = (
+                    "a created Note"
+                    if current_item.review_status == "accepted"
+                    else "a not-needed decision"
+                )
+                raise ValueError(
+                    f"This Inbox item already has {completed_label}; final review actions "
+                    "cannot be changed here. Its existing files and status were preserved"
+                )
+        elif decision == "accept":
+            notes = [my_notes] if isinstance(my_notes, str) and my_notes.strip() else []
+            tags = _parse_note_tags(tags_text)
+            suggestions = (
+                [ai_suggestion]
+                if include_ai_suggestion
+                and isinstance(ai_suggestion, str)
+                and ai_suggestion.strip()
+                else []
+            )
+            output = promote_inbox_item(
+                vault,
+                item_id,
+                my_notes=notes,
+                ai_suggestions=suggestions,
+                linked_source_path=linked_source_path,
+                tags=tags,
+            )
+            linked_detail = (
+                f" Linked source: {linked_source_path}." if linked_source_path else ""
+            )
+            tag_detail = f" Tags: {', '.join(tags)}." if tags else ""
+            ai_detail = ""
+            if isinstance(ai_suggestion, str) and ai_suggestion.strip():
+                ai_detail = (
+                    " The edited AI draft was included."
+                    if include_ai_suggestion
+                    else " The AI draft was not included because its checkbox was off."
+                )
+            message = (
+                f"Created in Notes: {output.name}. The original remains in Inbox."
+                f"{linked_detail}{tag_detail}{ai_detail}"
+            )
+            state = "ok"
+            title = "Note created"
+        elif decision == "reject":
+            set_review_status(vault, item_id, "rejected")
+            message = (
+                "Marked as not needed. The original remains in Inbox and no Note was created. "
+                "Current optional additions were not saved."
+            )
+            state = "ok"
+            title = "Review completed"
+    except (OSError, ValueError, VaultCatalogError) as exc:
+        try:
+            summary, item_ids = _inbox_queue_state(vault)
+        except (OSError, ValueError):
+            summary, item_ids = "_Inbox could not be refreshed._", []
+        failure = _inbox_action_status_html(
+            "warn",
+            "Inbox action not completed",
+            f"{exc}. No vault files were changed. Review the selected item and try again.",
+        )
+        return summary, gr.update(choices=item_ids, value=item_id or None), failure
+
+    try:
+        summary, item_ids = _inbox_queue_state(vault)
+    except (OSError, ValueError) as exc:
+        warning = _inbox_action_status_html(
+            "warn",
+            title,
+            f"{message} The action completed, but the queue could not refresh: {exc}.",
+        )
+        return "_Inbox queue refresh failed._", gr.update(value=item_id), warning
+    status = _inbox_action_status_html(state, title, message)
+    return summary, gr.update(choices=item_ids, value=item_id), status
+
+
+def _inbox_action_status_html(state: str, title: str, message: str) -> str:
+    status_class = {
+        "ok": "omd-model-status-ok",
+        "warn": "omd-model-status-warn",
+        "info": "omd-model-status-info",
+    }.get(state, "omd-model-status-warn")
+    return (
+        f'<div class="omd-model-status {status_class}" role="status" aria-live="polite">'
+        f"<strong>{html.escape(title)}:</strong> {html.escape(message)}</div>"
+    )
+
+
+def _voice_queue_state(vault: str) -> tuple[str, list[str]]:
+    records = VoiceInboxStore(vault).list_records()
+    if not records:
+        return "_No voice attachments in this Inbox._", []
+    lines = [
+        (
+            f"- **{_safe_markdown_text(record.title)}** | "
+            f"transcript: `{_safe_code_text(record.transcription_state)}` | "
+            f"review: `{_safe_code_text(record.review_state)}` | "
+            f"`{record.record_id}`"
+        )
+        for record in records
+    ]
+    return "\n".join(lines), [record.record_id for record in records]
+
+
+def _voice_quality_markdown(record: VoiceInboxRecord) -> str:
+    if record.quality_warnings:
+        warnings = "\n".join(
+            f"- {_safe_markdown_text(value)}" for value in record.quality_warnings
+        )
+        return f"**Transcript needs review**\n\n{warnings}"
+    if record.transcription_state == "failed":
+        return (
+            "**Local transcription failed.** The preserved audio and My Notes are still available; "
+            "check the local Whisper setup and retry."
+        )
+    if record.transcription_state == "needs_review":
+        return "**Transcript ready for review.** Compare it with the source audio before accepting."
+    if record.transcription_state == "transcribing":
+        return "_Local transcription is running._"
+    return "_No transcript yet. The original audio is already saved locally._"
+
+
+def _voice_record_status(record: VoiceInboxRecord, message: str) -> str:
+    return (
+        f"**{_safe_markdown_text(message)}**\n\n"
+        f"- Receipt: `{record.record_id}`\n"
+        f"- Audio: `{_safe_code_text(record.attachment_path)}`\n"
+        f"- Transcription: `{_safe_code_text(record.transcription_state)}` "
+        f"(attempt {record.transcription_attempts})\n"
+        f"- Review: `{_safe_code_text(record.review_state)}`"
+    )
+
+
+def _save_voice_attachment(
+    vault: str,
+    uploaded_path: str | None,
+    title: str,
+    my_notes: str,
+):
+    import gradio as gr
+
+    _require_local_ui("Voice attachments")
+    if not uploaded_path:
+        raise ValueError("Choose an existing audio file first")
+    source = Path(uploaded_path)
+    display_title = (title or "").strip() or source.stem.replace("_", " ").strip()
+    store = VoiceInboxStore(vault)
+    record = store.create(source, title=display_title or "Voice note", my_notes=my_notes or "")
+    summary, record_ids = _voice_queue_state(vault)
+    return (
+        summary,
+        gr.update(choices=record_ids, value=record.record_id),
+        _voice_record_status(record, "Audio saved locally; transcription has not started"),
+        gr.update(value=None),
+    )
+
+
+def _refresh_voice_ui(vault: str):
+    import gradio as gr
+
+    _require_local_ui("Voice Inbox access")
+    summary, record_ids = _voice_queue_state(vault)
+    return summary, gr.update(choices=record_ids, value=record_ids[0] if record_ids else None)
+
+
+def _load_voice_review(vault: str, record_id: str | None):
+    _require_local_ui("Voice Inbox review")
+    if not record_id:
+        return "", "", "", "_Choose a voice attachment to review._", "_No voice item selected._"
+    record = VoiceInboxStore(vault).load(record_id)
+    return (
+        record.raw_transcript,
+        record.my_notes,
+        record.ai_suggestion,
+        _voice_quality_markdown(record),
+        _voice_record_status(record, "Voice attachment loaded"),
+    )
+
+
+def _begin_voice_transcription(
+    vault: str,
+    record_id: str,
+    my_notes: str,
+    model: str,
+    language_hint: str,
+) -> str:
+    _require_local_ui("Voice transcription")
+    if not record_id:
+        raise ValueError("Choose a voice attachment first")
+    store = VoiceInboxStore(vault)
+    record = store.set_my_notes(record_id, my_notes or "")
+    from omd._language import choose_whisper_language
+
+    language = choose_whisper_language(None, preferred=(language_hint or "").strip() or None) or ""
+    backend = (os.environ.get("OMD_WHISPER_BACKEND") or "mlx").strip()
+    if record.transcription_state == "transcribing":
+        record = store.resume_transcription(record.record_id)
+    else:
+        record = store.begin_transcription(
+            record.record_id,
+            backend=backend,
+            model=(model or "").strip() or "mlx-community/whisper-large-v3-turbo",
+            language=language,
+        )
+    return _voice_record_status(record, "Local transcription started locally")
+
+
+def _voice_error_code(exc: BaseException) -> str:
+    lowered = str(exc).casefold()
+    if "not on path" in lowered or "not importable" in lowered or "tool_missing" in lowered or "missing" in lowered:
+        return "runtime_missing"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "transcription_timeout"
+    if "duration" in lowered:
+        return "audio_duration_invalid"
+    return "transcription_failed"
+
+
+def _finish_voice_transcription(vault: str, record_id: str):
+    _require_local_ui("Voice transcription")
+    if not record_id:
+        raise ValueError("Choose a voice attachment first")
+    store = VoiceInboxStore(vault)
+    record = store.load(record_id)
+    if record.transcription_state != "transcribing":
+        raise ValueError("Start local transcription before running it")
+    try:
+        from omd.reel import transcribe
+
+        with tempfile.TemporaryDirectory(prefix="omd-voice-") as workdir:
+            transcript = transcribe(
+                store.attachment_path(record_id),
+                Path(workdir),
+                record.transcript_model,
+                record.transcript_language or None,
+                record.transcript_backend,
+            )
+        record = store.save_transcript(record_id, transcript)
+        message = "Local transcript is ready for review"
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - source audio is the fallback.
+        record = store.fail_transcription(record_id, error_code=_voice_error_code(exc))
+        message = "Local transcription failed; original audio and My Notes were kept"
+    queue, _record_ids = _voice_queue_state(vault)
+    return (
+        record.raw_transcript,
+        record.my_notes,
+        record.ai_suggestion,
+        _voice_quality_markdown(record),
+        _voice_record_status(record, message),
+        queue,
+    )
+
+
+def _review_voice_attachment(
+    vault: str,
+    record_id: str,
+    action: str,
+    transcript: str,
+    my_notes: str,
+    ai_suggestion: str,
+):
+    import gradio as gr
+
+    _require_local_ui("Voice Inbox review")
+    if not record_id:
+        raise ValueError("Choose a voice attachment first")
+    store = VoiceInboxStore(vault)
+    record = store.load(record_id)
+    if (my_notes or "") != record.my_notes:
+        record = store.set_my_notes(record_id, my_notes or "")
+    if (ai_suggestion or "") != record.ai_suggestion:
+        record = store.set_ai_suggestion(record_id, ai_suggestion or "")
+    if (transcript or "").strip() != record.raw_transcript:
+        record = store.edit_transcript(record_id, transcript or "")
+    if action == "keep_raw":
+        record = store.keep_raw(record_id)
+        message = "Raw transcript kept for later review"
+    elif action == "accept":
+        record = store.accept(record_id)
+        message = "Reviewed note saved to Notes; source audio remains preserved in Inbox"
+    elif action == "reject":
+        record = store.reject(record_id)
+        message = "Voice attachment rejected; source audio remains preserved"
+    else:
+        raise ValueError("voice action must be keep_raw, accept, or reject")
+    queue, record_ids = _voice_queue_state(vault)
+    return (
+        queue,
+        gr.update(choices=record_ids, value=record.record_id),
+        _voice_quality_markdown(record),
+        _voice_record_status(record, message),
+    )
 
 
 def _status_for_log_line(
@@ -1866,25 +3741,52 @@ def run_with_status(*args):
     except Exception as e:  # noqa: BLE001
         raise gr.Error(f"Argument error: {e}") from e
 
+    context_run: _ContextRun | None = None
+    if len(args) >= 6:
+        try:
+            context_run = _queue_context_run(*args[:6])
+        except (OSError, ValueError) as exc:
+            raise gr.Error(f"Could not create a durable local receipt: {exc}") from exc
+
     header = f"$ {' '.join(shlex.quote(a) for a in argv)}\n"
-    log = header
+    receipt_log = [] if context_run is None else context_run.log_lines()
+    log = header + ("\n".join(receipt_log) + "\n" if receipt_log else "")
     started_at = time.monotonic()
     download_modified_since = time.time() - 1.0
+    structured_events = "--json-events" in argv
+    history_store = _eta_history_store() if structured_events else None
+    calibration_store = None
+    if history_store is not None and history_store.summary()["enabled"]:
+        calibration_store = _eta_calibration_store()
+    telemetry = (
+        RunTelemetrySession(
+            history_store,
+            telemetry_context_from_argv(argv),
+            calibration_store=calibration_store,
+        )
+        if history_store is not None
+        else None
+    )
     eta = _EtaEstimator(started_at=started_at, initial_range=_initial_eta_range(argv))
+    structured_eta_label = (
+        "ETA: estimating after the first measurable stage"
+        if structured_events
+        else ""
+    )
     current_state = "running"
     had_warning = False
     had_partial_warning = False
-    current_label = "running..."
-    current_detail = "starting"
+    current_label = "accepted" if context_run is not None else "running..."
+    current_detail = "durable receipt created" if context_run is not None else "starting"
     percent: int | None = None
     counts = _RunCounts(total=None if _argv_uses_batch(argv) else 1)
     status_html = _status_html(
         current_state,
         current_label,
         detail=current_detail,
-        eta=eta.label(percent, now=started_at),
+        eta=structured_eta_label or eta.label(percent, now=started_at),
         percent=percent,
-        summary=counts.summary(),
+        summary=_run_status_summary(counts, context_run),
     )
     yield (
         log,
@@ -1894,51 +3796,144 @@ def run_with_status(*args):
         gr.update(value=None, interactive=False),
     )
 
+    if context_run is not None:
+        try:
+            context_run.secure_sources()
+            context_run.start_processing()
+        except (OSError, ValueError) as exc:
+            log += f"warn: source could not be secured; processing did not start: {exc}\n"
+            status_html = _status_html(
+                "err",
+                "source not secured",
+                detail="original input needs attention",
+                eta=_total_elapsed_detail(started_at),
+                percent=0,
+                summary=_run_status_summary(counts, context_run),
+            )
+            yield (
+                log,
+                gr.update(value="_Source was not secured; processing did not start._"),
+                gr.update(value=""),
+                status_html,
+                gr.update(value=None, interactive=False),
+            )
+            return
+        log += "\n".join(context_run.log_lines()) + "\n"
+        current_label = "processing"
+        current_detail = "source secured; conversion started"
+        status_html = _status_html(
+            current_state,
+            current_label,
+            detail=current_detail,
+            eta=structured_eta_label or eta.label(percent),
+            percent=percent,
+            summary=_run_status_summary(counts, context_run),
+        )
+        yield log, gr.update(), gr.update(), status_html, gr.update()
+
     rc = None
     batch_total: int | None = None
     batch_index = 0
-    for tag, line in _stream_subprocess(argv):
-        if tag == "rc":
-            rc = int(line)
-            break
-        if tag == "tick":
+    try:
+        for tag, line in _stream_subprocess(argv):
+            if tag == "rc":
+                rc = int(line)
+                break
+            if tag == "tick":
+                status_html = _status_html(
+                    current_state,
+                    current_label,
+                    detail=current_detail,
+                    eta=structured_eta_label or eta.label(percent),
+                    percent=percent,
+                    summary=_run_status_summary(counts, context_run),
+                )
+                yield log, gr.update(), gr.update(), status_html, gr.update()
+                continue
+            structured_event = parse_json_event(line) if structured_events else None
+            if structured_event is not None and telemetry is not None:
+                receipt_event_warning = _transition_context_batch_event(
+                    context_run,
+                    structured_event,
+                )
+                if receipt_event_warning:
+                    log += f"warn: {receipt_event_warning}\n"
+                    had_warning = True
+                update = telemetry.consume(structured_event)
+                if rendered_line := event_log_line(structured_event):
+                    log += rendered_line + "\n"
+                if log.count("\n") > 4000:
+                    log = "...(truncated)...\n" + "\n".join(log.splitlines()[-3500:]) + "\n"
+
+                if telemetry.tracker.item_total:
+                    counts.total = telemetry.tracker.item_total
+                    counts.success = update.succeeded
+                    counts.failed = update.failed
+                    counts.partial = 0
+                current_label = update.label
+                current_detail = update.detail
+                percent = update.percent
+                structured_eta_label = update.eta_label
+
+                event_type = structured_event.get("event")
+                if event_type in {"warn", "batch_item_failed"}:
+                    had_warning = True
+                    if event_type == "warn":
+                        warning_line = f"warn: {structured_event.get('message') or ''}"
+                        had_partial_warning = had_partial_warning or _warning_marks_partial_output(
+                            warning_line
+                        )
+                    current_state = "warn"
+                    current_label = "item failed" if event_type == "batch_item_failed" else "warning"
+                elif event_type == "error" or update.state == "failed":
+                    current_state = "err"
+                    current_label = "error"
+                elif update.state in {"retrying", "needs_action"}:
+                    current_state = "warn"
+                    current_label = update.state.replace("_", " ")
+                elif current_state not in {"warn", "err"}:
+                    current_state = "running"
+
+                status_html = _status_html(
+                    current_state,
+                    current_label,
+                    detail=current_detail,
+                    eta=structured_eta_label,
+                    percent=percent,
+                    summary=_run_status_summary(counts, context_run),
+                )
+                yield log, gr.update(), gr.update(), status_html, gr.update()
+                continue
+            log += line + "\n"
+            if log.count("\n") > 4000:
+                log = "...(truncated)...\n" + "\n".join(log.splitlines()[-3500:]) + "\n"
+            batch_total, batch_index, percent, current_label, current_detail = _status_for_log_line(
+                line,
+                batch_total=batch_total,
+                batch_index=batch_index,
+                percent=percent,
+            )
+            _update_counts_from_log_line(counts, line, batch_total)
+            line_state = _status_state_for_log_line(line)
+            if line_state == "warn":
+                had_warning = True
+                had_partial_warning = had_partial_warning or _warning_marks_partial_output(line)
+            if current_state == "err":
+                current_label = "error"
+            else:
+                current_state = line_state
             status_html = _status_html(
                 current_state,
                 current_label,
                 detail=current_detail,
                 eta=eta.label(percent),
                 percent=percent,
-                summary=counts.summary(),
+                summary=_run_status_summary(counts, context_run),
             )
             yield log, gr.update(), gr.update(), status_html, gr.update()
-            continue
-        log += line + "\n"
-        if log.count("\n") > 4000:
-            log = "...(truncated)...\n" + "\n".join(log.splitlines()[-3500:]) + "\n"
-        batch_total, batch_index, percent, current_label, current_detail = _status_for_log_line(
-            line,
-            batch_total=batch_total,
-            batch_index=batch_index,
-            percent=percent,
-        )
-        _update_counts_from_log_line(counts, line, batch_total)
-        line_state = _status_state_for_log_line(line)
-        if line_state == "warn":
-            had_warning = True
-            had_partial_warning = had_partial_warning or _warning_marks_partial_output(line)
-        if current_state == "err":
-            current_label = "error"
-        else:
-            current_state = line_state
-        status_html = _status_html(
-            current_state,
-            current_label,
-            detail=current_detail,
-            eta=eta.label(percent),
-            percent=percent,
-            summary=counts.summary(),
-        )
-        yield log, gr.update(), gr.update(), status_html, gr.update()
+    finally:
+        if rc is None:
+            _transition_context_run(context_run, "cancel")
 
     if rc == 0:
         try:
@@ -1947,13 +3942,16 @@ def run_with_status(*args):
             log += f"\n✗ failed: {exc}\n"
             if counts.seen == 0:
                 counts.failed += 1
+            receipt_warning = _transition_context_run(context_run, "mark_failed")
+            if receipt_warning:
+                log += f"warn: {receipt_warning}\n"
             status_html = _status_html(
                 "err",
                 "failed",
                 detail=str(exc)[:80],
                 eta=_total_elapsed_detail(started_at),
                 percent=100,
-                summary=counts.summary(),
+                summary=_run_status_summary(counts, context_run),
             )
             yield (
                 log,
@@ -1974,6 +3972,11 @@ def run_with_status(*args):
             counts.success = max(counts.success, max(0, counts.total - counts.failed))
         elif counts.seen == 0:
             counts.success = counts.total or 1
+        receipt_action = "mark_partial_output" if single_partial else "complete"
+        receipt_warning = _transition_context_run(context_run, receipt_action)
+        if receipt_warning:
+            log += f"warn: {receipt_warning}\n"
+            had_warning = True
         final_state = "warn" if had_warning else "ok"
         final_label = "saved with warning" if single_partial else ("done with warning" if had_warning else "done")
         final_detail = (
@@ -1987,7 +3990,7 @@ def run_with_status(*args):
             detail=final_detail,
             eta=_total_elapsed_detail(started_at),
             percent=100,
-            summary=counts.summary(),
+            summary=_run_status_summary(counts, context_run),
         )
         download_value = _download_value_for_output(out_md, modified_since=download_modified_since)
         yield (
@@ -2004,13 +4007,16 @@ def run_with_status(*args):
             log += f"\n✗ failed (exit {rc})\n"
             if counts.seen == 0:
                 counts.failed += 1
+            receipt_warning = _transition_context_run(context_run, "mark_failed")
+            if receipt_warning:
+                log += f"warn: {receipt_warning}\n"
             status_html = _status_html(
                 "err",
                 "failed",
                 detail=f"exit {rc}",
                 eta=_total_elapsed_detail(started_at),
                 percent=100,
-                summary=counts.summary(),
+                summary=_run_status_summary(counts, context_run),
             )
             yield (
                 log,
@@ -2028,13 +4034,17 @@ def run_with_status(*args):
             counts.partial = 1
         elif counts.failed == 0:
             counts.failed += 1
+        receipt_action = "mark_failed" if _argv_uses_batch(argv) else "mark_partial_output"
+        receipt_warning = _transition_context_run(context_run, receipt_action)
+        if receipt_warning:
+            log += f"warn: {receipt_warning}\n"
         status_html = _status_html(
             "warn" if single_partial else "err",
             "saved with warning" if single_partial else "partial failure",
             detail="output available; check log" if single_partial else "open output folder",
             eta=_total_elapsed_detail(started_at),
             percent=100,
-            summary=counts.summary(),
+            summary=_run_status_summary(counts, context_run),
         )
         download_value = _download_value_for_output(out_md, modified_since=download_modified_since)
         yield (
@@ -2279,6 +4289,24 @@ gradio-app,
     transform: none !important;
 }
 
+#omd-menubar .omd-menu-btn button.primary,
+#omd-menubar button.primary {
+    border-color: #052863 !important;
+    background: linear-gradient(180deg, #2d68d1 0%, #073b9a 100%) !important;
+    color: #fff !important;
+    box-shadow: inset 1px 1px 0 #7fa8ff, inset -1px -1px 0 #031a45 !important;
+}
+
+#omd-menubar .omd-menu-btn button.primary:hover,
+#omd-menubar button.primary:hover,
+#omd-menubar .omd-menu-btn button.primary:focus-visible,
+#omd-menubar button.primary:focus-visible {
+    border-color: #031a45 !important;
+    background: linear-gradient(180deg, #3b78e0 0%, #0b49b7 100%) !important;
+    color: #fff !important;
+    box-shadow: inset 1px 1px 0 #9ab9ff, inset -1px -1px 0 #02112d !important;
+}
+
 #omd-workbench {
     padding: 8px;
     background: var(--omd-window);
@@ -2297,6 +4325,16 @@ gradio-app,
         inset 1px 0 0 var(--omd-border-light),
         inset -1px -1px 0 #666,
         10px 12px 0 rgba(0, 0, 0, 0.22) !important;
+}
+
+.omd-grid-primary-only,
+.omd-grid-secondary-only {
+    grid-template-columns: minmax(0, 1fr) !important;
+}
+
+.omd-grid-primary-only > .omd-stack:last-child,
+.omd-grid-secondary-only > .omd-stack:first-child {
+    display: none !important;
 }
 
 .omd-panel-source { grid-area: source; }
@@ -2381,6 +4419,20 @@ gradio-app,
     background: #fff2b8 !important;
     color: #2f2500 !important;
     box-shadow: inset 1px 1px 0 #fff9d6, inset -1px -1px 0 #c4a000 !important;
+}
+
+.omd-field-help,
+.omd-field-help p,
+.omd-field-help span,
+.omd-field-help .md,
+.omd-field-help .md * {
+    margin: 0 0 8px !important;
+    padding: 0 !important;
+    background: transparent !important;
+    color: var(--omd-muted) !important;
+    opacity: 1 !important;
+    font-size: 0.8rem !important;
+    line-height: 1.45 !important;
 }
 
 .omd-model-warning .md,
@@ -2647,6 +4699,46 @@ gradio-app,
     box-shadow: inset 1px 1px 0 #fff9d6, inset -1px -1px 0 #c4a000 !important;
 }
 
+.omd-inbox-step {
+    margin: 14px 0 7px !important;
+    padding: 9px 10px !important;
+    border: 1px solid #8b9fca !important;
+    border-left: 5px solid var(--omd-blue) !important;
+    background: #eef2fb !important;
+    color: var(--omd-ink) !important;
+    box-shadow: inset 1px 1px 0 #fff !important;
+}
+
+.omd-inbox-step:first-child {
+    margin-top: 0 !important;
+}
+
+.omd-inbox-step .md,
+.omd-inbox-step .md * {
+    color: var(--omd-ink) !important;
+}
+
+.omd-inbox-step h3,
+.omd-inbox-step p {
+    margin: 0 !important;
+}
+
+.omd-inbox-step h3 {
+    margin-bottom: 3px !important;
+    font-size: 0.94rem !important;
+}
+
+.omd-inbox-privacy {
+    margin-top: 7px !important;
+    padding: 7px 9px !important;
+    border-left: 3px solid #4775c7 !important;
+    background: #f5f7fc !important;
+}
+
+.omd-inbox-ai {
+    margin-top: 10px !important;
+}
+
 .omd-drop-grid .file-preview-holder {
     padding: 46px 6px 6px !important;
     overflow-x: hidden !important;
@@ -2893,6 +4985,15 @@ gradio-app,
     color: var(--omd-ink) !important;
 }
 
+.omd-no-wrap-btn button,
+button.omd-no-wrap-btn,
+.omd-no-wrap-btn .wrap,
+.omd-no-wrap-btn .wrap * {
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
 .gradio-container button:hover,
 .gradio-container [role="button"]:hover {
     filter: brightness(1.04);
@@ -3007,6 +5108,22 @@ gradio-app,
     padding: 8px 9px !important;
     overflow: hidden !important;
     resize: none !important;
+}
+
+#omd-vault-folder textarea {
+    min-height: 48px !important;
+    height: 48px !important;
+    box-sizing: border-box !important;
+    line-height: 18px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    white-space: pre !important;
+    overflow-wrap: normal !important;
+    scrollbar-width: thin;
+}
+
+#omd-vault-folder textarea::-webkit-scrollbar {
+    height: 8px;
 }
 
 .omd-path-grid .wrap,
@@ -3227,7 +5344,6 @@ gradio-app,
 }
 
 .omd-status-label,
-.omd-status-detail,
 .omd-status-eta {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3244,6 +5360,11 @@ gradio-app,
     grid-column: 1 / -1;
     grid-row: 2;
     color: var(--omd-muted);
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 .omd-status-eta {
@@ -3287,6 +5408,13 @@ gradio-app,
     border-color: #a67a18;
     color: #7a4d00;
     background: #fff2b8;
+}
+
+.omd-status-pill-receipt {
+    border-color: #5d739c;
+    color: #173c78;
+    background: #eef4ff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .omd-progress-track {
@@ -3422,6 +5550,14 @@ gradio-app,
     .omd-run-dock .omd-action-row > * {
         height: auto !important;
     }
+    .omd-status-head {
+        grid-template-columns: minmax(0, 1fr) !important;
+    }
+    .omd-status-eta {
+        grid-column: 1 !important;
+        grid-row: 3 !important;
+        justify-self: start !important;
+    }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3451,8 +5587,16 @@ def build_launch_kwargs(
     import inspect
     import gradio as gr
 
+    selected_host = (server_name or os.environ.get("OMD_UI_HOST", "127.0.0.1")).strip()
+    if not selected_host:
+        raise ValueError("UI server name must not be empty")
+    if not _public_demo_enabled() and not _is_loopback_ui_host(selected_host):
+        raise ValueError(
+            "Local OMD UI must bind to a loopback address because it has no remote authentication"
+        )
+
     kwargs: dict[str, object] = {
-        "server_name": server_name or os.environ.get("OMD_UI_HOST", "127.0.0.1"),
+        "server_name": selected_host,
         "server_port": server_port if server_port is not None else int(os.environ.get("OMD_UI_PORT", "7860")),
     }
     if inbrowser:
@@ -3482,6 +5626,16 @@ def build_launch_kwargs(
     if "i18n" in accepted and hasattr(gr, "I18n"):
         kwargs["i18n"] = gr.I18n(en=UI_TRANSLATIONS)
     return kwargs
+
+
+def _is_loopback_ui_host(value: str) -> bool:
+    normalized = value.strip().lower().rstrip(".")
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def build_app():
@@ -3517,6 +5671,7 @@ def build_app():
 
     with gr.Blocks(**blocks_kwargs) as app:
         source_file_queue = gr.State(value=[])
+        ai_consent_grant = gr.State(value=None)
         gr.HTML(
             '<div id="omd-desktop">'
             '<div id="omd-titlebar">'
@@ -3525,13 +5680,14 @@ def build_app():
             '</div></div>'
         )
         with gr.Row(elem_id="omd-menubar"):
-            all_tab = gr.Button("All", elem_classes=["omd-menu-btn"])
-            source_tab = gr.Button("Source", elem_classes=["omd-menu-btn"])
-            output_tab = gr.Button("Output", elem_classes=["omd-menu-btn"])
-            advanced_tab = gr.Button("Advanced settings", elem_classes=["omd-menu-btn"])
+            all_tab = gr.Button("All", elem_classes=["omd-menu-btn"], variant="primary")
+            source_tab = gr.Button("Source", elem_classes=["omd-menu-btn"], variant="secondary")
+            inbox_tab = gr.Button("Inbox / review", elem_classes=["omd-menu-btn"], variant="secondary")
+            output_tab = gr.Button("Output", elem_classes=["omd-menu-btn"], variant="secondary")
+            advanced_tab = gr.Button("Advanced settings", elem_classes=["omd-menu-btn"], variant="secondary")
             gr.HTML(title_status_html)
 
-        with gr.Row(elem_classes=["omd-grid"]):
+        with gr.Row(elem_classes=["omd-grid"]) as workbench:
             with gr.Column(scale=7, elem_classes=["omd-stack"]):
                 with gr.Accordion(
                     "Add source",
@@ -3574,6 +5730,309 @@ def build_app():
                             value="_No source inspected yet._",
                             elem_id="omd-inspect-preview",
                         )
+
+                with gr.Accordion(
+                    "Inbox and review",
+                    open=False,
+                    elem_classes=["omd-window", "omd-panel-inbox"],
+                ) as inbox_window:
+                    with gr.Group(elem_classes=["omd-pane"]):
+                        gr.Markdown(
+                            "### 1. Save a thought or highlight\n\n"
+                            "Use **My note** for your own words. Use **Highlight** for an exact passage "
+                            "copied from something you read.",
+                            elem_classes=["omd-inbox-step"],
+                        )
+                        with gr.Row(elem_classes=["omd-settings-grid"]):
+                            inbox_capture_type = gr.Radio(
+                                label="What are you saving?",
+                                choices=[
+                                    ("My note (my own words)", "My Note"),
+                                    ("Highlight (an exact excerpt)", "Highlight"),
+                                ],
+                                value="My Note",
+                            )
+                            inbox_title = gr.Textbox(
+                                label="Title",
+                                placeholder="A short, recognisable title",
+                            )
+                        inbox_content = gr.Textbox(
+                            label="Your words or exact highlight",
+                            lines=5,
+                            placeholder="Write a thought, or paste the exact passage you want to keep.",
+                        )
+                        save_inbox_btn = gr.Button("Save to Inbox", variant="primary")
+                        gr.Markdown(
+                            "Saving is local and does not use AI. The original text remains in Inbox "
+                            "after either review action.",
+                            elem_classes=["omd-hint", "omd-inbox-privacy"],
+                        )
+                        gr.Markdown(
+                            "### 2. Review one Inbox item\n\n"
+                            "Choose an item, read the unchanged original, and add your own note if useful.",
+                            elem_classes=["omd-inbox-step"],
+                        )
+                        inbox_queue = gr.Markdown(
+                            "_No Inbox items yet. Save a thought or highlight above._",
+                            elem_classes=["omd-file-queue", "omd-inbox-queue"],
+                        )
+                        inbox_item_id = gr.Dropdown(
+                            label="Choose an Inbox item",
+                            choices=[],
+                            value=None,
+                            info="The list refreshes automatically when you open Inbox or save an item.",
+                        )
+                        inbox_provenance = gr.Textbox(
+                            label="Saved details",
+                            value="Choose an Inbox item above.",
+                            lines=2,
+                            interactive=False,
+                        )
+                        inbox_raw_source = gr.Textbox(
+                            label="Original text (kept unchanged)",
+                            value="",
+                            lines=6,
+                            interactive=False,
+                        )
+                        with gr.Accordion(
+                            "Choose a vault source (optional)",
+                            open=False,
+                            elem_classes=["omd-settings-section", "omd-retrieval-panel"],
+                        ):
+                            gr.Markdown(
+                                "Suggest sources combines related notes for this Inbox item with recent converted "
+                                "Markdown under `Sources/` in one list. Search notes is for a phrase you enter. "
+                                "Choosing a file lets AI read only its preview and adds an Obsidian wikilink only "
+                                "when you create the Note. Existing files are never rewritten.",
+                                elem_classes=["omd-hint"],
+                            )
+                            with gr.Row(elem_classes=["omd-action-row"]):
+                                suggest_sources_btn = gr.Button(
+                                    "Suggest sources",
+                                    elem_classes=["omd-no-wrap-btn"],
+                                )
+                            vault_search_query = gr.Textbox(
+                                label="Search this vault",
+                                placeholder="Words or phrases to find",
+                            )
+                            search_notes_btn = gr.Button("Search notes")
+                            retrieval_results = gr.Markdown(
+                                "_No local search run yet._",
+                                elem_classes=["omd-file-queue", "omd-retrieval-results"],
+                            )
+                            linked_markdown_path = gr.Dropdown(
+                                label="Markdown source for AI and new-note link (optional)",
+                                choices=[],
+                                value=None,
+                                info=(
+                                    "Choose one result. Clear the selection to use only the Inbox original."
+                                ),
+                            )
+                            linked_source_preview = gr.Textbox(
+                                label="Selected Markdown source (kept unchanged)",
+                                value="",
+                                lines=7,
+                                interactive=False,
+                            )
+                            linked_source_status = gr.HTML(
+                                value=(
+                                    '<div class="omd-model-status omd-model-status-info">'
+                                    "<strong>AI source:</strong> the selected Inbox original will be used. "
+                                    "No extra source link will be added.</div>"
+                                ),
+                                container=False,
+                            )
+                        with gr.Accordion(
+                            "Draft a takeaway with AI (optional)",
+                            open=False,
+                            visible=not public_demo,
+                            elem_classes=["omd-settings-section", "omd-inbox-ai"],
+                        ) as inbox_ai_panel:
+                            gr.Markdown(
+                                "AI can draft one takeaway, quote exact evidence, and suggest tags from "
+                                "the selected Inbox original or the explicitly selected Markdown preview above. "
+                                "When the draft is ready, suggested tags are copied into the editable field directly "
+                                "below this panel. AI does not open links or read any unselected file.",
+                                elem_classes=["omd-hint"],
+                            )
+                            preview_ai_request_btn = gr.Button(
+                                "Review cloud request",
+                                visible=False,
+                                interactive=not public_demo,
+                            )
+                            ai_request_preview = gr.HTML(
+                                value=(
+                                    '<div class="omd-model-status omd-model-status-info">'
+                                    "<strong>Cloud AI is optional.</strong> Review exactly what will be sent "
+                                    "before granting consent for one request.</div>"
+                                ),
+                                visible=False,
+                                container=False,
+                            )
+                            cloud_consent = gr.Checkbox(
+                                label="Cloud consent for this request",
+                                value=False,
+                                visible=False,
+                                info="Required again for every OpenAI, Anthropic, or DeepSeek request.",
+                                interactive=not public_demo,
+                            )
+                            generate_ai_suggestion_btn = gr.Button(
+                                "Generate draft from selected text",
+                                visible=not public_demo,
+                                interactive=not public_demo,
+                            )
+                            ai_suggestion_box = gr.Textbox(
+                                label="AI draft (edit before including)",
+                                lines=7,
+                                placeholder="A grounded draft will appear here. OMD rejects results without exact evidence.",
+                                interactive=not public_demo,
+                            )
+                            include_ai_suggestion = gr.Checkbox(
+                                label="Add this edited AI draft to the new note",
+                                value=False,
+                                interactive=not public_demo,
+                            )
+                            ai_suggestion_status = gr.HTML(
+                                value=(
+                                    '<div class="omd-model-status omd-model-status-info">'
+                                    "<strong>Local AI scope:</strong> only the chosen read-only text is sent to "
+                                    "Ollama on this Mac. Links are not opened and unselected files are not read.</div>"
+                                ),
+                                container=False,
+                            )
+                        note_tags = gr.Textbox(
+                            label="Tags for new note (editable)",
+                            placeholder="agents, knowledge-management",
+                        )
+                        gr.Markdown(
+                            "AI suggestions are added here, not saved automatically. Review, edit, or remove tags before creating the note.",
+                            elem_classes=["omd-field-help"],
+                        )
+                        inbox_review_notes = gr.Textbox(
+                            label="Add your note (optional)",
+                            lines=3,
+                            placeholder="Your interpretation, question, or next step. Kept separate from the original.",
+                        )
+                        gr.Markdown(
+                            "### 3. Decide what to keep\n\n"
+                            "**Create note in Notes** copies the original plus your optional additions into "
+                            "a traceable note, saves your edited tags, and includes the selected source as an "
+                            "Obsidian wikilink, if any. "
+                            "**Keep original · mark as not needed** is not Delete: it creates no Note and "
+                            "keeps the Inbox original available.",
+                            elem_classes=["omd-inbox-step"],
+                        )
+                        with gr.Row(elem_classes=["omd-action-row"]):
+                            accept_inbox_btn = gr.Button(
+                                "Create note in Notes",
+                                variant="primary",
+                            )
+                            reject_inbox_btn = gr.Button(
+                                "Keep original · mark as not needed"
+                            )
+                        inbox_action_status = gr.HTML(
+                            value=(
+                                '<div class="omd-model-status omd-model-status-info" '
+                                'role="status" aria-live="polite">'
+                                "<strong>No review action yet.</strong> Choose one final action above.</div>"
+                            ),
+                            container=False,
+                        )
+                        with gr.Accordion(
+                            "Voice attachment and review",
+                            open=False,
+                            elem_classes=["omd-settings-section", "omd-voice-panel"],
+                        ):
+                            gr.Markdown(
+                                "Attach an existing audio memo. OMD saves the original to this vault first, "
+                                "then you can transcribe it locally and review the result. Recording is not "
+                                "included in this desktop phase.",
+                                elem_classes=["omd-hint"],
+                            )
+                            voice_upload = gr.File(
+                                label="Voice attachment",
+                                type="filepath",
+                                file_count="single",
+                                file_types=["audio"],
+                                interactive=not public_demo,
+                            )
+                            with gr.Row(elem_classes=["omd-settings-grid"]):
+                                voice_title = gr.Textbox(
+                                    label="Voice note title",
+                                    placeholder="Optional; the filename is used when blank",
+                                    interactive=not public_demo,
+                                )
+                                voice_capture_notes = gr.Textbox(
+                                    label="My Notes before transcription",
+                                    placeholder="Optional context in your own words",
+                                    interactive=not public_demo,
+                                )
+                            save_voice_btn = gr.Button(
+                                "Save audio to Inbox",
+                                variant="primary",
+                                interactive=not public_demo,
+                            )
+                            gr.Markdown(
+                                "**Step 1:** save the audio | **Step 2:** transcribe locally | "
+                                "**Step 3:** compare and decide",
+                                elem_classes=["omd-hint", "omd-inbox-privacy"],
+                            )
+                            with gr.Row(elem_classes=["omd-action-row"]):
+                                refresh_voice_btn = gr.Button(
+                                    "Refresh voice Inbox",
+                                    interactive=not public_demo,
+                                )
+                                voice_record_id = gr.Dropdown(
+                                    label="Voice item",
+                                    choices=[],
+                                    value=None,
+                                    interactive=not public_demo,
+                                )
+                            voice_transcript = gr.Textbox(
+                                label="Raw transcript (editable after local transcription)",
+                                lines=7,
+                                placeholder="The local transcript will appear here.",
+                                interactive=not public_demo,
+                            )
+                            voice_review_notes = gr.Textbox(
+                                label="My Notes",
+                                lines=3,
+                                placeholder="Your own notes stay separate from the transcript.",
+                                interactive=not public_demo,
+                            )
+                            voice_ai_suggestion = gr.Textbox(
+                                label="AI suggestion (optional and review required)",
+                                lines=4,
+                                placeholder="Optional organisation or summary; never replaces the raw transcript.",
+                                interactive=not public_demo,
+                            )
+                            voice_quality = gr.Markdown(
+                                "_Choose a voice attachment to review._",
+                                elem_classes=["omd-file-queue", "omd-voice-quality"],
+                            )
+                            transcribe_voice_btn = gr.Button(
+                                "Transcribe / Retry locally",
+                                interactive=not public_demo,
+                            )
+                            with gr.Row(elem_classes=["omd-action-row"]):
+                                keep_raw_voice_btn = gr.Button(
+                                    "Keep raw",
+                                    interactive=not public_demo,
+                                )
+                                accept_voice_btn = gr.Button(
+                                    "Accept Voice note",
+                                    variant="primary",
+                                    interactive=not public_demo,
+                                )
+                                reject_voice_btn = gr.Button(
+                                    "Reject",
+                                    interactive=not public_demo,
+                                )
+                            voice_action_status = gr.Markdown("_No voice action yet._")
+                            voice_queue = gr.Markdown(
+                                "_No voice attachments in this Inbox._",
+                                elem_classes=["omd-file-queue", "omd-voice-queue"],
+                            )
 
                 with gr.Accordion(
                     "Result and download",
@@ -3642,6 +6101,7 @@ def build_app():
                                 value=DEFAULT_VAULT_DIR,
                                 scale=5,
                                 interactive=not public_demo,
+                                elem_id="omd-vault-folder",
                             )
                             choose_vault_dir = gr.Button(
                                 "Choose vault",
@@ -3811,7 +6271,7 @@ def build_app():
                                     elem_classes=["omd-picker-btn"],
                                     interactive=not public_demo,
                                 )
-                                json_events = gr.State(False)
+                                json_events = gr.State(INTERNAL_JSON_EVENTS_DEFAULT)
                                 with gr.Accordion(
                                     "Developer diagnostics",
                                     open=False,
@@ -3827,6 +6287,80 @@ def build_app():
                                                 "Extra lines appear in Process log for this run; they are not saved into your Obsidian vault or generated Markdown."
                                             ),
                                         )
+
+                        with gr.Accordion(
+                            "AI provider for Inbox review",
+                            open=False,
+                            elem_classes=["omd-settings-section"],
+                        ):
+                            with gr.Group(elem_classes=["omd-option-panel"]):
+                                gr.HTML('<div class="omd-option-title">Optional AI destination</div>')
+                                gr.Markdown(
+                                    (
+                                        "Use local Ollama by default, turn AI off, or bring your own API key for "
+                                        "OpenAI, Anthropic, or DeepSeek. OMD uses direct provider APIs, never a "
+                                        "consumer ChatGPT/Claude login, and never falls back to another provider."
+                                    ),
+                                    elem_classes=["omd-hint"],
+                                )
+                                ai_provider_choice = gr.Dropdown(
+                                    label="AI provider for Inbox review",
+                                    choices=(list(AI_PROVIDER_CHOICES) if not public_demo else ["No AI"]),
+                                    value="Local Ollama" if not public_demo else "No AI",
+                                    interactive=not public_demo,
+                                )
+                                provider_model = gr.Dropdown(
+                                    label="Provider model",
+                                    choices=[default_polish_model] if not public_demo else [],
+                                    value=default_polish_model if not public_demo else None,
+                                    allow_custom_value=True,
+                                    info=(
+                                        "Use Check models, then choose the exact model. OMD does not "
+                                        "silently substitute another model."
+                                    ),
+                                    interactive=not public_demo,
+                                )
+                                with gr.Group(visible=False) as cloud_key_controls:
+                                    session_api_key = gr.Textbox(
+                                        label="Session API key",
+                                        type="password",
+                                        placeholder="Used in memory for this UI session",
+                                        interactive=not public_demo,
+                                    )
+                                    gr.Markdown(
+                                        "Leave blank to use a supported environment variable or a key saved in "
+                                        "macOS Keychain. Secrets are not written to OMD project or vault files.",
+                                        elem_classes=["omd-field-help"],
+                                    )
+                                    with gr.Row(elem_classes=["omd-action-row"]):
+                                        save_provider_key_btn = gr.Button(
+                                            "Save key to Keychain",
+                                            interactive=not public_demo,
+                                        )
+                                        delete_provider_key_btn = gr.Button(
+                                            "Delete saved key",
+                                            interactive=not public_demo,
+                                        )
+                                check_ai_provider_btn = gr.Button(
+                                    "Check models",
+                                    elem_classes=["omd-picker-btn", "omd-no-wrap-btn"],
+                                    interactive=not public_demo,
+                                )
+                                ai_provider_status = gr.HTML(
+                                    value=(
+                                        '<div class="omd-model-status omd-model-status-info">'
+                                        "<strong>Local-only provider:</strong> source text stays on this Mac and is "
+                                        "sent only to the selected loopback Ollama endpoint. No cloud consent or API key is used."
+                                        "</div>"
+                                        if not public_demo
+                                        else (
+                                            '<div class="omd-model-status omd-model-status-info">'
+                                            "<strong>AI disabled in hosted demo:</strong> use the local app for private model access."
+                                            "</div>"
+                                        )
+                                    ),
+                                    container=False,
+                                )
 
                         with gr.Accordion("Platform adapters", open=False, elem_classes=["omd-settings-section"]):
                             with gr.Group(elem_classes=["omd-option-panel"]):
@@ -3911,6 +6445,7 @@ def build_app():
             fn=_stage_batch_list,
             inputs=[batch_file_input],
             outputs=[batch_file_path],
+            api_visibility="private",
         )
 
         def remove_deleted_source_file(
@@ -3926,89 +6461,389 @@ def build_app():
             inputs=[source_file_queue, file_input],
             outputs=[source_file_queue, source_file_queue_summary, file_input],
             queue=False,
+            api_visibility="private",
         )
         file_input.delete(
             fn=remove_deleted_source_file,
             inputs=[source_file_queue],
             outputs=[source_file_queue, source_file_queue_summary],
             queue=False,
+            api_visibility="private",
         )
         file_input.clear(
             fn=_clear_source_file_queue,
             inputs=[source_file_queue],
             outputs=[source_file_queue, source_file_queue_summary],
             queue=False,
+            api_visibility="private",
         )
-        menu_outputs = [source_window, result_window, output_window, run_dock, cookies_window, advanced_window]
+        menu_outputs = [
+            source_window,
+            inbox_window,
+            result_window,
+            output_window,
+            run_dock,
+            cookies_window,
+            advanced_window,
+            all_tab,
+            source_tab,
+            inbox_tab,
+            output_tab,
+            advanced_tab,
+            workbench,
+        ]
         all_tab.click(
             fn=lambda: _menu_view_updates("all"),
             inputs=None,
             outputs=menu_outputs,
+            api_visibility="private",
         )
         source_tab.click(
             fn=lambda: _menu_view_updates("source"),
             inputs=None,
             outputs=menu_outputs,
+            api_visibility="private",
+        )
+        inbox_tab.click(
+            fn=lambda: _menu_view_updates("inbox"),
+            inputs=None,
+            outputs=menu_outputs,
+            api_visibility="private",
+        ).then(
+            fn=_refresh_inbox_ui,
+            inputs=[vault_dir],
+            outputs=[inbox_queue, inbox_item_id],
+            api_visibility="private",
         )
         output_tab.click(
             fn=lambda: _menu_view_updates("output"),
             inputs=None,
             outputs=menu_outputs,
+            api_visibility="private",
         )
         advanced_tab.click(
             fn=lambda: _menu_view_updates("advanced"),
             inputs=None,
             outputs=menu_outputs,
+            api_visibility="private",
+        )
+        save_inbox_btn.click(
+            fn=_save_inbox_note,
+            inputs=[vault_dir, inbox_capture_type, inbox_title, inbox_content],
+            outputs=[inbox_queue, inbox_item_id, inbox_action_status],
+            api_visibility="private",
+        )
+        accept_inbox_btn.click(
+            fn=lambda vault, item_id, notes, suggestion, include_suggestion, linked_source, tags: (
+                _review_inbox_note(
+                    vault,
+                    item_id,
+                    "accept",
+                    notes,
+                    suggestion,
+                    include_suggestion,
+                    linked_source,
+                    tags,
+                )
+            ),
+            inputs=[
+                vault_dir,
+                inbox_item_id,
+                inbox_review_notes,
+                ai_suggestion_box,
+                include_ai_suggestion,
+                linked_markdown_path,
+                note_tags,
+            ],
+            outputs=[inbox_queue, inbox_item_id, inbox_action_status],
+            api_visibility="private",
+        )
+        reject_inbox_btn.click(
+            fn=lambda vault, item_id, notes: _review_inbox_note(
+                vault, item_id, "reject", notes
+            ),
+            inputs=[vault_dir, inbox_item_id, inbox_review_notes],
+            outputs=[inbox_queue, inbox_item_id, inbox_action_status],
+            api_visibility="private",
+        )
+        ai_provider_choice.change(
+            fn=_ai_provider_ui_updates,
+            inputs=[ai_provider_choice, polish_md_model],
+            outputs=[
+                provider_model,
+                cloud_key_controls,
+                session_api_key,
+                cloud_consent,
+                ai_provider_status,
+                preview_ai_request_btn,
+                ai_request_preview,
+                generate_ai_suggestion_btn,
+                inbox_ai_panel,
+            ],
+            api_visibility="private",
+        ).then(fn=lambda: None, inputs=None, outputs=[ai_consent_grant], api_visibility="private")
+        check_ai_provider_btn.click(
+            fn=_check_ai_provider_connection,
+            inputs=[ai_provider_choice, provider_model, session_api_key, ollama_host],
+            outputs=[provider_model, ai_provider_status],
+            api_visibility="private",
+        )
+        save_provider_key_btn.click(
+            fn=_save_cloud_api_key,
+            inputs=[ai_provider_choice, session_api_key],
+            outputs=[session_api_key, ai_provider_status],
+            api_visibility="private",
+        )
+        delete_provider_key_btn.click(
+            fn=_delete_cloud_api_key,
+            inputs=[ai_provider_choice],
+            outputs=[ai_provider_status],
+            api_visibility="private",
+        )
+        preview_ai_request_btn.click(
+            fn=_preview_inbox_ai_request_for_ui,
+            inputs=[
+                vault_dir,
+                inbox_item_id,
+                ai_provider_choice,
+                provider_model,
+                ollama_host,
+                linked_markdown_path,
+            ],
+            outputs=[ai_request_preview, ai_consent_grant, cloud_consent],
+            api_visibility="private",
+        )
+        generate_ai_suggestion_btn.click(
+            fn=_run_inbox_ai_suggestion_for_ui,
+            inputs=[
+                vault_dir,
+                inbox_item_id,
+                ai_provider_choice,
+                provider_model,
+                session_api_key,
+                ollama_host,
+                cloud_consent,
+                ai_suggestion_box,
+                note_tags,
+                ai_consent_grant,
+                linked_markdown_path,
+            ],
+            outputs=[ai_suggestion_box, ai_suggestion_status, note_tags],
+            api_visibility="private",
+        ).then(
+            fn=lambda: (False, None),
+            inputs=None,
+            outputs=[cloud_consent, ai_consent_grant],
+            api_visibility="private",
+        )
+        inbox_item_id.change(
+            fn=_load_inbox_review,
+            inputs=[vault_dir, inbox_item_id],
+            outputs=[inbox_provenance, inbox_raw_source],
+            api_visibility="private",
+        ).then(
+            fn=_reset_inbox_review_context,
+            inputs=None,
+            outputs=[
+                cloud_consent,
+                include_ai_suggestion,
+                ai_suggestion_box,
+                ai_consent_grant,
+                linked_markdown_path,
+                linked_source_preview,
+                linked_source_status,
+                inbox_action_status,
+                note_tags,
+                inbox_review_notes,
+                retrieval_results,
+                vault_search_query,
+            ],
+            api_visibility="private",
+        )
+        linked_markdown_path.change(
+            fn=_load_vault_markdown_source,
+            inputs=[vault_dir, linked_markdown_path],
+            outputs=[linked_source_preview, linked_source_status],
+            api_visibility="private",
+        ).then(
+            fn=lambda: (False, False, "", None),
+            inputs=None,
+            outputs=[cloud_consent, include_ai_suggestion, ai_suggestion_box, ai_consent_grant],
+            api_visibility="private",
+        )
+        provider_model.change(
+            fn=lambda: (False, None),
+            inputs=None,
+            outputs=[cloud_consent, ai_consent_grant],
+            api_visibility="private",
+        )
+        suggest_sources_btn.click(
+            fn=_suggest_vault_sources_for_ui,
+            inputs=[vault_dir, inbox_item_id],
+            outputs=[retrieval_results, linked_markdown_path],
+            api_visibility="private",
+        )
+        search_notes_btn.click(
+            fn=_search_vault_notes_for_ui,
+            inputs=[vault_dir, vault_search_query],
+            outputs=[retrieval_results, linked_markdown_path],
+            api_visibility="private",
+        )
+        save_voice_btn.click(
+            fn=_save_voice_attachment,
+            inputs=[vault_dir, voice_upload, voice_title, voice_capture_notes],
+            outputs=[voice_queue, voice_record_id, voice_action_status, voice_upload],
+            api_visibility="private",
+        )
+        refresh_voice_btn.click(
+            fn=_refresh_voice_ui,
+            inputs=[vault_dir],
+            outputs=[voice_queue, voice_record_id],
+            api_visibility="private",
+        )
+        voice_record_id.change(
+            fn=_load_voice_review,
+            inputs=[vault_dir, voice_record_id],
+            outputs=[
+                voice_transcript,
+                voice_review_notes,
+                voice_ai_suggestion,
+                voice_quality,
+                voice_action_status,
+            ],
+            api_visibility="private",
+        )
+        transcribe_voice_btn.click(
+            fn=_begin_voice_transcription,
+            inputs=[
+                vault_dir,
+                voice_record_id,
+                voice_review_notes,
+                whisper_model,
+                preferred_languages,
+            ],
+            outputs=[voice_action_status],
+            api_visibility="private",
+        ).then(
+            fn=_finish_voice_transcription,
+            inputs=[vault_dir, voice_record_id],
+            outputs=[
+                voice_transcript,
+                voice_review_notes,
+                voice_ai_suggestion,
+                voice_quality,
+                voice_action_status,
+                voice_queue,
+            ],
+            api_visibility="private",
+        )
+        keep_raw_voice_btn.click(
+            fn=lambda vault, item_id, transcript, notes, suggestion: _review_voice_attachment(
+                vault, item_id, "keep_raw", transcript, notes, suggestion
+            ),
+            inputs=[
+                vault_dir,
+                voice_record_id,
+                voice_transcript,
+                voice_review_notes,
+                voice_ai_suggestion,
+            ],
+            outputs=[voice_queue, voice_record_id, voice_quality, voice_action_status],
+            api_visibility="private",
+        )
+        accept_voice_btn.click(
+            fn=lambda vault, item_id, transcript, notes, suggestion: _review_voice_attachment(
+                vault, item_id, "accept", transcript, notes, suggestion
+            ),
+            inputs=[
+                vault_dir,
+                voice_record_id,
+                voice_transcript,
+                voice_review_notes,
+                voice_ai_suggestion,
+            ],
+            outputs=[voice_queue, voice_record_id, voice_quality, voice_action_status],
+            api_visibility="private",
+        )
+        reject_voice_btn.click(
+            fn=lambda vault, item_id, transcript, notes, suggestion: _review_voice_attachment(
+                vault, item_id, "reject", transcript, notes, suggestion
+            ),
+            inputs=[
+                vault_dir,
+                voice_record_id,
+                voice_transcript,
+                voice_review_notes,
+                voice_ai_suggestion,
+            ],
+            outputs=[voice_queue, voice_record_id, voice_quality, voice_action_status],
+            api_visibility="private",
         )
         inspect_btn.click(
             fn=_inspect_source,
             inputs=[text_input, source_file_queue, batch_file_path, cookies_file, cookies_browser, xhs_cookies_file],
             outputs=[inspect_preview],
+            api_visibility="private",
         )
         choose_out_dir.click(
             fn=_choose_output_dir,
             inputs=[out_dir],
             outputs=[out_dir],
+            api_visibility="private",
         )
         choose_vault_dir.click(
             fn=_choose_output_dir,
             inputs=[vault_dir],
             outputs=[vault_dir],
+            api_visibility="private",
         )
         cookies_upload.change(
             fn=_stage_cookies,
             inputs=[cookies_upload],
             outputs=[cookies_file],
+            api_visibility="private",
         )
         xhs_cookies_upload.change(
             fn=_stage_cookies,
             inputs=[xhs_cookies_upload],
             outputs=[xhs_cookies_file],
+            api_visibility="private",
         )
         choose_cookies_file.click(
             fn=_choose_cookies_file,
             inputs=[cookies_file],
             outputs=[cookies_file],
+            api_visibility="private",
         )
         choose_xhs_cookies_file.click(
             fn=_choose_cookies_file,
             inputs=[xhs_cookies_file],
             outputs=[xhs_cookies_file],
+            api_visibility="private",
         )
         workflow_mode.change(
             fn=_workflow_mode_updates,
             inputs=[workflow_mode],
             outputs=[run_btn, polish_md, memory_cards],
+            api_visibility="private",
+        )
+        verbose.change(
+            fn=lambda enabled: not enabled,
+            inputs=[verbose],
+            outputs=[json_events],
+            api_visibility="private",
         )
         check_local_model_btn.click(
             fn=_local_model_status_html,
             inputs=[polish_md_model, memory_model, ollama_host],
             outputs=[local_model_status],
+            api_visibility="private",
         )
         open_output_btn.click(
             fn=_open_output_path,
             inputs=[out_path_box],
             outputs=[status],
+            api_visibility="private",
         )
         run_event = run_btn.click(
             fn=run_with_status,
@@ -4024,6 +6859,7 @@ def build_app():
                 verbose, json_events, reddit_comment_scope, xhs_cookies_file,
             ],
             outputs=[log_box, md_preview, out_path_box, status, download_file],
+            api_name="run_with_status",
         )
         stop_btn.click(
             fn=None,
@@ -4037,19 +6873,88 @@ def build_app():
             inputs=None,
             outputs=[status],
             queue=False,
+            api_visibility="private",
         )
 
     return app
 
 
-def main() -> int:
-    app = build_app()
-    kwargs = build_launch_kwargs(
-        inbrowser=True,
-        server_name=os.environ.get("OMD_UI_HOST", "127.0.0.1"),
-        server_port=int(os.environ.get("OMD_UI_PORT", "7860")),
+def _ui_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def _ui_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omd-ui",
+        description="Launch the local OMD browser UI.",
+        epilog=(
+            "Environment: OMD_UI_PORT sets the default port and OMD_UI_HOST sets the "
+            "loopback host. Run `omd doctor` if the UI dependencies are unavailable."
+        ),
     )
-    app.queue().launch(**kwargs)
+    parser.add_argument(
+        "--port",
+        type=_ui_port,
+        default=os.environ.get("OMD_UI_PORT", "7860"),
+        help="Local server port (default: OMD_UI_PORT or 7860).",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Start the UI without opening a browser tab.",
+    )
+    return parser
+
+
+def _write_ui_startup_error(exc: Exception, *, port: int) -> None:
+    message = str(exc)
+    normalized = message.lower()
+    if "cannot find empty port" in normalized or "address already in use" in normalized:
+        alternative = port + 1 if port < 65535 else port - 1
+        sys.stderr.write(
+            f"error: OMD UI could not start because port {port} is already in use.\n"
+            f"next: run `omd-ui --port {alternative}`.\n"
+            f"alternative: run `OMD_UI_PORT={alternative} omd-ui`.\n"
+            "preserved: no vault files were changed.\n"
+        )
+        sys.stderr.flush()
+        return
+    if isinstance(exc, ImportError):
+        sys.stderr.write(
+            "error: OMD UI dependencies are unavailable.\n"
+            "next: install the UI extra with `python -m pip install 'omd[ui]'`.\n"
+            "check: run `omd doctor` after installation.\n"
+            "preserved: no vault files were changed.\n"
+        )
+        sys.stderr.flush()
+        return
+    sys.stderr.write(
+        f"error: OMD UI could not start: {message}\n"
+        "next: run `omd doctor`, correct the reported configuration, and retry.\n"
+        "preserved: no vault files were changed.\n"
+    )
+    sys.stderr.flush()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _ui_argument_parser().parse_args(argv)
+    try:
+        app = build_app()
+        kwargs = build_launch_kwargs(
+            inbrowser=not args.no_browser,
+            server_name=os.environ.get("OMD_UI_HOST", "127.0.0.1"),
+            server_port=args.port,
+        )
+        app.queue().launch(**kwargs)
+    except (ImportError, OSError, ValueError) as exc:
+        _write_ui_startup_error(exc, port=args.port)
+        return 1
     return 0
 
 

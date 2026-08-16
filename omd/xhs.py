@@ -484,6 +484,7 @@ def main() -> int:
                 if args.polish and transcript_text and not transcript_warnings:
                     polished = polish_transcript(
                         transcript_text, args.polish, args.ollama_host, segments=segments,
+                        **({"allow_remote": True} if args.allow_remote_ollama else {}),
                     )
             except Exception as e:
                 _progress.warn(f"video transcription failed: {e}")

@@ -1,6 +1,7 @@
 # omd `--json-events` schema
 
-Version: **v1** (locked)
+Transport version: **v1** (locked)
+Structured work extension: **work v2** (additive)
 
 When `--json-events` is set on `omd` (or `omd.reel` / `omd.podcast` / `omd.xhs`),
 the CLI emits one JSON object per line on **stderr** in place of the human-readable
@@ -63,6 +64,31 @@ Every event has these:
 | `ts` | float | Unix epoch seconds, rounded to 3 decimal places. |
 | `event` | string | One of the core event types below, or a documented command-specific event such as the batch events listed in this file. |
 
+## Structured work extension (`work_v: 2`)
+
+Stage, progress, and stage-state events may include an additive `work_v: 2`
+snapshot. The top-level transport remains `v: 1`; existing consumers must ignore
+the new fields and continue to work. New UI consumers should use these fields
+instead of parsing human log text or treating cosmetic percentages as work.
+
+| field | type | meaning |
+|-------|------|---------|
+| `work_v` | integer | Structured work schema version. Current value is `2`. |
+| `stage_id` | string | Stable lowercase stage token such as `download`, `convert`, `ocr`, `transcribe`, or `polish`. |
+| `state` | string | `determinate`, `indeterminate`, `retrying`, `needs_action`, `completed`, `failed`, or `cancelled`. |
+| `unit` | string | Optional real work unit: `bytes`, `pages`, `pixels`, `audio_seconds`, `tokens`, or `items`. |
+| `completed` | number | Completed real work. Omitted when it cannot be measured. |
+| `total` | number | Known positive work total. Omitted when unknowable. |
+| `elapsed_s` | number | Elapsed time for the current stage observation. |
+| `attempt` | integer | One-based stage attempt. |
+| `item_index` | integer | Optional one-based active batch item. It does not mean the item has completed. |
+| `item_total` | integer | Optional total batch item count. |
+| `peak_memory_bytes` | integer | Optional process high-water RSS snapshot, normalised to bytes. It contains no source or machine identity. |
+
+Unknown totals remain explicitly indeterminate. A consumer must not invent a
+percentage when `state` is not `determinate` or when `completed`/`total` are
+absent.
+
 ## Event types
 
 ### `stage`
@@ -70,12 +96,25 @@ Every event has these:
 Marks the start of a named pipeline stage.
 
 ```json
-{"v":1,"ts":1715342400.123,"event":"stage","name":"transcribe"}
+{"v":1,"ts":1715342400.123,"event":"stage","name":"transcribe","work_v":2,"stage_id":"transcribe","state":"indeterminate","unit":"audio_seconds","elapsed_s":0.0,"attempt":1}
 ```
 
 | field | type | meaning |
 |-------|------|---------|
 | `name` | string | Stage identifier. Stable values: `"download"`, `"transcribe"`, `"polish"`, `"compose"`, `"ocr"`, `"convert"`. New names may be added in v1.x; consumers should fall back to displaying the value as-is. |
+
+### `stage_state`
+
+Reports an explicit non-determinate or terminal state without fabricating a
+legacy progress percentage.
+
+```json
+{"v":1,"ts":1715342450.456,"event":"stage_state","work_v":2,"stage_id":"transcribe","state":"completed","unit":"audio_seconds","completed":373.0,"total":373.0,"elapsed_s":61.2,"attempt":1}
+```
+
+Use `needs_action` for blockers such as missing cookies, `retrying` while a
+retry is scheduled, and `completed`/`failed`/`cancelled` for terminal stage
+states. ETA countdowns must pause for `needs_action` and `retrying`.
 
 ### `progress`
 
@@ -83,17 +122,17 @@ Per-tick progress update for a determinate operation. Emitted from inside
 `ProgressBar` (e.g. polish chunks, batch folder iteration).
 
 ```json
-{"v":1,"ts":1715342410.456,"event":"progress","label":"Polish","cur":3,"total":12,"percent":25.0,"elapsed_s":4.27,"eta_s":12.81}
+{"v":1,"ts":1715342410.456,"event":"progress","label":"Polish","cur":420,"total":1680,"percent":25.0,"elapsed_s":4.27,"eta_s":12.81,"work_v":2,"stage_id":"polish","state":"determinate","unit":"tokens","completed":420.0,"attempt":1}
 ```
 
 | field | type | meaning |
 |-------|------|---------|
 | `label` | string | Bar label. Examples: `"Polish"`, `"Batch"`, `"Download"`. |
-| `cur` | integer | Current count. |
-| `total` | integer | Total count. Always positive. May be a coarse estimate; consumer should treat `cur/total` as a ratio. |
+| `cur` | integer | Legacy current count. Prefer `completed` when `work_v: 2` is present. |
+| `total` | integer | Legacy total count. Always positive. With `work_v: 2`, it is the real-unit total declared by `unit`. |
 | `percent` | float | Completion percentage, rounded to 1 decimal place. |
 | `elapsed_s` | float | Seconds since the bar started. Rounded to 2 decimals. |
-| `eta_s` | float | Estimated seconds remaining, rounded to 2 decimals. `0` when complete. |
+| `eta_s` | float | Legacy instantaneous estimate, rounded to 2 decimals. `0` when complete. It is retained for compatibility and is not the calibrated Stage ETA contract. |
 
 ### `done`
 
@@ -107,6 +146,7 @@ completes normally.
 | field | type | meaning |
 |-------|------|---------|
 | `output` | string \| null | Absolute or working-directory-relative path written. `null` if the result went to stdout (no `--output`). |
+| `request_id` | string | Optional additive field for request-scoped commands such as `enrich-note`. |
 
 ### `warn`
 
@@ -135,6 +175,17 @@ signal and use the most recent `error` event for the user-facing message.
 |-------|------|---------|
 | `kind` | string | Stable machine token. Known examples include `"tool_missing"`, `"unsupported_extension"`, `"file_not_found"`, `"flag_conflict"`, `"format_invalid"`, `"agent_safe_blocked_flag"`, `"url_not_found"`, `"cookies_missing"`, `"cookies_invalid"`, `"network"`, `"parse_failed"`, `"fetch_failed"`, `"transcribe_failed"`, and `"f2_no_audio"`. New `kind` values may be added in v1.x; consumers should fall back to displaying `message`. |
 | `message` | string | Human-readable error line. May contain paths or URLs. |
+| `request_id` | string | Optional additive field once a request-scoped command has validated the ID. |
+
+### `enrich-note` stages and terminal events
+
+`omd enrich-note --json-events` uses the additive stage IDs `catalog`,
+`retrieve`, `generate`, and `validate` in that order. A successful run ends in
+one `done` event with `output: null`; a failed run ends in one `error` event.
+Terminal events include `request_id` when it is already known. Enrichment
+events never contain note/candidate bodies, prompts, credentials, environment
+values, or the full vault path. See
+[`enrich-note` contract v1](enrich-note-contract-v1.md).
 
 ## Batch Events
 
@@ -147,7 +198,7 @@ events.
 Emitted once after the batch list has been read.
 
 ```json
-{"v":1,"ts":1715342400.123,"event":"batch_started","out_dir":"/path/to/out","total":2,"retries":1}
+{"v":1,"ts":1715342400.123,"event":"batch_started","out_dir":"/path/to/out","total":2,"retries":1,"worker_plan":{"global":2,"convert":2,"network":2,"ocr":1,"asr":1,"model":1}}
 ```
 
 | field | type | meaning |
@@ -155,6 +206,7 @@ Emitted once after the batch list has been read.
 | `out_dir` | string | Output directory for generated Markdown/RMarkdown files. |
 | `total` | integer | Number of batch items to process. |
 | `retries` | integer | Configured retry count for failed items. |
+| `worker_plan` | object | Effective bounded limits for this run. `global` is the process-wide conversion cap; `convert`, `network`, `ocr`, `asr`, and `model` are lane caps. OCR, ASR, and model lanes remain one worker. |
 
 ### `batch_item_started`
 

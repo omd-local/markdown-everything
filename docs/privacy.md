@@ -57,6 +57,42 @@ The intended default model path is local Ollama. The local UI accepts loopback
 Ollama only. The CLI requires both `--allow-remote-ollama` and an HTTPS endpoint
 before it will send source content to a remote Ollama-compatible host.
 
+The Inbox review surface also supports an explicit **Cloud for this task**
+choice for direct OpenAI, Anthropic, or DeepSeek developer APIs. Before any note
+text is sent, OMD requires a task-bound preview and consent showing the selected
+provider, exact model, destination domain, estimated input size, and current
+provider-policy link. A consumer ChatGPT or Claude subscription is not an API
+credential. OMD does not use OpenRouter, automatically switch providers, send a
+whole vault, or make hosted AI part of capture and deterministic conversion.
+Before credential access or a model request, OMD also checks a conservative
+input-plus-output context budget. It rejects an oversized task and preserves
+the Inbox source instead of silently truncating private text.
+
+UI-entered provider keys are stored through the native macOS Security framework
+when Keychain is available. If Keychain is unavailable, the UI uses session-only
+entry rather than writing the secret into application state. API keys never
+enter a command argument. They must not appear in
+Markdown, manifests, Context Receipts, ETA history, exports, or logs. Provider
+and model identifiers plus usage/timing may be recorded with the reviewed task;
+prompt and response content are not ETA telemetry.
+
+Local ETA history stores only coarse stage, source class, device tier,
+runtime/model identity, cold/warm state, work units, duration, outcome,
+timestamp, and pipeline version. Path-like model identities are hashed. It does
+not store source URLs, filenames, note text, prompts, responses, API keys, or
+cookie paths. Historical ranges remain hidden until both the minimum sample
+count and an explicit versioned calibration gate pass; the user can disable or
+reset this history.
+Retry state, a coarse queue-depth bucket, and throughput derived passively from
+the required operation may also be stored. OMD does not run a separate network
+speed test or retain an IP address for ETA.
+
+After a history bucket is mature, OMD may additionally store bounded
+baseline-versus-shadow rows containing only the same safe tokens and numeric
+baseline/shadow/actual durations. These rows are local application state, not
+vault notes and not shared telemetry. Disabling timing collection stops new
+rows; Reset ETA history removes both timing observations and shadow rows.
+
 Recommended local model defaults for the current beta:
 
 - A memory-aware text recommendation for optional transcript polish, Markdown

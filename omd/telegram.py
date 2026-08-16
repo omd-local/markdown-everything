@@ -11,8 +11,6 @@ import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
-
 from omd import __version__
 
 TELEGRAM_HOSTS = {

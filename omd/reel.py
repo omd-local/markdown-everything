@@ -35,9 +35,11 @@ from omd._language import DEFAULT_OCR_LANGUAGE
 from omd._models import (
     LOCAL_TEXT_CONTEXT_TOKENS,
     bounded_edit_output_budget,
+    estimated_text_tokens,
     local_text_model_issue,
     recommended_local_text_model,
 )
+from omd.ollama_runtime import ollama_keep_alive, request_ollama_json
 
 DOUYIN_HOSTS = {"douyin.com", "v.douyin.com", "iesdouyin.com", "www.douyin.com"}
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -390,6 +392,7 @@ def _polish_chunk(text: str, model: str, host: str) -> str:
         "prompt": prompt,
         "stream": False,
         "think": False,
+        "keep_alive": ollama_keep_alive(),
         "options": {
             "temperature": 0.1,
             "num_ctx": LOCAL_TEXT_CONTEXT_TOKENS,
@@ -401,8 +404,7 @@ def _polish_chunk(text: str, model: str, host: str) -> str:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=POLISH_CHUNK_TIMEOUT_SECONDS) as r:
-        payload = json.loads(r.read())
+    payload = request_ollama_json(req, timeout=POLISH_CHUNK_TIMEOUT_SECONDS)
     if payload.get("done_reason") == "length":
         raise RuntimeError(
             f"model reached its output limit ({output_budget} tokens) before finishing"
@@ -447,10 +449,14 @@ def polish_transcript(
     model: str,
     host: str = "http://localhost:11434",
     segments: list[dict] | None = None,
+    *,
+    allow_remote: bool = False,
 ) -> str:
     """Chunk-then-polish to keep models in 'edit' mode rather than 'summarize' mode."""
     from omd import _progress
+    from omd._network_policy import validate_ollama_host
 
+    validate_ollama_host(host, allow_remote=allow_remote)
     if issue := local_text_model_issue(model):
         _progress.warn(
             f"Ollama transcript polish skipped: {issue}. Keeping the raw transcript."
@@ -465,7 +471,13 @@ def polish_transcript(
         chunks = [text[i:i + POLISH_CHUNK_SIZE] for i in range(0, n_chars, POLISH_CHUNK_SIZE)]
 
     out_parts: list[str] = []
-    with _progress.ProgressBar("Polish", total=len(chunks)) as bar:
+    chunk_units = [estimated_text_tokens(chunk) for chunk in chunks]
+    with _progress.ProgressBar(
+        "Polish",
+        total=sum(chunk_units),
+        stage_id="polish",
+        unit="tokens",
+    ) as bar:
         for i, c in enumerate(chunks, 1):
             _progress.log(f"polish chunk {i}/{len(chunks)} ({len(c)} chars)...")
             try:
@@ -481,13 +493,13 @@ def polish_transcript(
                     f"polish chunk {i}/{len(chunks)} failed: {e}. Keeping this chunk and "
                     f"all remaining transcript text unchanged.{skipped}"
                 )
-                bar.update(remaining + 1)
+                bar.update(sum(chunk_units[i - 1:]))
                 if i == 1:
                     return text
                 out_parts.append(c)
                 out_parts.extend(chunks[i:])
                 break
-            bar.update()
+            bar.update(chunk_units[i - 1])
     out = "\n\n".join(p for p in out_parts if p)
     if len(out) < n_chars * 0.6:
         _progress.warn(
@@ -667,6 +679,7 @@ def main() -> int:
                     args.polish,
                     args.ollama_host,
                     segments=transcript.get("segments"),
+                    **({"allow_remote": True} if args.allow_remote_ollama else {}),
                 )
         md = compose_markdown(args.url, info, transcript, ocr_text, polished)
         if args.output:

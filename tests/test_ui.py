@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+from datetime import date
 from pathlib import Path
 import sys
 import time
@@ -154,6 +156,71 @@ def test_run_status_keeps_error_label_during_following_traceback_lines(tmp_path,
     traceback_detail_status = updates[2][3]
     assert 'class="omd-status-err"' in traceback_detail_status
     assert '<span class="omd-status-label">error</span>' in traceback_detail_status
+
+
+def test_run_status_consumes_structured_progress_without_showing_raw_json(tmp_path, monkeypatch):
+    class FakeGradio:
+        class Error(Exception):
+            pass
+
+        @staticmethod
+        def update(**kwargs):
+            return kwargs
+
+    output = tmp_path / "result.md"
+    output.write_text("# Result\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "gradio", FakeGradio)
+    monkeypatch.setenv("OMD_ETA_HISTORY_PATH", str(tmp_path / "eta-history.json"))
+    monkeypatch.setattr(
+        ui,
+        "_build_argv",
+        lambda *_args: (["omd", "https://example.com/private", "--json-events"], output),
+    )
+    events = [
+        {
+            "v": 1,
+            "event": "stage",
+            "name": "converting",
+            "work_v": 2,
+            "stage_id": "convert",
+            "state": "indeterminate",
+            "elapsed_s": 0,
+            "attempt": 1,
+        },
+        {
+            "v": 1,
+            "event": "progress",
+            "label": "Convert",
+            "cur": 1,
+            "total": 2,
+            "percent": 50.0,
+            "elapsed_s": 2.0,
+            "eta_s": 2.0,
+            "work_v": 2,
+            "stage_id": "convert",
+            "state": "determinate",
+            "unit": "items",
+            "completed": 1,
+            "attempt": 1,
+        },
+        {"v": 1, "event": "done", "output": "/Users/private/result.md"},
+    ]
+    monkeypatch.setattr(
+        ui,
+        "_stream_subprocess",
+        lambda _argv: iter(
+            [("err", json.dumps(event)) for event in events] + [("rc", "0")]
+        ),
+    )
+
+    updates = list(ui.run_with_status("unused"))
+    final_log = updates[-1][0]
+
+    assert any("--omd-progress:50%" in update[3] for update in updates)
+    assert "Converting" in final_log
+    assert "Output written" in final_log
+    assert '"work_v"' not in final_log
+    assert "/Users/private/result.md" not in final_log
 
 
 def test_ocr_language_defaults_to_english_with_chinese_example():
@@ -389,11 +456,152 @@ def test_source_file_controls_are_compact_and_do_not_stretch_file_rows():
     assert "transform: translate(-50%, -50%)" in ui.CUSTOM_CSS
 
 
+def test_vault_folder_keeps_long_paths_horizontally_scrollable(tmp_path, monkeypatch):
+    selector = "#omd-vault-folder textarea"
+
+    assert selector in ui.CUSTOM_CSS
+    rule = ui.CUSTOM_CSS.split(selector, 1)[1].split("}", 1)[0]
+    assert "overflow-x: auto !important" in rule
+    assert "overflow-y: hidden !important" in rule
+    assert "white-space: pre !important" in rule
+    assert "min-height: 48px !important" in rule
+    assert "height: 48px !important" in rule
+    assert "scrollbar-width: thin" in rule
+    assert "#omd-vault-folder textarea::-webkit-scrollbar" in ui.CUSTOM_CSS
+    scrollbar_rule = ui.CUSTOM_CSS.split(
+        "#omd-vault-folder textarea::-webkit-scrollbar", 1
+    )[1].split("}", 1)[0]
+    assert "height: 8px" in scrollbar_rule
+
+    monkeypatch.setenv("OMD_ETA_HISTORY_PATH", str(tmp_path / "eta-history.json"))
+    cfg = build_gradio_config_or_skip()
+    vault_folder = next(
+        component
+        for component in cfg["components"]
+        if component.get("props", {}).get("label") == "Vault folder"
+    )
+    assert vault_folder["props"]["elem_id"] == "omd-vault-folder"
+
+
 def test_source_file_add_button_has_a_readable_accessible_name():
     kwargs = ui.build_launch_kwargs()
 
     assert ui.UI_TRANSLATIONS["common.upload"] == "Add files"
     assert kwargs["i18n"].translations["en"]["common.upload"] == "Add files"
+
+
+def test_ui_help_does_not_build_or_launch_app(monkeypatch, capsys):
+    monkeypatch.setattr(
+        ui,
+        "build_app",
+        lambda: pytest.fail("--help must not build the Gradio application"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ui.main(["--help"])
+
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "Launch the local OMD browser UI" in captured.out
+    assert "--port" in captured.out
+    assert "OMD_UI_PORT" in captured.out
+    assert captured.err == ""
+
+
+def test_ui_main_forwards_requested_port(monkeypatch):
+    launched = {}
+
+    class FakeApp:
+        def queue(self):
+            return self
+
+        def launch(self, **kwargs):
+            launched.update(kwargs)
+
+    monkeypatch.setattr(ui, "build_app", FakeApp)
+
+    assert ui.main(["--port", "8123"]) == 0
+    assert launched["server_port"] == 8123
+
+
+def test_ui_main_preserves_environment_port_override(monkeypatch):
+    launched = {}
+
+    class FakeApp:
+        def queue(self):
+            return self
+
+        def launch(self, **kwargs):
+            launched.update(kwargs)
+
+    monkeypatch.setenv("OMD_UI_PORT", "8124")
+    monkeypatch.setattr(ui, "build_app", FakeApp)
+
+    assert ui.main([]) == 0
+    assert launched["server_port"] == 8124
+
+
+def test_ui_port_conflict_is_actionable_without_traceback(monkeypatch, capsys):
+    class FakeApp:
+        def queue(self):
+            return self
+
+        def launch(self, **kwargs):
+            raise OSError("Cannot find empty port in range: 7860-7860")
+
+    monkeypatch.setattr(ui, "build_app", FakeApp)
+
+    assert ui.main(["--port", "7860"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "port 7860 is already in use" in captured.err
+    assert "omd-ui --port 7861" in captured.err
+    assert "OMD_UI_PORT=7861 omd-ui" in captured.err
+    assert "no vault files were changed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_ui_invalid_host_configuration_is_actionable_without_traceback(monkeypatch, capsys):
+    class FakeApp:
+        def queue(self):
+            return self
+
+    monkeypatch.setattr(ui, "build_app", FakeApp)
+    monkeypatch.setenv("OMD_UI_HOST", "0.0.0.0")
+    monkeypatch.delenv("OMD_PUBLIC_DEMO", raising=False)
+
+    assert ui.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not start" in captured.err
+    assert "omd doctor" in captured.err
+    assert "no vault files were changed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_local_ui_rejects_non_loopback_bind_address(monkeypatch):
+    monkeypatch.delenv("OMD_PUBLIC_DEMO", raising=False)
+
+    with pytest.raises(ValueError, match="loopback"):
+        ui.build_launch_kwargs(server_name="0.0.0.0")
+
+
+def test_local_ui_accepts_ipv6_loopback_bind_address(monkeypatch):
+    monkeypatch.delenv("OMD_PUBLIC_DEMO", raising=False)
+
+    kwargs = ui.build_launch_kwargs(server_name="::1")
+
+    assert kwargs["server_name"] == "::1"
+
+
+def test_public_demo_allows_non_loopback_bind_address(monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+
+    kwargs = ui.build_launch_kwargs(server_name="0.0.0.0")
+
+    assert kwargs["server_name"] == "0.0.0.0"
 
 
 def test_command_buttons_share_control_height_and_action_column_width():
@@ -424,6 +632,13 @@ def test_run_panel_reserves_space_for_primary_status_output():
     desktop_css = ui.CUSTOM_CSS.split("@media (max-width: 860px)", 1)[0]
     assert ".omd-status-detail" in desktop_css
     assert "grid-column: 1 / -1" in desktop_css
+
+
+def test_status_detail_wraps_instead_of_ellipsising():
+    assert ".omd-status-detail {" in ui.CUSTOM_CSS
+    assert "white-space: normal;" in ui.CUSTOM_CSS
+    assert "overflow-wrap: anywhere;" in ui.CUSTOM_CSS
+    assert "#omd-menubar .omd-menu-btn button.primary" in ui.CUSTOM_CSS
 
 
 def test_primary_panels_use_action_oriented_labels():
@@ -531,26 +746,1001 @@ def test_top_menu_tabs_are_clickable_view_controls():
         if component.get("type") == "button"
     ]
 
-    for label in ("All", "Source", "Output", "Advanced settings"):
+    for label in ("All", "Source", "Inbox / review", "Output", "Advanced settings"):
         assert label in labels
 
 
 def test_top_menu_view_updates_collapse_instead_of_hiding_panels():
     def open_flags(updates):
-        return [update["open"] for update in updates]
+        return [update["open"] for update in updates[:7]]
+
+    def variants(updates):
+        return [update["variant"] for update in updates[7:12]]
+
+    def layout_classes(updates):
+        return updates[12]["elem_classes"]
 
     for updates in (
         ui._menu_view_updates("all"),
         ui._menu_view_updates("source"),
+        ui._menu_view_updates("inbox"),
         ui._menu_view_updates("output"),
         ui._menu_view_updates("advanced"),
     ):
-        assert [update["visible"] for update in updates] == [True, True, True, True, True, True]
+        assert [update["visible"] for update in updates[:7]] == [True] * 7
 
-    assert open_flags(ui._menu_view_updates("all")) == [True, True, True, True, False, False]
-    assert open_flags(ui._menu_view_updates("source")) == [True, False, False, False, False, False]
-    assert open_flags(ui._menu_view_updates("output")) == [False, True, True, True, False, False]
-    assert open_flags(ui._menu_view_updates("advanced")) == [False, False, False, False, True, True]
+    assert open_flags(ui._menu_view_updates("all")) == [True, False, True, True, True, False, False]
+    assert open_flags(ui._menu_view_updates("source")) == [True, False, False, False, False, False, False]
+    assert open_flags(ui._menu_view_updates("inbox")) == [False, True, False, False, False, False, False]
+    assert open_flags(ui._menu_view_updates("output")) == [False, False, True, True, True, False, False]
+    assert open_flags(ui._menu_view_updates("advanced")) == [False, False, False, False, False, True, True]
+    assert variants(ui._menu_view_updates("all")) == ["primary", "secondary", "secondary", "secondary", "secondary"]
+    assert variants(ui._menu_view_updates("source")) == ["secondary", "primary", "secondary", "secondary", "secondary"]
+    assert variants(ui._menu_view_updates("inbox")) == ["secondary", "secondary", "primary", "secondary", "secondary"]
+    assert variants(ui._menu_view_updates("output")) == ["secondary", "secondary", "secondary", "primary", "secondary"]
+    assert variants(ui._menu_view_updates("advanced")) == ["secondary", "secondary", "secondary", "secondary", "primary"]
+    assert layout_classes(ui._menu_view_updates("all")) == ["omd-grid"]
+    assert layout_classes(ui._menu_view_updates("source")) == ["omd-grid", "omd-grid-primary-only"]
+    assert layout_classes(ui._menu_view_updates("inbox")) == ["omd-grid", "omd-grid-primary-only"]
+    assert layout_classes(ui._menu_view_updates("output")) == ["omd-grid"]
+    assert layout_classes(ui._menu_view_updates("advanced")) == ["omd-grid", "omd-grid-secondary-only"]
+
+
+def test_inbox_review_panel_is_secondary_and_privacy_explicit():
+    cfg = build_gradio_config_or_skip()
+    labels = [component.get("props", {}).get("label") for component in cfg["components"]]
+    visible_text = "\n".join(
+        str(component.get("props", {}).get("value", ""))
+        for component in cfg["components"]
+    )
+    buttons = [
+        component.get("props", {}).get("value")
+        for component in cfg["components"]
+        if component.get("type") == "button"
+    ]
+
+    assert "Inbox and review" in labels
+    assert "Save to Inbox" in buttons
+    assert "Saving is local and does not use AI" in visible_text
+    assert "The original text remains in Inbox" in visible_text
+
+
+def test_inbox_review_selection_loads_raw_source_and_provenance(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Quoted note",
+        raw_content="Exact quoted source text.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    provenance, raw_source = ui._load_inbox_review(str(tmp_path), item.item_id)
+
+    assert "Highlight" in provenance
+    assert "Current status: inbox" in provenance
+    assert "2026-07-19T10:11:12Z" in provenance
+    assert raw_source == "Exact quoted source text."
+
+
+def test_switching_inbox_items_clears_item_specific_unsaved_context():
+    (
+        consent,
+        include_ai,
+        draft,
+        grant,
+        source_update,
+        source_preview,
+        source_status,
+        action_status,
+        tags,
+        personal_notes,
+        retrieval_results,
+        search_query,
+    ) = ui._reset_inbox_review_context()
+
+    assert consent is False
+    assert include_ai is False
+    assert draft == ""
+    assert grant is None
+    assert source_update["choices"] == []
+    assert source_update["value"] is None
+    assert source_preview == ""
+    assert "Inbox original" in source_status
+    assert "No review action yet" in action_status
+    assert tags == ""
+    assert personal_notes == ""
+    assert retrieval_results == "_No local search run yet._"
+    assert search_query == ""
+
+
+def test_inbox_review_ui_exposes_read_only_raw_source_pane_and_specific_accept_labels():
+    cfg = build_gradio_config_or_skip()
+    components = {
+        component.get("props", {}).get("label"): component
+        for component in cfg["components"]
+        if component.get("props", {}).get("label")
+    }
+    buttons = [
+        component.get("props", {}).get("value")
+        for component in cfg["components"]
+        if component.get("type") == "button"
+    ]
+
+    assert "Saved details" in components
+    assert components["Original text (kept unchanged)"]["props"]["interactive"] is False
+    assert "Markdown source for AI and new-note link (optional)" in components
+    assert components["Selected Markdown source (kept unchanged)"]["props"]["interactive"] is False
+    assert "Add your note (optional)" in components
+    assert "Tags for new note (editable)" in components
+    assert "AI draft (edit before including)" in components
+    assert "Create note in Notes" in buttons
+    assert "Keep original · mark as not needed" in buttons
+    assert "Suggest sources" in buttons
+    assert "Load converted Markdown from Sources" not in buttons
+    assert "Find related to review item" not in buttons
+    assert "Refresh Inbox" not in buttons
+    assert "Accept Voice note" in buttons
+
+
+def test_inbox_ai_and_tag_controls_follow_the_unchanged_original():
+    cfg = build_gradio_config_or_skip()
+
+    def component_position(text: str) -> int:
+        for position, component in enumerate(cfg["components"]):
+            props = component.get("props", {})
+            if props.get("label") == text or props.get("value") == text:
+                return position
+        raise AssertionError(f"component not found: {text}")
+
+    original = component_position("Original text (kept unchanged)")
+    ai_panel = component_position("Draft a takeaway with AI (optional)")
+    tags = component_position("Tags for new note (editable)")
+    personal_note = component_position("Add your note (optional)")
+
+    assert original < ai_panel < tags < personal_note
+
+
+def test_inbox_review_ui_explains_the_three_step_workflow_and_ai_scope():
+    cfg = build_gradio_config_or_skip()
+    visible_text = "\n".join(
+        str(component.get("props", {}).get("value", ""))
+        for component in cfg["components"]
+    )
+    buttons = [
+        component.get("props", {}).get("value")
+        for component in cfg["components"]
+        if component.get("type") == "button"
+    ]
+
+    assert "1. Save a thought or highlight" in visible_text
+    assert "2. Review one Inbox item" in visible_text
+    assert "3. Decide what to keep" in visible_text
+    assert "does not open links or read any unselected file" in visible_text
+    assert "Generate draft from selected text" in buttons
+    assert "Review cloud request" in buttons
+
+
+def test_inbox_queue_uses_readable_labels_instead_of_raw_item_ids(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Readable highlight",
+        raw_content="An exact passage worth keeping.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    summary, choices = ui._inbox_queue_state(str(tmp_path))
+
+    assert "Readable highlight" in summary
+    assert choices == [("Readable highlight · needs review", item.item_id)]
+
+
+def test_linkable_search_results_exclude_inbox_case_insensitively():
+    from types import SimpleNamespace
+
+    hits = [
+        SimpleNamespace(title="Upper", path="Inbox/upper.md"),
+        SimpleNamespace(title="Lower", path="inbox/lower.md"),
+        SimpleNamespace(title="Note", path="Notes/kept.md"),
+    ]
+
+    assert ui._linkable_hit_choices(hits) == [
+        ("Note · Notes/kept.md", "Notes/kept.md")
+    ]
+
+
+def test_vault_markdown_source_choices_are_safe_bounded_and_sources_only(tmp_path):
+    sources = tmp_path / "Sources" / "Web"
+    sources.mkdir(parents=True)
+    newest = sources / "newest article.md"
+    older = sources / "older.md"
+    newest.write_text("# Newest\n\nConverted source text.\n", encoding="utf-8")
+    older.write_text("# Older\n\nOlder source text.\n", encoding="utf-8")
+    (tmp_path / "Inbox").mkdir()
+    (tmp_path / "Inbox" / "not-a-source.md").write_text("Inbox", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    (sources / "linked.md").symlink_to(outside)
+
+    choices = ui._vault_markdown_source_choices(str(tmp_path))
+
+    assert ("Sources/Web/newest article.md", "Sources/Web/newest article.md") in choices
+    assert ("Sources/Web/older.md", "Sources/Web/older.md") in choices
+    assert all("Inbox/" not in value for _, value in choices)
+    assert all(value != "Sources/Web/linked.md" for _, value in choices)
+
+
+def test_selected_vault_markdown_source_is_read_only_and_previewed(tmp_path):
+    source = tmp_path / "Sources" / "Web" / "converted.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Converted\n\nExact converted passage.\n", encoding="utf-8")
+    before = source.read_bytes()
+
+    preview, status = ui._load_vault_markdown_source(
+        str(tmp_path), "Sources/Web/converted.md"
+    )
+
+    assert "Exact converted passage." in preview
+    assert "Sources/Web/converted.md" in status
+    assert source.read_bytes() == before
+
+
+def test_inbox_final_action_returns_visible_success_and_failure_status(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Visible action",
+        raw_content="Keep this source.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    _, _, success = ui._review_inbox_note(
+        str(tmp_path), item.item_id, "accept", "", "", False, ""
+    )
+    _, _, failure = ui._review_inbox_note(
+        str(tmp_path), "missing-item", "accept", "", "", False, ""
+    )
+
+    assert "omd-model-status-ok" in success
+    assert "Created in Notes" in success
+    assert "original remains in Inbox" in success
+    assert "omd-model-status-warn" in failure
+    assert "No vault files were changed" in failure
+
+
+def test_inbox_final_actions_confirm_ai_link_and_safe_not_needed_state(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    accepted = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Accepted with AI",
+        raw_content="Keep the original accepted text.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    rejected = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Not needed safely",
+        raw_content="Keep the original rejected text too.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:12:12Z",
+    )
+    accepted_path = save_inbox_item(tmp_path, accepted)
+    rejected_path = save_inbox_item(tmp_path, rejected)
+    linked = tmp_path / "Sources" / "Web" / "converted.md"
+    linked.parent.mkdir(parents=True)
+    linked.write_text("# Converted\n\nExact source.\n", encoding="utf-8")
+    source_before = {
+        accepted_path: accepted_path.read_bytes(),
+        rejected_path: rejected_path.read_bytes(),
+        linked: linked.read_bytes(),
+    }
+
+    _, _, accepted_status = ui._review_inbox_note(
+        str(tmp_path),
+        accepted.item_id,
+        "accept",
+        "My addition.",
+        "AI addition with exact evidence.",
+        True,
+        "Sources/Web/converted.md",
+        "agents, #knowledge-management",
+    )
+    notes_after_accept = list((tmp_path / "Notes").glob("*.md"))
+    _, _, rejected_status = ui._review_inbox_note(
+        str(tmp_path), rejected.item_id, "reject", "Unsaved addition."
+    )
+
+    assert len(notes_after_accept) == 1
+    note_text = notes_after_accept[0].read_text(encoding="utf-8")
+    assert "My addition." in note_text
+    assert "AI addition with exact evidence." in note_text
+    assert "[[Sources/Web/converted]]" in note_text
+    assert '  - "agents"' in note_text
+    assert '  - "knowledge-management"' in note_text
+    assert "The edited AI draft was included" in accepted_status
+    assert "Linked source: Sources/Web/converted.md" in accepted_status
+    assert "Tags: agents, knowledge-management" in accepted_status
+    assert "Marked as not needed" in rejected_status
+    assert "no Note was created" in rejected_status
+    assert list((tmp_path / "Notes").glob("*.md")) == notes_after_accept
+    for path, before in source_before.items():
+        assert path.read_bytes() == before
+
+
+def test_inbox_final_actions_do_not_replay_or_reverse_completed_decisions(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    accepted = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Completed accept",
+        raw_content="Keep this accepted source.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    rejected = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Completed reject",
+        raw_content="Keep this rejected source.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:12:12Z",
+    )
+    save_inbox_item(tmp_path, accepted)
+    save_inbox_item(tmp_path, rejected)
+
+    ui._review_inbox_note(
+        str(tmp_path), accepted.item_id, "accept", "First note", "", False, "", "first-tag"
+    )
+    ui._review_inbox_note(str(tmp_path), rejected.item_id, "reject", "")
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    _, _, repeated_accept = ui._review_inbox_note(
+        str(tmp_path),
+        accepted.item_id,
+        "accept",
+        "Replacement that must not be written",
+        "Replacement AI draft",
+        True,
+        "",
+        "replacement-tag",
+    )
+    _, _, reverse_accept = ui._review_inbox_note(
+        str(tmp_path), accepted.item_id, "reject", ""
+    )
+    _, _, reverse_reject = ui._review_inbox_note(
+        str(tmp_path), rejected.item_id, "accept", "Must not create a Note"
+    )
+
+    after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before
+    assert "Review already completed" in repeated_accept
+    assert "current edits were not applied again" in repeated_accept
+    assert "cannot be changed here" in reverse_accept
+    assert "cannot be changed here" in reverse_reject
+    assert "No vault files were changed" in reverse_accept
+    assert "No vault files were changed" in reverse_reject
+    assert "Replacement that must not be written" not in next(
+        (tmp_path / "Notes").glob("*.md")
+    ).read_text(encoding="utf-8")
+
+
+def test_local_ai_hides_cloud_review_controls():
+    updates = ui._ai_provider_ui_updates("Local Ollama", "qwen3:4b-instruct")
+
+    preview_button, preview_panel, generate_button, ai_panel = updates[5:]
+    assert preview_button["visible"] is False
+    assert preview_panel["visible"] is False
+    assert generate_button["value"] == "Generate draft from selected text"
+    assert ai_panel["visible"] is True
+
+
+def test_no_ai_hides_the_complete_inbox_ai_panel():
+    updates = ui._ai_provider_ui_updates("No AI", "qwen3:4b-instruct")
+
+    assert updates[7]["visible"] is False
+    assert updates[8]["visible"] is False
+
+
+def test_inbox_local_ai_uses_extended_context_without_changing_global_default():
+    from omd._models import LOCAL_TEXT_CONTEXT_TOKENS
+
+    task = ui._ai_note_task(
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "http://localhost:11434",
+    )
+
+    assert LOCAL_TEXT_CONTEXT_TOKENS == 4096
+    assert task.context_window_tokens == 32 * 1024
+
+
+def test_inbox_context_error_explains_extended_limit_and_preserved_state(
+    tmp_path, monkeypatch
+):
+    from omd.ai_service import AIServiceError
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Long note",
+        raw_content="A sufficiently meaningful local note.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    def reject_context(*args, **kwargs):
+        raise AIServiceError("ollama", "context_limit_exceeded", "old detail")
+
+    monkeypatch.setattr(ui, "execute_text_task", reject_context)
+
+    output, status = ui._run_inbox_ai_suggestion(
+        str(tmp_path),
+        item.item_id,
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "",
+        "http://localhost:11434",
+        False,
+        "Keep this draft",
+    )
+
+    assert output == "Keep this draft"
+    assert "32768-token Inbox AI window" in status
+    assert "local models still have context and memory limits" in status
+    assert "current draft, editable tags, raw Inbox item, and selected source are unchanged" in status
+
+
+def test_inbox_ai_rejects_ungrounded_missing_evidence_result(tmp_path, monkeypatch):
+    from omd.ai_service import AITextResult
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Short highlight",
+        raw_content="A short exact highlight with enough words to review.",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+    monkeypatch.setattr(
+        ui,
+        "execute_text_task",
+        lambda *args, **kwargs: AITextResult(
+            provider="ollama",
+            requested_model="qwen3:4b-instruct",
+            actual_model="qwen3:4b-instruct",
+            capability="note_organisation",
+            privacy_mode="local_only",
+            destination_domain="localhost",
+            text="No evidence provided to support an organisation structure.",
+            usage={},
+            timing={"elapsed_seconds": 0.1},
+            structured={
+                "suggestion": "No evidence provided to support an organisation structure.",
+                "evidence": [],
+                "tags": ["missing-evidence", "incomplete-input", "no-source-claims"],
+            },
+        ),
+    )
+
+    output, status = ui._run_inbox_ai_suggestion(
+        str(tmp_path),
+        item.item_id,
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "",
+        "http://localhost:11434",
+        False,
+        "Keep my existing draft",
+    )
+
+    assert output == "Keep my existing draft"
+    assert "could not create a grounded draft" in status
+    assert "select or save the exact passage" in status
+    assert "Inbox original" in status
+    assert "ready for review" not in status
+
+
+def test_inbox_ai_does_not_call_model_for_url_only_item(tmp_path, monkeypatch):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Article link",
+        raw_content="https://www.towardsdeeplearning.com/example-article",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    def unexpected_model_call(*args, **kwargs):
+        raise AssertionError("URL-only Inbox items must not be sent to a model")
+
+    monkeypatch.setattr(ui, "execute_text_task", unexpected_model_call)
+
+    output, status = ui._run_inbox_ai_suggestion(
+        str(tmp_path),
+        item.item_id,
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "",
+        "http://localhost:11434",
+        False,
+        "",
+    )
+
+    assert output == ""
+    assert "needs text, not only a link" in status
+    assert "Nothing was sent" in status
+
+
+def test_inbox_ai_accepts_only_exact_source_evidence(tmp_path, monkeypatch):
+    from omd.ai_service import AITextResult
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    source = "Transformers predict the next token using a bounded context."
+    item = InboxItem(
+        capture_surface="highlight",
+        provenance_kind="excerpt",
+        title="Grounded highlight",
+        raw_content=source,
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+    monkeypatch.setattr(
+        ui,
+        "execute_text_task",
+        lambda *args, **kwargs: AITextResult(
+            provider="ollama",
+            requested_model="qwen3:4b-instruct",
+            actual_model="qwen3:4b-instruct",
+            capability="note_organisation",
+            privacy_mode="local_only",
+            destination_domain="localhost",
+            text="Keep this as a concise model-mechanics claim.",
+            usage={},
+            timing={"elapsed_seconds": 0.1},
+            structured={
+                "suggestion": "Keep this as a concise model-mechanics claim.",
+                "evidence": ["predict the next token"],
+                "tags": ["transformers", "language-models"],
+            },
+        ),
+    )
+
+    output, status = ui._run_inbox_ai_suggestion(
+        str(tmp_path),
+        item.item_id,
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "",
+        "http://localhost:11434",
+        False,
+        "",
+    )
+
+    assert "Keep this as a concise model-mechanics claim." in output
+    assert "- predict the next token" in output
+    assert "transformers, language-models" in output
+    assert "ready for review" in status
+
+
+def test_inbox_ai_ui_moves_suggested_tags_into_editable_tag_field(monkeypatch):
+    monkeypatch.setattr(
+        ui,
+        "_run_inbox_ai_suggestion",
+        lambda *args, **kwargs: (
+            "Keep the claim.\n\nEvidence from selected text\n- exact claim"
+            "\n\nSuggested tags\nagents, #knowledge-management",
+            "ready",
+        ),
+    )
+
+    draft, status, tags = ui._run_inbox_ai_suggestion_for_ui(
+        "vault",
+        "item",
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "",
+        "http://localhost:11434",
+        False,
+        "",
+        "personal",
+        None,
+        "",
+    )
+
+    assert "Suggested tags" not in draft
+    assert "ready" in status
+    assert "agents" in status
+    assert "knowledge-management" in status
+    assert "Review or remove them" in status
+    assert tags == "personal, agents, knowledge-management"
+
+
+def test_inbox_ai_can_use_selected_converted_markdown_without_rewriting_it(
+    tmp_path, monkeypatch
+):
+    from omd.ai_service import AITextResult
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Question about a conversion",
+        raw_content="What should I retain from the converted article?",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T10:11:12Z",
+    )
+    save_inbox_item(tmp_path, item)
+    converted = tmp_path / "Sources" / "Web" / "converted.md"
+    converted.parent.mkdir(parents=True)
+    converted_text = "# Converted\n\nA deterministic loop keeps agent behavior inspectable.\n"
+    converted.write_text(converted_text, encoding="utf-8")
+    before = converted.read_bytes()
+    seen = {}
+
+    def execute(_task, *, source_text, **_kwargs):
+        seen["source_text"] = source_text
+        return AITextResult(
+            provider="ollama",
+            requested_model="qwen3:4b-instruct",
+            actual_model="qwen3:4b-instruct",
+            capability="note_organisation",
+            privacy_mode="local_only",
+            destination_domain="localhost",
+            text="Keep the inspectability claim.",
+            usage={},
+            timing={"elapsed_seconds": 0.1},
+            structured={
+                "suggestion": "Keep the inspectability claim.",
+                "evidence": ["deterministic loop keeps agent behavior inspectable"],
+                "tags": ["agents"],
+            },
+        )
+
+    monkeypatch.setattr(ui, "execute_text_task", execute)
+
+    output, status = ui._run_inbox_ai_suggestion(
+        str(tmp_path),
+        item.item_id,
+        "Local Ollama",
+        "qwen3:4b-instruct",
+        "",
+        "http://localhost:11434",
+        False,
+        "",
+        None,
+        "Sources/Web/converted.md",
+    )
+
+    assert seen["source_text"] == converted_text
+    assert "deterministic loop keeps agent behavior inspectable" in output
+    assert "Sources/Web/converted.md" in status
+    assert converted.read_bytes() == before
+
+
+def test_ai_provider_choices_are_direct_and_exclude_openrouter():
+    assert ui.AI_PROVIDER_CHOICES == (
+        "No AI",
+        "Local Ollama",
+        "OpenAI API",
+        "Anthropic API",
+        "DeepSeek API",
+    )
+    assert ui._ai_provider_key("OpenAI API") == "openai"
+
+    with pytest.raises(ValueError, match="provider"):
+        ui._ai_provider_key("OpenRouter")
+
+
+def test_cloud_request_preview_names_destination_without_echoing_source(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    source = "Private source text must not appear in the preview."
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Private note",
+        raw_content=source,
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T00:00:00Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    preview = ui._preview_inbox_ai_request(
+        str(tmp_path),
+        item.item_id,
+        "OpenAI API",
+        "gpt-selected",
+        "http://localhost:11434",
+        as_of=date(2026, 7, 19),
+    )
+
+    assert "api.openai.com" in preview
+    assert "gpt-selected" in preview
+    assert f"{len(source)} characters" in preview
+    assert source not in preview
+    assert "consumer ChatGPT login" in preview
+
+
+def test_cloud_request_preview_for_ui_creates_source_bound_unchecked_grant(tmp_path):
+    from omd.ai_service import AIConsentGrant
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    source = "Private source for one exact preview."
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Private note",
+        raw_content=source,
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T00:00:00Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    preview, grant, consent = ui._preview_inbox_ai_request_for_ui(
+        str(tmp_path),
+        item.item_id,
+        "OpenAI API",
+        "gpt-selected",
+        "http://localhost:11434",
+    )
+
+    assert "api.openai.com" in preview
+    assert isinstance(grant, AIConsentGrant)
+    assert source not in repr(grant)
+    assert consent is False
+
+
+def test_provider_connection_check_does_not_replace_unavailable_model(monkeypatch):
+    from omd.provider_models import ProviderModelCatalog
+
+    monkeypatch.setattr(
+        ui,
+        "discover_provider_models",
+        lambda *args, **kwargs: ProviderModelCatalog(
+            provider="openai",
+            destination_domain="api.openai.com",
+            models=("gpt-a", "gpt-b"),
+            elapsed_seconds=0.2,
+        ),
+    )
+
+    update, status = ui._check_ai_provider_connection(
+        "OpenAI API",
+        "retired-model",
+        "session-secret",
+        "http://localhost:11434",
+    )
+
+    assert update["value"] == "retired-model"
+    assert [choice for choice in update["choices"]] == ["gpt-a", "gpt-b"]
+    assert "not available" in status
+    assert "retired-model" in status
+    assert "session-secret" not in status
+
+
+def test_ai_provider_controls_are_in_advanced_settings():
+    cfg = build_gradio_config_or_skip()
+    labels = [component.get("props", {}).get("label") for component in cfg["components"]]
+    visible_text = "\n".join(
+        str(component.get("props", {}).get("value", ""))
+        for component in cfg["components"]
+    )
+    buttons = [
+        component.get("props", {}).get("value")
+        for component in cfg["components"]
+        if component.get("type") == "button"
+    ]
+
+    assert "AI provider for Inbox review" in labels
+    assert "Provider model" in labels
+    assert "Session API key" in labels
+    assert "Cloud consent for this request" in labels
+    assert "Leave blank to use a supported environment variable" in visible_text
+    assert "Check models" in buttons
+    assert "Load models / check connection" not in buttons
+    assert "OpenRouter" not in visible_text
+
+
+def test_inbox_queue_escapes_markdown_in_user_title(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="[load remote image](https://tracker.example/pixel)",
+        raw_content="Private note",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T00:00:00Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    summary, choices = ui._inbox_queue_state(str(tmp_path))
+
+    assert choices == [(f"{item.title} · needs review", item.item_id)]
+    assert "[load remote image](" not in summary
+    assert r"\[load remote image\]\(" in summary
+
+
+def test_local_search_ui_returns_path_and_bounded_evidence(tmp_path, monkeypatch):
+    (tmp_path / "Notes").mkdir()
+    (tmp_path / "Notes" / "retrieval.md").write_text(
+        "# Retrieval note\n\nA local lexical marker for this vault.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMD_PREFERENCES_PATH", str(tmp_path / ".state" / "preferences.json"))
+
+    result = ui._search_vault_notes(str(tmp_path), "lexical marker")
+
+    assert "Retrieval note" in result
+    assert "Notes/retrieval.md" in result
+    assert "local lexical marker" in result
+
+
+def test_related_notes_ui_does_not_rewrite_vault_files(tmp_path, monkeypatch):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    (tmp_path / "Notes").mkdir()
+    related = tmp_path / "Notes" / "related.md"
+    related.write_text("# Related\n\nDurable context receipt design.\n", encoding="utf-8")
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Receipt thought",
+        raw_content="Durable context receipt",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T00:00:00Z",
+    )
+    save_inbox_item(tmp_path, item)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    monkeypatch.setenv("OMD_PREFERENCES_PATH", str(tmp_path / ".state" / "preferences.json"))
+
+    result = ui._related_inbox_notes(str(tmp_path), item.item_id)
+
+    assert "Notes/related.md" in result
+    assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+
+def test_related_notes_can_populate_an_explicit_source_selection(tmp_path, monkeypatch):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    (tmp_path / "Notes").mkdir()
+    (tmp_path / "Notes" / "related.md").write_text(
+        "# Related\n\nDurable context receipt design.\n", encoding="utf-8"
+    )
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Receipt thought",
+        raw_content="Durable context receipt",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T00:00:00Z",
+    )
+    save_inbox_item(tmp_path, item)
+    monkeypatch.setenv("OMD_PREFERENCES_PATH", str(tmp_path / "preferences.json"))
+
+    result, choices = ui._related_inbox_notes_with_choices(str(tmp_path), item.item_id)
+
+    assert "Notes/related.md" in result
+    assert choices == [("Related · Notes/related.md", "Notes/related.md")]
+
+
+def test_source_suggestions_unify_recent_conversions_and_related_notes(tmp_path):
+    from omd.inbox import InboxItem
+    from omd.inbox_workflow import save_inbox_item
+
+    converted = tmp_path / "Sources" / "Web" / "converted article.md"
+    converted.parent.mkdir(parents=True)
+    converted.write_text("# Converted article\n\nA separate converted source.\n", encoding="utf-8")
+    related = tmp_path / "Notes" / "related.md"
+    related.parent.mkdir(parents=True)
+    related.write_text("# Related\n\nDurable context receipt design.\n", encoding="utf-8")
+    item = InboxItem(
+        capture_surface="my_note",
+        provenance_kind="authored",
+        title="Receipt thought",
+        raw_content="Durable context receipt",
+        source_locator={"kind": "manual"},
+        captured_at="2026-07-19T00:00:00Z",
+    )
+    save_inbox_item(tmp_path, item)
+
+    result, choices = ui._suggest_vault_sources_with_choices(str(tmp_path), item.item_id)
+
+    assert "Related note" in result
+    assert "Converted source" in result
+    assert ("Related note · Related · Notes/related.md", "Notes/related.md") in choices
+    assert (
+        "Converted source · converted article · Sources/Web/converted article.md",
+        "Sources/Web/converted article.md",
+    ) in choices
+
+
+def test_preference_feedback_changes_state_only_after_explicit_action(tmp_path, monkeypatch):
+    preference_path = tmp_path / "preferences.json"
+    monkeypatch.setenv("OMD_PREFERENCES_PATH", str(preference_path))
+
+    initial = ui._inspect_local_preferences()
+    updated, status = ui._record_local_preference_feedback(
+        "accept",
+        "bullet_list",
+        "bullet_list",
+    )
+
+    assert preference_path.exists()
+    assert "bullet_list" in updated
+    assert "+1" in updated
+    assert "saved locally" in status
+    assert "No explicit preferences" in initial
+
+
+def test_reset_local_preferences_removes_saved_state(tmp_path, monkeypatch):
+    preference_path = tmp_path / "preferences.json"
+    monkeypatch.setenv("OMD_PREFERENCES_PATH", str(preference_path))
+    ui._record_local_preference_feedback("accept", "outline", "outline")
+
+    profile, status = ui._reset_local_preferences()
+
+    assert not preference_path.exists()
+    assert "No explicit preferences" in profile
+    assert "reset" in status.lower()
+
+
+def test_retrieval_ui_has_one_source_entry_and_hides_unused_preference_controls():
+    cfg = build_gradio_config_or_skip()
+    labels = [component.get("props", {}).get("label") for component in cfg["components"]]
+    buttons = [
+        component.get("props", {}).get("value")
+        for component in cfg["components"]
+        if component.get("type") == "button"
+    ]
+
+    assert "Search this vault" in labels
+    assert "Explicit style feedback" not in labels
+    assert "Search notes" in buttons
+    assert "Suggest sources" in buttons
+    assert "Find related to review item" not in buttons
+    assert "Load converted Markdown from Sources" not in buttons
+    assert "Find duplicates" not in buttons
+    assert "Reset preferences" not in buttons
 
 
 def test_stop_conversion_button_configures_cancel_dependency():
@@ -667,6 +1857,65 @@ def test_open_output_button_hidden_in_public_demo(monkeypatch):
     assert buttons[0]["props"].get("visible") is False
 
 
+def test_public_demo_exposes_only_the_bounded_conversion_api(monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+
+    cfg = build_gradio_config_or_skip()
+    exposed = {
+        dependency.get("api_name")
+        for dependency in cfg["dependencies"]
+        if dependency.get("backend_fn")
+        and dependency.get("api_visibility") == "public"
+        and dependency.get("api_name") is not None
+    }
+
+    assert exposed == {"run_with_status"}
+    assert not any(
+        str(dependency.get("api_name") or "").startswith("false")
+        for dependency in cfg["dependencies"]
+    )
+    assert all(
+        dependency.get("api_visibility") == "private"
+        for dependency in cfg["dependencies"]
+        if dependency.get("backend_fn") and dependency.get("api_name") != "run_with_status"
+    )
+
+
+def test_public_demo_rejects_direct_inbox_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+
+    with pytest.raises(ValueError, match="local OMD app"):
+        ui._save_inbox_note(str(tmp_path), "My note", "Private", "Do not write")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_public_demo_rejects_direct_output_folder_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+
+    with pytest.raises(ValueError, match="local OMD app"):
+        ui._open_output_path(str(tmp_path))
+
+
+def test_public_demo_rejects_unstaged_server_file_as_upload(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+    monkeypatch.setattr(ui, "SOURCE_STAGING", tmp_path / "staged")
+    server_file = tmp_path / "server-secret.txt"
+    server_file.write_text("private", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="staged by this upload session"):
+        ui._validate_public_demo_uploaded_file(str(server_file))
+
+
+def test_public_demo_rejects_saved_list_before_reading_server_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+    server_file = tmp_path / "server-list.txt"
+    server_file.write_text("/private/server/path\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="local OMD app"):
+        ui._inspect_source("", [], str(server_file))
+
+
 def test_json_events_checkbox_is_not_exposed_in_ui_config():
     cfg = build_gradio_config_or_skip()
     labels = {
@@ -677,6 +1926,98 @@ def test_json_events_checkbox_is_not_exposed_in_ui_config():
 
     assert "Verbose log" in labels
     assert "JSON events" not in labels
+
+
+def test_ui_uses_internal_structured_events_unless_verbose_is_enabled():
+    cfg = build_gradio_config_or_skip()
+    components = {component["id"]: component for component in cfg["components"]}
+    verbose = next(
+        component
+        for component in cfg["components"]
+        if component.get("props", {}).get("label") == "Verbose log"
+    )
+    dependencies = [
+        dependency
+        for dependency in cfg["dependencies"]
+        if any(target[0] == verbose["id"] for target in dependency.get("targets", []))
+    ]
+
+    assert ui.INTERNAL_JSON_EVENTS_DEFAULT is True
+    assert any(
+        any(components[output_id].get("type") == "state" for output_id in dependency["outputs"])
+        for dependency in dependencies
+    )
+
+
+def test_eta_history_calibration_is_automatic_without_management_controls():
+    cfg = build_gradio_config_or_skip()
+    labels = [component.get("props", {}).get("label") for component in cfg["components"]]
+    buttons = [
+        component.get("props", {}).get("value")
+        for component in cfg["components"]
+        if component.get("type") == "button"
+    ]
+    visible_text = "\n".join(
+        str(component.get("props", {}).get("value", ""))
+        for component in cfg["components"]
+    )
+
+    assert "Collect local timings for calibrated ETA" not in labels
+    assert "Inspect ETA history" not in buttons
+    assert "Reset ETA history" not in buttons
+    assert "Progress and ETA history" not in visible_text
+
+
+def test_ui_css_keeps_helper_text_readable_and_action_labels_on_one_line():
+    assert ".omd-field-help" in ui.CUSTOM_CSS
+    assert "color: var(--omd-muted) !important" in ui.CUSTOM_CSS
+    assert ".omd-no-wrap-btn" in ui.CUSTOM_CSS
+    assert "white-space: nowrap !important" in ui.CUSTOM_CSS
+
+
+def test_reset_eta_history_also_removes_shadow_calibration_samples(tmp_path, monkeypatch):
+    from omd.eta_calibration import EtaCalibrationSample, EtaCalibrationStore
+    from omd.eta_history import EtaHistoryStore, EtaObservation
+
+    history_path = tmp_path / "eta-history.json"
+    calibration_path = tmp_path / "eta-calibration-samples.json"
+    monkeypatch.setenv("OMD_ETA_HISTORY_PATH", str(history_path))
+    monkeypatch.setenv("OMD_ETA_CALIBRATION_PATH", str(calibration_path))
+    EtaHistoryStore(history_path).record(
+        EtaObservation(
+            stage_id="convert",
+            source_class="file",
+            device_tier="arm64-16gb-8core",
+            runtime="markitdown",
+            model_key="none",
+            cold_start=None,
+            unit="items",
+            work_units=1,
+            duration_seconds=5,
+            outcome="success",
+            observed_at=time.time(),
+        )
+    )
+    EtaCalibrationStore(calibration_path).record(
+        EtaCalibrationSample(
+            stage="convert",
+            source="file",
+            device="arm64-16gb-8core",
+            runtime="markitdown",
+            model="none",
+            cold=False,
+            unit="items",
+            actual_seconds=5,
+            baseline_seconds=8,
+            shadow_p50_seconds=5,
+            shadow_p90_seconds=7,
+        )
+    )
+
+    ui._reset_eta_history()
+
+    assert EtaHistoryStore(history_path).summary()["observation_count"] == 0
+    assert EtaCalibrationStore(calibration_path).summary()["sample_count"] == 0
 
 
 def test_advanced_options_explain_ocr_and_verbose_log_scope():
@@ -912,12 +2253,41 @@ def test_local_model_status_warns_when_installed_model_is_thinking_only(monkeypa
     assert "ollama pull qwen3:4b-instruct" in status
 
 
+def test_local_model_status_warns_when_installed_model_exceeds_machine_tier(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"models":[{"name":"qwen2.5:14b-instruct"}]}'
+
+    monkeypatch.setenv("OMD_SYSTEM_MEMORY_GB", "16")
+    monkeypatch.setattr(ui.urllib.request, "urlopen", lambda *_a, **_kw: FakeResponse())
+
+    status = ui._local_model_status_html(
+        "qwen2.5:14b-instruct",
+        "qwen2.5:14b-instruct",
+        "http://localhost:11434",
+        public_demo=False,
+    )
+
+    assert "omd-model-status-warn" in status
+    assert "above this machine" in status
+    assert "conservative" in status
+    assert "qwen3:4b-instruct" in status
+    assert "16 GB" not in status
+
+
 @pytest.mark.parametrize(
     "host",
     [
         "file:///tmp/ollama",
         "http://169.254.169.254:11434",
         "ollama.example.com:11434",
+        "http://localhost:11434/custom-path",
     ],
 )
 def test_ollama_model_probe_rejects_non_loopback_hosts_before_network(monkeypatch, host):
@@ -993,6 +2363,29 @@ def build_argv(tmp_path: Path, **overrides):
     return ui._build_argv(**params)
 
 
+def make_receipt(
+    *,
+    state: str = "queued",
+    recovery_action: str | None = None,
+    source_state: str = "referenced",
+) -> ui.ContextReceipt:
+    kwargs = {
+        "job_id": "job_1234567890abcdef",
+        "source_type": "source",
+        "source_state": source_state,
+        "destination": "Markdown folder",
+        "privacy_mode": "local_only",
+        "accepted_at": "2026-07-19T00:00:00Z",
+        "updated_at": "2026-07-19T00:00:00Z",
+        "state": state,
+        "recovery_action": recovery_action,
+    }
+    if source_state in {"secured", "missing"}:
+        kwargs["content_hash"] = "a" * 64
+        kwargs["secured_source"] = "sources/job_1234567890abcdef/source.bin"
+    return ui.ContextReceipt(**kwargs)
+
+
 def test_build_argv_rejects_verbose_plus_json_events(tmp_path):
     with pytest.raises(ValueError, match="mutually exclusive"):
         build_argv(tmp_path, verbose=True, json_events=True)
@@ -1065,6 +2458,26 @@ def test_build_argv_defaults_reddit_to_op_only(tmp_path):
 def test_build_argv_rejects_missing_xhs_cookies_file(tmp_path):
     with pytest.raises(ValueError, match="XHS cookie file not found"):
         build_argv(tmp_path, xhs_cookies_file=str(tmp_path / "missing-xhs.txt"))
+
+
+def test_build_argv_blocks_douyin_without_matching_cookie_file(tmp_path):
+    with pytest.raises(ValueError, match="Default / Douyin cookies.txt path is empty"):
+        build_argv(tmp_path, text_input="https://v.douyin.com/abc123/")
+
+
+def test_build_argv_blocks_xhs_without_matching_cookie_file(tmp_path):
+    with pytest.raises(ValueError, match="XHS / Rednote cookies.txt path is empty"):
+        build_argv(tmp_path, text_input="http://xhslink.com/a/abcDEF/")
+
+
+def test_build_argv_allows_public_only_sources_without_cookie_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(ui, "BATCH_STAGING", tmp_path / "batch-lists")
+    argv, _ = build_argv(
+        tmp_path,
+        text_input="https://x.com/openai/status/1234567890\nhttps://www.reddit.com/r/test/comments/abc/demo/",
+    )
+
+    assert argv[:4] == [ui.sys.executable, "-m", "omd.cli", "batch"]
 
 
 def test_build_argv_prefers_typed_text_over_stale_uploaded_file(tmp_path):
@@ -1245,8 +2658,10 @@ def test_build_argv_handles_messy_douyin_share_text(tmp_path):
         "8.92 复制打开抖音，看看【艾丽的无废话财经的作品】6.27 终于 贝森特道出了核心目的 "
         "# 沃什 #... https://v.douyin.com/yGWf39cCbCE/ :4pm z"
     )
+    cookies = tmp_path / "douyin_cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
 
-    argv, output = build_argv(tmp_path, text_input=share_text)
+    argv, output = build_argv(tmp_path, text_input=share_text, cookies_file=str(cookies))
 
     assert argv[3] == share_text
     assert output.name == "v-yGWf39cCbCE.md"
@@ -1380,6 +2795,58 @@ def test_public_demo_rejects_cookie_files_by_default(tmp_path):
             cookies_file=str(cookies),
             public_demo=True,
         )
+
+
+def test_public_demo_rejects_staged_cookie_symlink(tmp_path, monkeypatch):
+    staging = tmp_path / "cookies"
+    staging.mkdir()
+    outside = tmp_path / "private-cookies.txt"
+    outside.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    staged_link = staging / "uploaded-cookies.txt"
+    staged_link.symlink_to(outside)
+    monkeypatch.setattr(ui, "COOKIES_STAGING", staging)
+    monkeypatch.setenv("OMD_PUBLIC_DEMO_ALLOW_COOKIE_UPLOAD", "1")
+
+    with pytest.raises(ValueError, match="uploaded/staged cookie files"):
+        build_argv(
+            tmp_path,
+            cookies_file=str(staged_link),
+            public_demo=True,
+        )
+
+
+def test_public_demo_rejects_cookie_path_that_resolves_outside_staging(tmp_path, monkeypatch):
+    staging = tmp_path / "cookies"
+    staging.mkdir()
+    outside = tmp_path / "private-cookies.txt"
+    outside.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    traversal_path = staging / ".." / outside.name
+    monkeypatch.setattr(ui, "COOKIES_STAGING", staging)
+    monkeypatch.setenv("OMD_PUBLIC_DEMO_ALLOW_COOKIE_UPLOAD", "1")
+
+    with pytest.raises(ValueError, match="uploaded/staged cookie files"):
+        build_argv(
+            tmp_path,
+            cookies_file=str(traversal_path),
+            public_demo=True,
+        )
+
+
+def test_public_demo_accepts_regular_cookie_file_inside_staging(tmp_path, monkeypatch):
+    staging = tmp_path / "cookies"
+    staging.mkdir()
+    staged_cookie = staging / "uploaded-cookies.txt"
+    staged_cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    monkeypatch.setattr(ui, "COOKIES_STAGING", staging)
+    monkeypatch.setenv("OMD_PUBLIC_DEMO_ALLOW_COOKIE_UPLOAD", "1")
+
+    argv, _output = build_argv(
+        tmp_path,
+        cookies_file=str(staged_cookie),
+        public_demo=True,
+    )
+
+    assert argv[argv.index("--douyin-cookies") + 1] == str(staged_cookie)
 
 
 def test_public_demo_rejects_polish_and_ollama(tmp_path):
@@ -1661,10 +3128,13 @@ def test_build_argv_uses_rmarkdown_format_for_batch(tmp_path, monkeypatch):
 def test_build_argv_uses_batch_for_multiple_urls_on_one_line(tmp_path, monkeypatch):
     staging = tmp_path / "batch-lists"
     monkeypatch.setattr(ui, "BATCH_STAGING", staging)
+    cookies = tmp_path / "douyin_cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
 
     argv, output = build_argv(
         tmp_path,
         text_input="first https://v.douyin.com/a/ middle second https://v.douyin.com/b/ tail",
+        cookies_file=str(cookies),
     )
 
     assert argv[:4] == [ui.sys.executable, "-m", "omd.cli", "batch"]
@@ -1988,6 +3458,30 @@ def test_status_html_contains_progress_bar():
     assert "1 succeeded" in html
 
 
+def test_status_html_exposes_live_region_and_determinate_progress_semantics():
+    html = ui._status_html(
+        "running",
+        "transcribing",
+        detail="item 1/2",
+        percent=42,
+    )
+
+    assert 'role="status"' in html
+    assert 'aria-live="polite"' in html
+    assert 'aria-atomic="true"' in html
+    assert 'role="progressbar"' in html
+    assert 'aria-valuemin="0"' in html
+    assert 'aria-valuemax="100"' in html
+    assert 'aria-valuenow="42"' in html
+
+
+def test_status_html_does_not_claim_progress_value_when_indeterminate():
+    html = ui._status_html("running", "fetching", percent=None)
+
+    assert 'role="progressbar"' in html
+    assert 'aria-valuenow=' not in html
+
+
 def test_run_counts_distinguish_queued_current_and_finished_items():
     counts = ui._RunCounts(total=5)
 
@@ -2132,6 +3626,31 @@ def test_preview_output_summarizes_batch_directory(tmp_path):
     assert "Markdown/RMarkdown files: 2" in preview
     assert "`a.md`" in preview
     assert "`b.Rmd`" in preview
+
+
+def test_preview_output_focuses_vault_capture_on_three_recent_files(tmp_path):
+    captures = tmp_path / "Sources" / "Web"
+    captures.mkdir(parents=True)
+    for index in range(5):
+        path = captures / f"source-{index}.md"
+        path.write_text(f"# Source {index}\n", encoding="utf-8")
+        os.utime(path, (index + 1, index + 1))
+    vault_index = tmp_path / "Index" / "OMD Captures.md"
+    vault_index.parent.mkdir()
+    vault_index.write_text("INDEX-BODY-MUST-NOT-APPEAR\n" * 20, encoding="utf-8")
+
+    preview, label = ui._preview_output(tmp_path)
+
+    assert label == str(tmp_path)
+    assert "# Saved to vault" in preview
+    assert "External sources are stored under `Sources/`" in preview
+    assert "`Inbox/` is unchanged" in preview
+    assert "`Sources/Web/source-4.md`" in preview
+    assert "`Sources/Web/source-3.md`" in preview
+    assert "`Sources/Web/source-2.md`" in preview
+    assert "source-1.md" not in preview
+    assert "source-0.md" not in preview
+    assert "INDEX-BODY-MUST-NOT-APPEAR" not in preview
 
 
 def test_preview_output_rejects_empty_file(tmp_path):
@@ -2379,6 +3898,422 @@ def test_run_with_status_keeps_successful_warning_visible(tmp_path, monkeypatch)
     assert "done with warning" in status_html
     assert "1/1 processed" in status_html
     assert "1 succeeded" in status_html
+
+
+def test_context_run_queues_one_privacy_minimised_receipt_per_input(tmp_path, monkeypatch):
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+
+    context_run = ui._queue_context_run(
+        "https://example.com/one\nhttps://example.com/two",
+        [],
+        "",
+        "Convert to .md file",
+        str(tmp_path / "output"),
+        "",
+    )
+
+    assert context_run is not None
+    assert len(context_run.receipts) == 2
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "omd-data" / "context-outbox" / "jobs").glob("*.json")
+    )
+    assert "https://example.com/one" not in persisted
+    assert "https://example.com/two" not in persisted
+    assert str(tmp_path) not in persisted
+
+
+def test_context_run_secures_local_file_before_processing(tmp_path, monkeypatch):
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"private local PDF bytes")
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+
+    context_run = ui._queue_context_run(
+        "",
+        [str(source)],
+        "",
+        "Convert to .md file",
+        str(tmp_path / "output"),
+        "",
+    )
+    assert context_run is not None
+
+    assert context_run.receipts[0].state == "queued"
+    context_run.secure_sources()
+    assert context_run.receipts[0].state == "source_secured"
+    assert context_run.receipts[0].source_state == "secured"
+    context_run.start_processing()
+    assert context_run.receipts[0].state == "processing"
+
+
+def test_run_with_status_keeps_batch_receipt_outcomes_independent(tmp_path, monkeypatch):
+    target = tmp_path / "partial.md"
+    target.write_text("# Partial\n", encoding="utf-8")
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+    monkeypatch.setattr(
+        ui,
+        "_build_argv",
+        lambda *_args: (["omd", "batch", "--json-events"], target),
+    )
+    events = [
+        {"event": "batch_started", "total": 2},
+        {"event": "batch_item_started", "index": 1, "total": 2},
+        {"event": "batch_item_succeeded", "index": 1, "total": 2},
+        {"event": "batch_item_started", "index": 2, "total": 2},
+        {"event": "batch_item_failed", "index": 2, "total": 2},
+        {"event": "batch_completed", "succeeded": 1, "failed": 1, "total": 2},
+    ]
+    monkeypatch.setattr(
+        ui,
+        "_stream_subprocess",
+        lambda _argv: iter(
+            [("err", json.dumps(event)) for event in events] + [("rc", "1")]
+        ),
+    )
+    monkeypatch.setattr(ui.time, "monotonic", lambda: 100.0)
+
+    list(
+        ui.run_with_status(
+            "https://example.com/one\nhttps://example.com/two",
+            [],
+            "",
+            "Convert to .md file",
+            str(tmp_path),
+            "",
+        )
+    )
+
+    receipts = ui.ContextOutbox(tmp_path / "omd-data" / "context-outbox").list_receipts()
+    assert [receipt.state for receipt in receipts] == ["complete", "needs_action"]
+
+
+def test_interrupted_batch_does_not_claim_unprocessed_item_has_partial_output(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "batch-output"
+    target.mkdir()
+    (target / "one.md").write_text("# One\n", encoding="utf-8")
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+    monkeypatch.setattr(
+        ui,
+        "_build_argv",
+        lambda *_args: (["omd", "batch", "--json-events"], target),
+    )
+    events = [
+        {"event": "batch_started", "total": 2},
+        {"event": "batch_item_started", "index": 1, "total": 2},
+        {"event": "batch_item_succeeded", "index": 1, "total": 2},
+        {"event": "batch_item_started", "index": 2, "total": 2},
+    ]
+    monkeypatch.setattr(
+        ui,
+        "_stream_subprocess",
+        lambda _argv: iter(
+            [("err", json.dumps(event)) for event in events] + [("rc", "1")]
+        ),
+    )
+    monkeypatch.setattr(ui.time, "monotonic", lambda: 100.0)
+
+    list(
+        ui.run_with_status(
+            "https://example.com/one\nhttps://example.com/two",
+            [],
+            "",
+            "Convert to .md file",
+            str(tmp_path),
+            "",
+        )
+    )
+
+    receipts = ui.ContextOutbox(tmp_path / "omd-data" / "context-outbox").list_receipts()
+    assert [receipt.state for receipt in receipts] == ["complete", "needs_action"]
+
+
+def test_context_batch_receipt_failure_is_reported_without_raising():
+    class BrokenContextRun:
+        def apply_batch_event(self, _event):
+            raise OSError("disk unavailable")
+
+    warning = ui._transition_context_batch_event(
+        BrokenContextRun(),
+        {"event": "batch_item_succeeded", "index": 1, "total": 1},
+    )
+
+    assert warning == "receipt update failed for batch item: disk unavailable"
+
+
+def test_receipt_status_summary_surfaces_retry_action():
+    context_run = ui._ContextRun(
+        outbox=None,
+        receipts=[make_receipt(state="needs_action", recovery_action="retry")],
+        local_sources=[],
+    )
+
+    kind, text = context_run.status_summary()
+
+    assert kind == "receipt"
+    assert "needs action" in text
+    assert "next: retry" in text
+
+
+def test_receipt_status_summary_surfaces_resume_for_recovered_receipt():
+    context_run = ui._ContextRun(
+        outbox=None,
+        receipts=[
+            make_receipt(
+                state="source_secured",
+                recovery_action="resume",
+                source_state="secured",
+            )
+        ],
+        local_sources=[],
+    )
+
+    _kind, text = context_run.status_summary()
+
+    assert "source secured" in text
+    assert "next: resume" in text
+
+
+def test_receipt_status_summary_surfaces_keep_raw_for_failed_receipt():
+    context_run = ui._ContextRun(
+        outbox=None,
+        receipts=[make_receipt(state="failed", recovery_action="keep_raw")],
+        local_sources=[],
+    )
+
+    _kind, text = context_run.status_summary()
+
+    assert "failed" in text
+    assert "next: keep raw" in text
+
+
+def test_receipt_status_summary_keeps_action_visible_for_mixed_batch():
+    context_run = ui._ContextRun(
+        outbox=None,
+        receipts=[
+            make_receipt(state="complete"),
+            make_receipt(state="needs_action", recovery_action="retry"),
+        ],
+        local_sources=[],
+    )
+
+    _kind, text = context_run.status_summary()
+
+    assert "mixed states" in text
+    assert "next: retry" in text
+
+
+def test_context_run_cancel_preserves_item_that_already_needs_action(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+    context_run = ui._queue_context_run(
+        "https://example.com/one",
+        [],
+        "",
+        "Convert to .md file",
+        str(tmp_path),
+        "",
+    )
+    assert context_run is not None
+    context_run.start_processing()
+    receipt = context_run.receipts[0]
+    context_run.receipts[0] = context_run.outbox.fail_stage(
+        receipt.job_id,
+        error_code="conversion_failed",
+        retryable=True,
+    )
+
+    context_run.cancel()
+
+    assert context_run.receipts[0].state == "needs_action"
+
+
+def test_context_run_cancel_preserves_item_with_partial_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+    context_run = ui._queue_context_run(
+        "https://example.com/one",
+        [],
+        "",
+        "Convert to .md file",
+        str(tmp_path),
+        "",
+    )
+    assert context_run is not None
+    context_run.start_processing()
+    context_run.mark_partial_output()
+
+    context_run.cancel()
+
+    assert context_run.receipts[0].state == "partial_output"
+
+
+def test_run_with_status_exposes_and_completes_context_receipt(tmp_path, monkeypatch):
+    target = tmp_path / "complete.md"
+    target.write_text("# Complete\n", encoding="utf-8")
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+    monkeypatch.setattr(ui, "_build_argv", lambda *_args: (["omd", "convert"], target))
+    monkeypatch.setattr(ui, "_stream_subprocess", lambda _argv: iter([("rc", "0")]))
+    monkeypatch.setattr(ui.time, "monotonic", lambda: 100.0)
+
+    updates = list(
+        ui.run_with_status(
+            "https://example.com/article",
+            [],
+            "",
+            "Convert to .md file",
+            str(tmp_path),
+            "",
+        )
+    )
+
+    assert "receipt" in updates[0][0].lower()
+    assert "job_" in updates[0][3]
+    receipts = ui.ContextOutbox(tmp_path / "omd-data" / "context-outbox").list_receipts()
+    assert [receipt.state for receipt in receipts] == ["complete"]
+
+
+def test_public_demo_does_not_persist_local_context_receipts(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+
+    context_run = ui._queue_context_run(
+        "https://example.com/article",
+        [],
+        "",
+        "Convert to .md file",
+        str(tmp_path),
+        "",
+    )
+
+    assert context_run is None
+    assert not (tmp_path / "omd-data").exists()
+
+
+def test_closing_running_ui_generator_cancels_context_receipt(tmp_path, monkeypatch):
+    target = tmp_path / "pending.md"
+    monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
+    monkeypatch.setattr(ui, "_build_argv", lambda *_args: (["omd", "convert"], target))
+
+    def ticks(_argv):
+        while True:
+            yield "tick", ""
+
+    monkeypatch.setattr(ui, "_stream_subprocess", ticks)
+    generator = ui.run_with_status(
+        "https://example.com/article",
+        [],
+        "",
+        "Convert to .md file",
+        str(tmp_path),
+        "",
+    )
+
+    next(generator)
+    next(generator)
+    next(generator)
+    generator.close()
+
+    receipts = ui.ContextOutbox(tmp_path / "omd-data" / "context-outbox").list_receipts()
+    assert [receipt.state for receipt in receipts] == ["cancelled"]
+
+
+def test_save_voice_attachment_uses_filename_when_title_is_blank(tmp_path):
+    source = tmp_path / "walking-note.m4a"
+    source.write_bytes(b"audio")
+
+    _summary, selector_update, status, upload_update = ui._save_voice_attachment(
+        str(tmp_path),
+        str(source),
+        "",
+        "A note I typed first.",
+    )
+
+    record_id = selector_update["value"]
+    record = ui.VoiceInboxStore(tmp_path).load(record_id)
+    assert record.title == "walking-note"
+    assert record.my_notes == "A note I typed first."
+    assert "audio saved" in status.lower()
+    assert upload_update["value"] is None
+
+
+def test_begin_voice_transcription_uses_existing_local_model_controls(tmp_path):
+    source = tmp_path / "memo.wav"
+    source.write_bytes(b"audio")
+    store = ui.VoiceInboxStore(tmp_path)
+    record = store.create(source, title="Memo")
+
+    status = ui._begin_voice_transcription(
+        str(tmp_path),
+        record.record_id,
+        "My note",
+        "mlx-community/whisper-large-v3-turbo",
+        "en,zh",
+    )
+
+    updated = store.load(record.record_id)
+    assert updated.transcription_state == "transcribing"
+    assert updated.transcript_model == "mlx-community/whisper-large-v3-turbo"
+    assert updated.transcript_language == "en"
+    assert "started locally" in status.lower()
+
+
+def test_voice_transcription_failure_keeps_audio_and_note(tmp_path, monkeypatch):
+    source = tmp_path / "memo.wav"
+    source.write_bytes(b"audio")
+    store = ui.VoiceInboxStore(tmp_path)
+    record = store.create(source, title="Memo", my_notes="Keep me")
+    store.begin_transcription(record.record_id, backend="mlx", model="whisper-test")
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("mlx_whisper missing at /private/path")
+
+    monkeypatch.setattr("omd.reel.transcribe", fail)
+
+    transcript, notes, _suggestion, quality, status, _queue = ui._finish_voice_transcription(
+        str(tmp_path), record.record_id
+    )
+
+    failed = store.load(record.record_id)
+    assert transcript == ""
+    assert notes == "Keep me"
+    assert failed.transcription_state == "failed"
+    assert (tmp_path / failed.attachment_path).exists()
+    assert "/private/path" not in status
+    assert "kept" in status.lower()
+    assert "failed" in quality.lower()
+
+
+def test_voice_transcription_success_surfaces_quality_review(tmp_path, monkeypatch):
+    source = tmp_path / "memo.wav"
+    source.write_bytes(b"audio")
+    store = ui.VoiceInboxStore(tmp_path)
+    record = store.create(source, title="Memo")
+    store.begin_transcription(record.record_id, backend="mlx", model="whisper-test")
+    monkeypatch.setattr(
+        "omd.reel.transcribe",
+        lambda *_args, **_kwargs: {"text": "Repeated words.", "confidence": 0.2},
+    )
+
+    transcript, _notes, _suggestion, quality, status, _queue = ui._finish_voice_transcription(
+        str(tmp_path), record.record_id
+    )
+
+    assert transcript == "Repeated words."
+    assert "confidence" in quality.lower()
+    assert "review" in status.lower()
+
+
+def test_voice_ui_is_attachment_only_and_does_not_offer_recording():
+    cfg = build_gradio_config_or_skip()
+    labels = [
+        str(component.get("props", {}).get("label") or "")
+        for component in cfg["components"]
+    ]
+
+    assert "Voice attachment" in labels
+    assert not any("microphone" in label.lower() or "record voice" in label.lower() for label in labels)
 
 
 def test_huggingface_smoke_args_match_current_ui_contract(monkeypatch):

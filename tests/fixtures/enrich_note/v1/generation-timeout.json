@@ -1,0 +1,8 @@
+{
+  "fixture_kind": "service_error",
+  "request_id": "timeout-1",
+  "provider": "ollama",
+  "service_code": "timeout",
+  "service_message": "ollama timeout",
+  "expected_error": "generation_timeout"
+}

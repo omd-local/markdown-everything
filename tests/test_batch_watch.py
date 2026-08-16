@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from omd.batch import (
     default_output_path,
@@ -9,6 +10,8 @@ from omd.batch import (
     run_batch,
 )
 from omd.watch import run_watch
+from omd.work_scheduler import lane_limits_for_memory
+from omd._models import GIB
 
 
 def test_load_batch_items_skips_blank_lines_and_comments(tmp_path):
@@ -79,6 +82,118 @@ def test_run_batch_retries_partial_failures_and_emits_events(tmp_path):
     assert any(event["event"] == "batch_item_retry" for event in events)
     assert events[0]["event"] == "batch_started"
     assert events[-1]["event"] == "batch_completed"
+
+
+def test_run_batch_parallel_lanes_preserve_result_order(tmp_path):
+    second_finished = threading.Event()
+
+    def convert_one(item: str, output: Path) -> int:
+        if item == "first.pdf":
+            assert second_finished.wait(1)
+        else:
+            second_finished.set()
+        output.write_text(item, encoding="utf-8")
+        return 0
+
+    result = run_batch(
+        ["first.pdf", "second.pdf"],
+        tmp_path,
+        convert_one,
+        lane_limits=lane_limits_for_memory(32 * GIB, requested_workers=2),
+    )
+
+    assert [item.item for item in result.items] == ["first.pdf", "second.pdf"]
+    assert [item.output_path.read_text(encoding="utf-8") for item in result.items] == [
+        "first.pdf",
+        "second.pdf",
+    ]
+
+
+def test_run_batch_reports_effective_worker_plan(tmp_path):
+    events: list[dict[str, object]] = []
+
+    def convert_one(_item: str, output: Path) -> int:
+        output.write_text("ok\n", encoding="utf-8")
+        return 0
+
+    limits = lane_limits_for_memory(32 * GIB, requested_workers=2)
+    run_batch(
+        ["one.pdf"],
+        tmp_path,
+        convert_one,
+        lane_limits=limits,
+        progress_hook=events.append,
+    )
+
+    assert events[0]["worker_plan"] == {
+        "global": 2,
+        "convert": 2,
+        "network": 2,
+        "ocr": 1,
+        "asr": 1,
+        "model": 1,
+    }
+
+
+def test_run_batch_default_remains_sequential(tmp_path):
+    active = 0
+    observed = 0
+    lock = threading.Lock()
+
+    def convert_one(item: str, output: Path) -> int:
+        nonlocal active, observed
+        with lock:
+            active += 1
+            observed = max(observed, active)
+        output.write_text(item, encoding="utf-8")
+        with lock:
+            active -= 1
+        return 0
+
+    run_batch(["first.pdf", "second.pdf"], tmp_path, convert_one)
+
+    assert observed == 1
+
+
+def test_run_batch_parallel_callback_runs_as_each_item_finishes(tmp_path):
+    callback_seen = threading.Event()
+
+    def convert_one(item: str, output: Path) -> int:
+        if item == "second.pdf":
+            assert callback_seen.wait(1)
+        output.write_text(item, encoding="utf-8")
+        return 0
+
+    def on_succeeded(result):
+        if result.item == "first.pdf":
+            callback_seen.set()
+
+    run_batch(
+        ["first.pdf", "second.pdf"],
+        tmp_path,
+        convert_one,
+        on_item_succeeded=on_succeeded,
+        lane_limits=lane_limits_for_memory(32 * GIB, requested_workers=2),
+    )
+
+    assert callback_seen.is_set()
+
+
+def test_batch_success_result_keeps_item_index_and_total(tmp_path):
+    seen = []
+
+    def convert_one(item: str, output: Path) -> int:
+        output.write_text(item, encoding="utf-8")
+        return 0
+
+    run_batch(
+        ["first.pdf", "second.pdf"],
+        tmp_path,
+        convert_one,
+        on_item_succeeded=seen.append,
+    )
+
+    assert [(result.item_index, result.item_total) for result in seen] == [(1, 2), (2, 2)]
 
 
 def test_run_batch_logs_each_success_as_a_result(tmp_path, capsys):

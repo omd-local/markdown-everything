@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -49,7 +51,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from omd._language import DEFAULT_OCR_LANGUAGE, MIXED_OCR_LANGUAGE_EXAMPLE
-from omd._models import recommended_local_text_model
+from omd._models import detect_total_memory_bytes, recommended_local_text_model
 
 REEL_HOSTS = {
     "douyin.com", "v.douyin.com", "iesdouyin.com",
@@ -487,22 +489,58 @@ def _platform_cookie_extra(target: str, extra: list[str]) -> list[str]:
 
 
 def route_image(path: Path, output: Path | None, lang: str) -> int:
-    from omd import _progress
+    from omd import _events, _progress
     from omd._io import write_atomic
     require("tesseract")
     out_md = output or path.with_suffix(".md")
-    _progress.info(f"OCR (tesseract --lang {lang})")
+    started = time.monotonic()
+    pixels = _image_pixel_count(path)
+    if _events.is_enabled() and pixels:
+        _events.progress("OCR", 0, pixels, 0.0, stage_id="ocr", unit="pixels")
+    else:
+        _progress.info(
+            f"OCR (tesseract --lang {lang})",
+            stage_id="ocr",
+            unit="pixels",
+        )
     proc = subprocess.run(
         ["tesseract", str(path), "-", "-l", lang],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
+        _events.stage_state(
+            "ocr",
+            "failed",
+            elapsed_s=time.monotonic() - started,
+            unit="pixels",
+            completed=0 if pixels else None,
+            total=pixels,
+        )
         sys.stderr.write(proc.stderr)
         return proc.returncode
     body = f"# {path.name}\n\n{proc.stdout.strip()}\n"
     write_atomic(out_md, body)
+    _events.stage_state(
+        "ocr",
+        "completed",
+        elapsed_s=time.monotonic() - started,
+        unit="pixels",
+        completed=pixels,
+        total=pixels,
+    )
     _progress.done(f"wrote {out_md}")
     return 0
+
+
+def _image_pixel_count(path: Path) -> int | None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            pixels = int(image.width) * int(image.height)
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    return pixels if pixels > 0 else None
 
 
 def _markdown_image_urls(markdown: str) -> list[str]:
@@ -582,11 +620,41 @@ def route_markitdown(target: str, output: Path | None) -> int:
             "pip install 'markitdown[all]'",
         )
     is_url = target.startswith(("http://", "https://"))
-    _progress.info(f"Converting {'URL' if is_url else 'file'} via markitdown")
+    started = time.monotonic()
+    input_bytes = None if is_url else _local_file_size(target)
+
+    def emit_terminal(state: str) -> None:
+        succeeded = state == "completed"
+        _events.stage_state(
+            "convert",
+            state,
+            elapsed_s=time.monotonic() - started,
+            unit=None if is_url else "bytes",
+            completed=input_bytes if succeeded else (0 if input_bytes else None),
+            total=input_bytes,
+        )
+
+    if _events.is_enabled() and input_bytes:
+        _events.progress(
+            "Convert",
+            0,
+            input_bytes,
+            0.0,
+            stage_id="convert",
+            unit="bytes",
+        )
+    else:
+        _progress.info(
+            f"Converting {'URL' if is_url else 'file'} via markitdown",
+            stage_id="convert",
+            unit="bytes" if not is_url else None,
+        )
     from omd._network_policy import public_network_policy_enabled
 
     if is_url and public_network_policy_enabled():
-        return _route_public_web_url(target, output, bin_path)
+        result = _route_public_web_url(target, output, bin_path)
+        emit_terminal("completed" if result == 0 else "failed")
+        return result
     proc = subprocess.run(
         [bin_path, target], capture_output=True, text=True,
     )
@@ -604,8 +672,10 @@ def route_markitdown(target: str, output: Path | None) -> int:
                     partial=False,
                 )
             _progress.done(f"wrote {output}")
+        emit_terminal("completed")
         return 0
     if not is_url:
+        emit_terminal("failed")
         sys.stderr.write(proc.stderr)
         return proc.returncode
 
@@ -623,6 +693,7 @@ def route_markitdown(target: str, output: Path | None) -> int:
             "Open the page in your browser, save it as HTML or PDF, then drop that local "
             "file into OMD. OMD does not bypass access controls or platform restrictions."
         )
+        emit_terminal("failed")
         return proc.returncode or 1
 
     with tempfile.TemporaryDirectory(prefix="omd-web-") as tmp_dir:
@@ -636,6 +707,7 @@ def route_markitdown(target: str, output: Path | None) -> int:
             "public webpage fallback could not be converted: "
             f"{_converter_error_summary(fallback_proc.stderr)}"
         )
+        emit_terminal("failed")
         return fallback_proc.returncode
     if fallback.partial:
         _progress.warn(
@@ -656,7 +728,16 @@ def route_markitdown(target: str, output: Path | None) -> int:
             partial=fallback.partial,
         )
         _progress.done(f"wrote {output}")
+    emit_terminal("completed")
     return 0
+
+
+def _local_file_size(target: str) -> int | None:
+    try:
+        size = Path(target).stat().st_size
+    except OSError:
+        return None
+    return size if size > 0 else None
 
 
 def _route_public_web_url(target: str, output: Path | None, bin_path: str) -> int:
@@ -936,6 +1017,7 @@ def route_audio(path: Path, output: Path | None, extra: list[str]) -> int:
                 audio_args.polish,
                 audio_args.ollama_host,
                 segments=tr.get("segments"),
+                **({"allow_remote": True} if audio_args.allow_remote_ollama else {}),
             )
 
         info_dict = {
@@ -1531,6 +1613,202 @@ def _forward_remote_ollama_opt_in(extra: list[str], *, allow_remote: bool) -> li
     return forwarded
 
 
+class _EnrichNoteCLIUsageError(ValueError):
+    pass
+
+
+class _EnrichNoteArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _EnrichNoteCLIUsageError(message)
+
+
+def _enrich_note_human_error(
+    code: str,
+    message: str,
+    args: argparse.Namespace | None,
+) -> str:
+    """Add recovery and preservation context without changing the JSON protocol."""
+    lines = [f"error: {message}"]
+    if code == "ollama_unavailable":
+        lines.extend(
+            [
+                "cause: OMD could not reach the configured Ollama service.",
+                "next: start Ollama, or run `ollama serve`, then retry the same command.",
+                "check: run `ollama list` to confirm the service is responding.",
+            ]
+        )
+    elif code == "model_not_installed":
+        model = getattr(args, "model", None) or recommended_local_text_model()
+        lines.extend(
+            [
+                "cause: the requested model is not present in the local Ollama model list.",
+                "next: run `ollama list`, then retry with `--model INSTALLED_MODEL`.",
+                f"install: run `ollama pull {shlex.quote(model)}` if you want this exact model.",
+            ]
+        )
+    elif code == "generation_timeout":
+        lines.extend(
+            [
+                "cause: Ollama did not finish before the configured timeout.",
+                "next: retry with a larger limit, for example `--timeout 90`.",
+            ]
+        )
+    elif code == "cancelled":
+        lines.extend(
+            [
+                "cause: generation was stopped before a complete proposal was validated.",
+                "next: rerun the same command when you are ready.",
+            ]
+        )
+    elif code in {"note_not_found", "path_outside_vault"}:
+        lines.extend(
+            [
+                "cause: the vault root or vault-relative Markdown path was not readable safely.",
+                "next: confirm that `--vault` is the vault root and NOTE.md is relative to it.",
+                "example: `omd enrich-note Inbox/example.md --vault /path/to/vault`.",
+            ]
+        )
+    elif code == "request_too_large":
+        lines.extend(
+            [
+                "cause: the request exceeds a safety or local-model context limit.",
+                "next: use a shorter note or select a model with a larger context window.",
+            ]
+        )
+    elif code == "invalid_model_json":
+        lines.extend(
+            [
+                "cause: the model response could not be validated as a grounded proposal.",
+                "next: retry once; if it repeats, choose another installed model.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "next: run `omd enrich-note NOTE.md --vault /path/to/vault`.",
+                "help: run `omd enrich-note --help` for all options.",
+            ]
+        )
+    lines.append("preserved: no vault files were changed; enrich-note only returns a proposal.")
+    return "\n".join(lines) + "\n"
+
+
+def _run_capabilities(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="omd capabilities",
+        description="Report OMD's static machine-readable protocol capabilities.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--json", action="store_true", help="Emit compact JSON.")
+    args = parser.parse_args(argv)
+    if not args.json:
+        parser.error("--json is required")
+    from omd.capabilities import capabilities_json
+
+    sys.stdout.write(capabilities_json())
+    return 0
+
+
+def _run_enrich_note(argv: list[str]) -> int:
+    from omd import _events
+    from omd.enrich_note import (
+        EnrichNoteError,
+        MAX_REQUEST_BYTES,
+        build_standalone_request,
+        decode_request,
+        run_enrich_note,
+    )
+
+    json_events = "--json-events" in argv
+    _events.configure(json_events)
+    parser = _EnrichNoteArgumentParser(
+        prog="omd enrich-note",
+        description="Generate a validated, read-only note-enrichment proposal.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("note", nargs="?", help="Vault-relative Markdown path.")
+    parser.add_argument("--vault", help="Vault root for standalone mode.")
+    parser.add_argument("--request-json", choices=["-"], help="Read the v1 request from stdin.")
+    parser.add_argument("--model", help="Exact installed Ollama model.")
+    parser.add_argument("--host", help="Ollama base URL.")
+    parser.add_argument("--timeout", type=float, default=45.0, help="Generation timeout in seconds.")
+    parser.add_argument("--json-events", action="store_true", help="Emit v1 JSONL events on stderr.")
+    parser.add_argument(
+        "--allow-remote-ollama",
+        action="store_true",
+        help="Authorize this invocation to use an explicit remote HTTPS Ollama endpoint.",
+    )
+
+    request_id: str | None = None
+    args: argparse.Namespace | None = None
+    try:
+        args = parser.parse_args(argv)
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise EnrichNoteError("invalid_request", "--timeout must be a positive finite number")
+        request_mode = args.request_json is not None
+        if request_mode:
+            if args.note is not None or any(
+                value is not None for value in (args.vault, args.model, args.host)
+            ):
+                raise EnrichNoteError(
+                    "invalid_request",
+                    "request mode rejects note, --vault, --model, and --host",
+                )
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            raw = stream.read(MAX_REQUEST_BYTES + 1)
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
+            request = decode_request(raw)
+            catalog_warnings: tuple[str, ...] = ()
+        else:
+            if args.note is None or args.vault is None:
+                raise EnrichNoteError(
+                    "invalid_request",
+                    "standalone mode requires a note and --vault",
+                )
+            request, catalog_warnings = build_standalone_request(
+                args.vault,
+                args.note,
+                model=args.model or recommended_local_text_model(),
+                host=args.host or "http://localhost:11434",
+            )
+        args.model = request.model
+        request_id = request.request_id
+        response = run_enrich_note(
+            request,
+            timeout_seconds=args.timeout,
+            allow_remote_ollama=args.allow_remote_ollama,
+            warnings=catalog_warnings,
+        )
+        serialized = json.dumps(
+            response,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
+        sys.stdout.write(serialized)
+        sys.stdout.flush()
+        _events.done(None, request_id=request_id)
+        _events.configure(False)
+        return 0
+    except _EnrichNoteCLIUsageError:
+        code, message = "invalid_request", "invalid enrich-note command arguments"
+    except EnrichNoteError as exc:
+        request_id = exc.request_id or request_id
+        code, message = exc.code, str(exc)
+    except KeyboardInterrupt:
+        code, message = "cancelled", "note enrichment was cancelled"
+
+    if json_events:
+        _events.error(code, message, request_id=request_id)
+    else:
+        sys.stderr.write(_enrich_note_human_error(code, message, args))
+        sys.stderr.flush()
+    _events.configure(False)
+    return 2 if code == "invalid_request" else 1
+
+
 def _run_inspect(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Inspect how OMD would route an input without converting it.")
     parser.add_argument("target", help="URL, share blob, file path, or directory")
@@ -1584,6 +1862,16 @@ def _run_batch_cmd(argv: list[str]) -> int:
                         help="Output format: md or rmd (default md; inferred from .Rmd output names where possible).")
     parser.add_argument("--rmd", action="store_true", help="Shortcut for --format rmd.")
     parser.add_argument("--retries", type=int, default=0, help="Retries per item after failure.")
+    parser.add_argument(
+        "--batch-workers",
+        type=int,
+        default=None,
+        help=(
+            "Advanced bounded conversion workers (default: automatic RAM-safe limit). "
+            "An explicit value may only reduce that limit; OCR, transcription, and "
+            "local-model lanes remain single-worker."
+        ),
+    )
     parser.add_argument(
         "--lang",
         default=DEFAULT_OCR_LANGUAGE,
@@ -1650,6 +1938,15 @@ def _run_batch_cmd(argv: list[str]) -> int:
         reel_extra = list(reel_extra) + [ARTICLE_IMAGE_OCR_FLAG]
     _validate_existing_file(args.input_file, label="Batch list", kind="batch_list_invalid")
     _validate_output_directory(args.output)
+    from omd.work_scheduler import lane_limits_for_memory
+
+    try:
+        lane_limits = lane_limits_for_memory(
+            detect_total_memory_bytes(),
+            requested_workers=args.batch_workers,
+        )
+    except ValueError as exc:
+        _events.fatal("batch_workers_invalid", str(exc))
 
     output_format = _resolve_output_format(args.output_format, rmd=args.rmd)
     route_output_format = "md" if args.polish_md and output_format == "rmd" else output_format
@@ -1657,7 +1954,7 @@ def _run_batch_cmd(argv: list[str]) -> int:
     from queue import Empty, Queue
     from threading import Event, Thread
 
-    polish_queue: Queue[tuple[str, Path] | None] | None = None
+    polish_queue: Queue[tuple[str, Path, int, int] | None] | None = None
     polish_worker: Thread | None = None
     polish_abort = Event()
     pipeline_closed = False
@@ -1684,6 +1981,7 @@ def _run_batch_cmd(argv: list[str]) -> int:
                 host=args.polish_md_host,
                 force=args.force,
                 keep_raw=args.polish_md_keep_raw,
+                **({"allow_remote": True} if args.allow_remote_ollama else {}),
             )
             if polish_abort.is_set():
                 write_atomic_bytes(output, original)
@@ -1712,9 +2010,10 @@ def _run_batch_cmd(argv: list[str]) -> int:
             try:
                 if task is None:
                     return
-                item, output = task
+                item, output, item_index, item_total = task
                 if not polish_abort.is_set():
-                    polish_output(item, output)
+                    with _events.item_context(index=item_index, total=item_total):
+                        polish_output(item, output)
             finally:
                 polish_queue.task_done()
 
@@ -1758,7 +2057,9 @@ def _run_batch_cmd(argv: list[str]) -> int:
     def queue_polish(result) -> None:
         if polish_queue is None:
             return
-        polish_queue.put((result.item, result.output_path))
+        polish_queue.put(
+            (result.item, result.output_path, result.item_index, result.item_total)
+        )
         _progress.info(f"Queued local Markdown polish: {result.output_path.name}")
 
     def convert_one(item: str, output: Path) -> int:
@@ -1791,6 +2092,7 @@ def _run_batch_cmd(argv: list[str]) -> int:
             progress_hook=_json_event_hook if json_events else None,
             finish_pending=finish_pending_polish if polish_queue is not None else None,
             on_item_succeeded=queue_polish if polish_queue is not None else None,
+            lane_limits=lane_limits,
         )
         completed_normally = True
     finally:
@@ -1889,6 +2191,12 @@ def _run_capture_cmd(argv: list[str]) -> int:
         help="Explicitly allow an HTTPS Ollama-compatible endpoint outside this machine.",
     )
     parser.add_argument("--memory-timeout", type=float, default=180, help="Seconds to wait for each local memory-card model request.")
+    parser.add_argument("--polish-md", action="store_true",
+                        help="Polish the structurally cleaned capture with a local Ollama model.")
+    parser.add_argument("--polish-md-model", default=recommended_text_model,
+                        help=f"Ollama model for capture Markdown polish (memory-sized default {recommended_text_model}).")
+    parser.add_argument("--polish-md-host", default="http://localhost:11434",
+                        help="Ollama HTTP host for capture Markdown polish.")
     parser.add_argument("--ocr-article-images", action="store_true",
                         help="After conversion, OCR remote images referenced by article/webpage Markdown.")
     parser.add_argument(
@@ -1918,11 +2226,15 @@ def _run_capture_cmd(argv: list[str]) -> int:
         _events.fatal("flag_conflict", "--json-events/--agent-safe and --quiet are mutually exclusive")
     if args.agent_safe and args.memory_cards:
         _events.fatal("agent_safe_blocked_flag", "--agent-safe rejects --memory-cards generated output")
+    if args.agent_safe and args.polish_md:
+        _events.fatal("agent_safe_blocked_flag", "--agent-safe rejects --polish-md generated output")
     if args.agent_safe and args.allow_remote_ollama:
         _events.fatal("agent_safe_blocked_flag", "--agent-safe rejects --allow-remote-ollama")
     ollama_hosts = _option_values(reel_extra, "--ollama-host")
     if args.memory_cards:
         ollama_hosts.append(args.memory_host)
+    if args.polish_md:
+        ollama_hosts.append(args.polish_md_host)
     _validate_cli_ollama_hosts(ollama_hosts, allow_remote=args.allow_remote_ollama)
     reel_extra = _forward_remote_ollama_opt_in(
         reel_extra,
@@ -1965,6 +2277,10 @@ def _run_capture_cmd(argv: list[str]) -> int:
                 memory_model=args.memory_model,
                 memory_host=args.memory_host,
                 memory_timeout=max(1.0, args.memory_timeout),
+                polish_md=args.polish_md,
+                polish_md_model=args.polish_md_model,
+                polish_md_host=args.polish_md_host,
+                allow_remote_ollama=args.allow_remote_ollama,
             )
         except (OSError, UnicodeError) as exc:
             _events.fatal("capture_batch_invalid", str(exc))
@@ -1982,6 +2298,10 @@ def _run_capture_cmd(argv: list[str]) -> int:
             memory_model=args.memory_model,
             memory_host=args.memory_host,
             memory_timeout=max(1.0, args.memory_timeout),
+            polish_md=args.polish_md,
+            polish_md_model=args.polish_md_model,
+            polish_md_host=args.polish_md_host,
+            allow_remote_ollama=args.allow_remote_ollama,
         )
     except OSError as exc:
         _events.fatal("capture_vault_invalid", str(exc))
@@ -1998,7 +2318,29 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "convert":
         argv.pop(0)
-    if argv and argv[0] in {"inspect", "doctor", "batch", "watch", "capture"}:
+    if argv and argv[0] not in {"capabilities", "enrich-note"} and any(
+        command.startswith(argv[0]) for command in ("capabilities", "enrich-note")
+    ):
+        from omd import _events
+
+        json_events = "--json-events" in argv[1:]
+        _events.configure(json_events)
+        message = "protocol command names do not support abbreviations"
+        if json_events:
+            _events.error("invalid_request", message)
+        else:
+            sys.stderr.write(f"error: {message}\n")
+        _events.configure(False)
+        return 2
+    if argv and argv[0] in {
+        "inspect",
+        "doctor",
+        "batch",
+        "watch",
+        "capture",
+        "capabilities",
+        "enrich-note",
+    }:
         command = argv.pop(0)
         if command == "inspect":
             return _run_inspect(argv)
@@ -2010,11 +2352,28 @@ def main(argv: list[str] | None = None) -> int:
             return _run_watch_cmd(argv)
         if command == "capture":
             return _run_capture_cmd(argv)
+        if command == "capabilities":
+            return _run_capabilities(argv)
+        if command == "enrich-note":
+            return _run_enrich_note(argv)
         raise AssertionError(command)
 
     recommended_text_model = recommended_local_text_model()
     p = argparse.ArgumentParser(
+        prog="omd",
         description=__doc__,
+        epilog="""Commands:
+  omd INPUT [options]                 Convert a URL, file, or directory.
+  omd doctor                          Check the installation and show next steps.
+  omd inspect INPUT                   Preview how an input will be routed.
+  omd capture INPUT --vault VAULT     Convert into the vault Sources tree without overwriting notes.
+  omd batch FILE                      Convert inputs listed in a file.
+  omd watch FOLDER                    Watch a drop folder for stable new files.
+  omd capabilities --json             Report machine-readable protocol support.
+  omd enrich-note NOTE --vault VAULT  Return a read-only local-AI proposal.
+
+Browser UI:
+  omd-ui --help                       Show UI launch and port options.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
     )
@@ -2179,6 +2538,7 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.polish_md_host,
                 force=args.force,
                 keep_raw=args.polish_md_keep_raw,
+                **({"allow_remote": True} if args.allow_remote_ollama else {}),
             )
         except (Exception, SystemExit) as exc:
             if direct_markdown_polish:

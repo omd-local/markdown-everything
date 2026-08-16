@@ -47,13 +47,27 @@ def public_only_getaddrinfo(host, port, *args, **kwargs):
     return answers
 
 
-def validate_public_http_url(url: str, *, resolver: Resolver | None = None) -> None:
-    """Reject URL destinations that are not resolved public HTTP(S) addresses."""
+def validate_http_url(url: str) -> None:
+    """Require an absolute credential-free HTTP(S) URL without control characters."""
+    if not isinstance(url, str) or not url or url != url.strip():
+        raise ValueError("Only absolute HTTP(S) URLs are allowed.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in url):
+        raise ValueError("Only absolute HTTP(S) URLs are allowed.")
     parsed = urlsplit(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Only absolute HTTP(S) URLs are allowed.")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("URLs containing credentials are not allowed.")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("URL contains an invalid port.") from exc
+
+
+def validate_public_http_url(url: str, *, resolver: Resolver | None = None) -> None:
+    """Reject URL destinations that are not resolved public HTTP(S) addresses."""
+    validate_http_url(url)
+    parsed = urlsplit(url)
     try:
         port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     except ValueError as exc:
@@ -120,6 +134,17 @@ class PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep credentials and source bodies bound to their validated destination."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_no_redirect_opener():
+    return urllib.request.build_opener(NoRedirectHandler())
+
+
 def build_public_network_opener(*, resolver: Resolver | None = None):
     return urllib.request.build_opener(
         _PublicOnlyHTTPHandler(resolver=resolver),
@@ -180,3 +205,13 @@ def validate_ollama_host(host: str, *, allow_remote: bool = False) -> None:
         )
     if parsed.scheme.lower() != "https":
         raise ValueError("An explicitly allowed remote Ollama host must use HTTPS.")
+
+
+def validate_ollama_base_url(host: str, *, allow_remote: bool = False) -> None:
+    """Validate an Ollama host and require a base URL without routing components."""
+    validate_ollama_host(host, allow_remote=allow_remote)
+    raw = host.strip()
+    absolute = raw if "://" in raw else f"http://{raw}"
+    parsed = urlsplit(absolute)
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("Ollama host must be a base URL without a path, query, or fragment")
