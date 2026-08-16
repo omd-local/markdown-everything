@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 
 def test_generate_memory_cards_chunks_long_markdown_before_final_pass():
     from omd import memory_cards
@@ -35,6 +37,45 @@ def test_generate_memory_cards_chunks_long_markdown_before_final_pass():
     assert result.tags == ["local-ai", "rag-preprocessing"]
     assert "[[RAG preprocessing]]" in result.cards_markdown
     assert result.warnings == []
+
+
+def test_generate_memory_cards_rejects_remote_host_without_explicit_opt_in():
+    from omd import memory_cards
+
+    calls: list[str] = []
+
+    def fake_chat(_prompt: str, _model: str, host: str) -> str:
+        calls.append(host)
+        return '{"summary":"Summary","tags":[],"memory_cards_markdown":""}'
+
+    with pytest.raises(ValueError, match="explicit opt-in"):
+        memory_cards.generate_memory_cards(
+            "# Private note\n\nDo not send this silently.",
+            host="https://models.example.com",
+            _chat_fn=fake_chat,
+        )
+
+    assert calls == []
+
+
+def test_generate_memory_cards_allows_https_remote_host_after_explicit_opt_in():
+    from omd import memory_cards
+
+    calls: list[str] = []
+
+    def fake_chat(_prompt: str, _model: str, host: str) -> str:
+        calls.append(host)
+        return '{"summary":"Summary","tags":[],"memory_cards_markdown":""}'
+
+    result = memory_cards.generate_memory_cards(
+        "# Private note\n\nSend only after consent.",
+        host="https://models.example.com",
+        allow_remote=True,
+        _chat_fn=fake_chat,
+    )
+
+    assert calls == ["https://models.example.com"]
+    assert result.summary == "Summary"
 
 
 def test_generate_memory_cards_parses_json_embedded_in_model_text():
@@ -121,22 +162,16 @@ def test_chat_ollama_disables_thinking(monkeypatch):
 
     captured: dict[str, object] = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self) -> bytes:
-            return b'{"message":{"content":"{\\"summary\\":\\"ok\\",\\"tags\\":[],\\"memory_cards_markdown\\":\\"\\"}"}}'
-
-    def fake_urlopen(request, timeout):
+    def fake_request(request, *, timeout):
         captured["timeout"] = timeout
         captured["body"] = json.loads(request.data.decode("utf-8"))
-        return FakeResponse()
+        return {
+            "message": {
+                "content": '{"summary":"ok","tags":[],"memory_cards_markdown":""}',
+            },
+        }
 
-    monkeypatch.setattr(memory_cards.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(memory_cards, "request_ollama_json", fake_request)
 
     response = memory_cards._chat_ollama("prompt", "qwen3:4b", "http://localhost:11434")
 

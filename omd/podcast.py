@@ -43,6 +43,8 @@ from urllib.parse import parse_qs, urlparse
 
 from omd._audio import duration_seconds
 from omd._models import recommended_local_text_model
+from omd._network_policy import validate_http_url
+from omd._safe_xml import parse_untrusted_xml
 from omd.reel import polish_transcript, transcribe
 
 UA = (
@@ -56,6 +58,8 @@ URL_RE = re.compile(r"https?://[^\s'\"<>，。、）)】]+", re.UNICODE)
 ID_RE = re.compile(r"/id(\d+)")
 SLUG_RE = re.compile(r"/podcast/([^/]+)/id\d+", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
+APPLE_LOOKUP_LIMIT_BYTES = 1024 * 1024
+PODCAST_FEED_LIMIT_BYTES = 10 * 1024 * 1024
 
 
 def is_apple_podcast_url(url: str) -> bool:
@@ -93,13 +97,35 @@ def slugify(s: str) -> str:
     return s.strip("-")
 
 
-def http_get(url: str, *, headers: dict | None = None) -> bytes:
+def http_get(
+    url: str,
+    *,
+    headers: dict | None = None,
+    max_bytes: int = PODCAST_FEED_LIMIT_BYTES,
+) -> bytes:
+    validate_http_url(url)
     h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.8"}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read()
+        try:
+            content_length = int(r.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > max_bytes:
+            raise ValueError(f"Podcast metadata exceeds the {max_bytes}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = r.read(min(64 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"Podcast metadata exceeded the {max_bytes}-byte limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def lookup_feed_url(show_id: str, *, retries: int = 5) -> str:
@@ -111,7 +137,10 @@ def lookup_feed_url(show_id: str, *, retries: int = 5) -> str:
     url = f"https://itunes.apple.com/lookup?id={show_id}&media=podcast&limit=1"
     last_err = ""
     for i in range(retries):
-        body = http_get(url).decode("utf-8", errors="replace")
+        body = http_get(url, max_bytes=APPLE_LOOKUP_LIMIT_BYTES).decode(
+            "utf-8",
+            errors="replace",
+        )
         try:
             d = json.loads(body)
             if d.get("resultCount", 0) >= 1:
@@ -132,7 +161,11 @@ _RSS_NS = {
 
 
 def parse_feed(xml_bytes: bytes) -> list[dict]:
-    root = ET.fromstring(xml_bytes)
+    root = parse_untrusted_xml(
+        xml_bytes,
+        max_bytes=PODCAST_FEED_LIMIT_BYTES,
+        label="Podcast feed",
+    )
     out: list[dict] = []
     for it in root.findall(".//item"):
         enc = it.find("enclosure")
@@ -175,6 +208,8 @@ def html_to_text(html: str) -> str:
 
 def download_to(url: str, dest: Path) -> None:
     from omd._download import copy_response_bounded
+    validate_http_url(url)
+
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=600) as r:
         copy_response_bounded(r, dest, label="Podcast audio download")
@@ -323,7 +358,11 @@ def main() -> int:
     item = find_episode(items, track_id, slug)
     show_name = ""
     try:
-        root = ET.fromstring(feed_xml)
+        root = parse_untrusted_xml(
+            feed_xml,
+            max_bytes=PODCAST_FEED_LIMIT_BYTES,
+            label="Podcast feed",
+        )
         show_name = (root.findtext(".//channel/title") or "").strip()
     except ET.ParseError:
         pass
@@ -362,6 +401,7 @@ def main() -> int:
             if args.polish and transcript_text and not transcript_warnings:
                 polished = polish_transcript(
                     transcript_text, args.polish, args.ollama_host, segments=segments,
+                    **({"allow_remote": True} if args.allow_remote_ollama else {}),
                 )
 
         transcript_source = ""

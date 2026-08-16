@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from omd._download import max_download_bytes
+from omd._safe_xml import UnsafeXML, parse_untrusted_xml
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -18,6 +19,10 @@ UA = (
 WEBPAGE_LIMIT_BYTES = 20 * 1024 * 1024
 CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
 DC_NS = "http://purl.org/dc/elements/1.1/"
+_ZHIHU_VERIFICATION_ID_RE = re.compile(
+    r"\bid\s*=\s*(['\"])zh-zse-ck\1",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -42,13 +47,18 @@ def fetch_public_fallback(
     direct_error: Exception | None = None
     try:
         source_html, final_url = _fetch_text(url, timeout=timeout, opener=opener)
+    except Exception as exc:  # noqa: BLE001 - the RSS path is the intended fallback
+        direct_error = exc
+        if _is_zhihu_article(url) and _is_access_denied(exc):
+            raise _zhihu_browser_verification_error() from exc
+    else:
+        if _is_zhihu_verification_page(url, source_html):
+            raise _zhihu_browser_verification_error()
         return WebFallbackDocument(
             html=_inject_base(source_html, final_url),
             mode="browser_html",
             partial=False,
         )
-    except Exception as exc:  # noqa: BLE001 - the RSS path is the intended fallback
-        direct_error = exc
 
     feed_url = _feed_url(url)
     try:
@@ -118,8 +128,12 @@ def _read_bounded(response) -> bytes:
 
 def _document_from_feed(feed_xml: str, source_url: str) -> WebFallbackDocument:
     try:
-        root = ET.fromstring(feed_xml)
-    except ET.ParseError as exc:
+        root = parse_untrusted_xml(
+            feed_xml,
+            max_bytes=WEBPAGE_LIMIT_BYTES,
+            label="same-origin feed",
+        )
+    except (ET.ParseError, UnsafeXML) as exc:
         raise WebFallbackUnavailable(f"same-origin feed was not valid XML: {exc}") from exc
 
     wanted = _normalized_url(source_url)
@@ -195,6 +209,26 @@ def _inject_base(source_html: str, source_url: str) -> str:
 def _feed_url(url: str) -> str:
     parsed = urlsplit(url)
     return urlunsplit((parsed.scheme, parsed.netloc, "/feed/", "", ""))
+
+
+def _is_zhihu_article(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.hostname == "zhuanlan.zhihu.com" and parsed.path.startswith("/p/")
+
+
+def _is_access_denied(exc: Exception) -> bool:
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in {401, 403}
+
+
+def _is_zhihu_verification_page(url: str, source_html: str) -> bool:
+    return _is_zhihu_article(url) and bool(_ZHIHU_VERIFICATION_ID_RE.search(source_html))
+
+
+def _zhihu_browser_verification_error() -> WebFallbackUnavailable:
+    return WebFallbackUnavailable(
+        "Zhihu requires browser verification before it returns article HTML; "
+        "OMD does not run anti-bot challenges"
+    )
 
 
 def _normalized_url(url: str) -> str:

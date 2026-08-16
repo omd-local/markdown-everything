@@ -69,15 +69,33 @@ def _events_on() -> bool:
     return _events.is_enabled()
 
 
-def info(msg: str) -> None:
+def info(
+    msg: str,
+    *,
+    stage_id: str | None = None,
+    state: str = "indeterminate",
+    unit: str | None = None,
+    total: float | None = None,
+    item_index: int | None = None,
+    item_total: int | None = None,
+) -> None:
     """Always-shown stage label. In --json-events mode, emit a `stage` event
     with `msg` as the name (slugified to a stable token)."""
     if _events_on():
         from omd import _events
+        from omd.stage_progress import stage_id_for_label
         # Slugify msg → stable stage name token (e.g. "Downloading reel" → "download").
         # Strip leading verbs and lowercase the first word as the canonical stage.
         first_word = msg.split()[0].lower().rstrip(":")
-        _events.stage(first_word)
+        _events.stage(
+            first_word,
+            stage_id=stage_id or stage_id_for_label(msg),
+            state=state,
+            unit=unit,
+            total=total,
+            item_index=item_index,
+            item_total=item_total,
+        )
         return
     if _QUIET:
         return
@@ -138,9 +156,24 @@ class ProgressBar:
     """
     BAR_WIDTH = 24
 
-    def __init__(self, label: str, total: int) -> None:
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        *,
+        stage_id: str | None = None,
+        unit: str = "items",
+        item_index: int | None = None,
+        item_total: int | None = None,
+    ) -> None:
+        from omd.stage_progress import stage_id_for_label
+
         self.label = label
         self.total = max(1, total)
+        self.stage_id = stage_id or stage_id_for_label(label)
+        self.unit = unit
+        self.item_index = item_index
+        self.item_total = item_total
         self.cur = 0
         self.start = time.monotonic()
         self.events_mode = _events_on()
@@ -166,7 +199,16 @@ class ProgressBar:
         elapsed = now - self.start
         if self.events_mode:
             from omd import _events
-            _events.progress(self.label, self.cur, self.total, elapsed)
+            _events.progress(
+                self.label,
+                self.cur,
+                self.total,
+                elapsed,
+                stage_id=self.stage_id,
+                unit=self.unit,
+                item_index=self.item_index,
+                item_total=self.item_total,
+            )
             return
         pct = self.cur / self.total
         eta = ((elapsed / pct) - elapsed) if pct > 0 and self.cur < self.total else 0
@@ -201,9 +243,40 @@ def copy_with_progress(src, dest, label: str, total_bytes: int, chunk: int = 64 
     """shutil.copyfileobj equivalent that renders a progress bar by bytes.
     `total_bytes` may be 0 if Content-Length is unknown — falls back to a
     simple "downloading…" line."""
-    if not _animated() or total_bytes <= 0:
+    events_mode = _events_on()
+    if total_bytes <= 0:
+        started = time.monotonic()
+        if events_mode:
+            from omd import _events
+
+            _events.stage(
+                "download",
+                stage_id="download",
+                state="indeterminate",
+                unit="bytes",
+            )
+        elif not _QUIET:
+            info(f"{label} (? MB)")
+        n = 0
+        while True:
+            buf = src.read(chunk)
+            if not buf:
+                break
+            dest.write(buf)
+            n += len(buf)
+        if events_mode:
+            _events.stage_state(
+                "download",
+                "completed",
+                elapsed_s=time.monotonic() - started,
+                unit="bytes",
+                completed=n,
+            )
+        return n
+
+    if not _animated() and not events_mode:
         if not _QUIET:
-            info(f"{label} ({total_bytes // 1024 // 1024 if total_bytes > 0 else '?'} MB)")
+            info(f"{label} ({total_bytes // 1024 // 1024} MB)")
         n = 0
         while True:
             buf = src.read(chunk)
@@ -216,6 +289,17 @@ def copy_with_progress(src, dest, label: str, total_bytes: int, chunk: int = 64 
     start = time.monotonic()
     written = 0
     last_render = 0.0
+    if events_mode:
+        from omd import _events
+
+        _events.progress(
+            label,
+            0,
+            total_bytes,
+            0.0,
+            stage_id="download",
+            unit="bytes",
+        )
     while True:
         buf = src.read(chunk)
         if not buf:
@@ -227,9 +311,19 @@ def copy_with_progress(src, dest, label: str, total_bytes: int, chunk: int = 64 
             continue
         last_render = now
         pct = written / total_bytes
+        elapsed = now - start
+        if events_mode:
+            _events.progress(
+                label,
+                written,
+                total_bytes,
+                elapsed,
+                stage_id="download",
+                unit="bytes",
+            )
+            continue
         filled = int(ProgressBar.BAR_WIDTH * pct)
         bar = "█" * filled + "░" * (ProgressBar.BAR_WIDTH - filled)
-        elapsed = now - start
         eta = ((elapsed / pct) - elapsed) if pct > 0 and written < total_bytes else 0
         mb_done = written / 1_000_000
         mb_total = total_bytes / 1_000_000
@@ -238,6 +332,7 @@ def copy_with_progress(src, dest, label: str, total_bytes: int, chunk: int = 64 
             f"{mb_done:5.1f}/{mb_total:5.1f} MB • {elapsed:5.1f}s elapsed • {eta:5.1f}s ETA"
         )
         sys.stderr.flush()
-    sys.stderr.write("\n")
-    sys.stderr.flush()
+    if not events_mode:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
     return written

@@ -91,6 +91,66 @@ def test_public_fallback_uses_matching_rss_excerpt_when_page_is_blocked():
     assert "Only the public RSS excerpt was available" in result.html
 
 
+def test_public_fallback_reports_zhihu_browser_verification_without_rss_probe():
+    from omd.web_article import WebFallbackUnavailable, fetch_public_fallback
+
+    url = "https://zhuanlan.zhihu.com/p/2023803203725135995"
+    opened: list[str] = []
+
+    def fake_open(request, timeout):
+        opened.append(request.full_url)
+        if request.full_url == url:
+            raise _http_403(url)
+        return _Response(
+            "<html><body>Not an RSS feed</body></html>",
+            request.full_url,
+            content_type="text/html; charset=utf-8",
+        )
+
+    with pytest.raises(WebFallbackUnavailable, match="Zhihu requires browser verification"):
+        fetch_public_fallback(url, _open=fake_open)
+
+    assert opened == [url]
+
+
+def test_public_fallback_rejects_zhihu_verification_html_without_rss_probe():
+    from omd.web_article import WebFallbackUnavailable, fetch_public_fallback
+
+    url = "https://zhuanlan.zhihu.com/p/2023803203725135995"
+    opened: list[str] = []
+
+    def fake_open(request, timeout):
+        opened.append(request.full_url)
+        return _Response(
+            '<html><head><meta id="zh-zse-ck"></head><body>Verification</body></html>',
+            request.full_url,
+        )
+
+    with pytest.raises(WebFallbackUnavailable, match="Zhihu requires browser verification"):
+        fetch_public_fallback(url, _open=fake_open)
+
+    assert opened == [url]
+
+
+@pytest.mark.parametrize(
+    "verification_html",
+    [
+        "<meta id='zh-zse-ck'>",
+        '<meta ID = "ZH-ZSE-CK">',
+    ],
+)
+def test_public_fallback_recognizes_zhihu_verification_id_variants(verification_html):
+    from omd.web_article import WebFallbackUnavailable, fetch_public_fallback
+
+    url = "https://zhuanlan.zhihu.com/p/2023803203725135995"
+
+    def fake_open(request, timeout):
+        return _Response(verification_html, request.full_url)
+
+    with pytest.raises(WebFallbackUnavailable, match="Zhihu requires browser verification"):
+        fetch_public_fallback(url, _open=fake_open)
+
+
 def test_public_fallback_rejects_feed_without_matching_article():
     from omd.web_article import WebFallbackUnavailable, fetch_public_fallback
 
@@ -107,6 +167,27 @@ def test_public_fallback_rejects_feed_without_matching_article():
         return _Response(feed, request.full_url, content_type="application/rss+xml")
 
     with pytest.raises(WebFallbackUnavailable, match="matching article"):
+        fetch_public_fallback(url, _open=fake_open)
+
+
+def test_public_fallback_rejects_feed_with_dtd_or_entity_declarations():
+    from omd.web_article import WebFallbackUnavailable, fetch_public_fallback
+
+    url = "https://example.com/posts/demo"
+    feed = """<?xml version="1.0"?>
+    <!DOCTYPE rss [<!ENTITY injected "unexpected">]>
+    <rss version="2.0"><channel><item>
+      <title>&injected;</title>
+      <link>https://example.com/posts/demo</link>
+      <description>Body</description>
+    </item></channel></rss>"""
+
+    def fake_open(request, timeout):
+        if request.full_url == url:
+            raise _http_403(url)
+        return _Response(feed, request.full_url, content_type="application/rss+xml")
+
+    with pytest.raises(WebFallbackUnavailable, match="DTD or entity"):
         fetch_public_fallback(url, _open=fake_open)
 
 

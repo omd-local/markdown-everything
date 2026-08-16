@@ -81,6 +81,11 @@ _FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n+", re.DOTALL)
 _HEADING_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 _TIMESTAMP_TITLE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[\s_-]+\d{2}[-:]\d{2}[-:]\d{2}[_\s-]*")
+_DOCTYPE_LINE_RE = re.compile(r"^\s*<!doctype\s+html\s*>\s*$", re.IGNORECASE)
+_SPHINX_HEADING_LINK_RE = re.compile(
+    r'^(?P<heading>\s*#{1,6}\s+.*?)(?:\[#\]\([^\n)]*(?:\s+"Link to this heading")?\))\s*$'
+)
+_TERMINAL_PROGRESS_RE = re.compile(r"^\s*\d{1,3}%\|.*\|.*\[[^\]]+\]\s*$")
 USER_FRONTMATTER_KEYS = (
     "title",
     "source_type",
@@ -103,6 +108,10 @@ def capture_one(
     memory_model: str | None = None,
     memory_host: str = "http://localhost:11434",
     memory_timeout: float = 180,
+    polish_md: bool = False,
+    polish_md_model: str | None = None,
+    polish_md_host: str = "http://localhost:11434",
+    allow_remote_ollama: bool = False,
 ) -> CaptureResult:
     """Convert one target into a vault, sizing an omitted memory model to local RAM."""
     from omd import cli
@@ -137,9 +146,23 @@ def capture_one(
 
     captured_at = _now_iso()
     body = output_path.read_text(encoding="utf-8", errors="replace")
-    title = clean_capture_title(title_from_markdown(body) or _initial_title(source))
+    body_without_frontmatter = normalize_captured_markdown(_strip_frontmatter(body))
+    title = clean_capture_title(title_from_markdown(body_without_frontmatter) or _initial_title(source))
     output_path = rename_capture_to_title(output_path, vault_root, title=title, source_type=source_type)
-    body_without_frontmatter = _strip_frontmatter(body)
+    polish_md_model = (polish_md_model or "").strip() or recommended_local_text_model()
+    if polish_md:
+        from omd import _polish_md, _progress
+
+        _progress.info(f"Polishing captured Markdown via Ollama: {polish_md_model}")
+        try:
+            body_without_frontmatter = _polish_md.polish_markdown(
+                body_without_frontmatter,
+                model=polish_md_model,
+                host=polish_md_host,
+                allow_remote=allow_remote_ollama,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional polish must not discard a valid capture.
+            _progress.warn(f"Markdown polish failed; keeping structurally cleaned capture: {exc}")
     from omd._transcript import transcript_warnings_from_markdown
 
     transcript_warnings = transcript_warnings_from_markdown(body_without_frontmatter)
@@ -172,6 +195,7 @@ def capture_one(
                 timeout=memory_timeout,
                 title=title,
                 source_type=source_type,
+                **({"allow_remote": True} if allow_remote_ollama else {}),
             )
         except Exception as exc:  # noqa: BLE001 - keep raw capture usable when optional LLM fails.
             memory_error = str(exc)
@@ -200,6 +224,9 @@ def capture_one(
         generated_tags=generated_tags,
         memory_warnings=memory_result.warnings if memory_result else [],
         memory_error=memory_error,
+        markdown_polish_requested=polish_md,
+        markdown_polish_model=polish_md_model,
+        markdown_polish_host=polish_md_host,
     )
     write_atomic(
         output_path,
@@ -231,6 +258,10 @@ def capture_batch(
     memory_model: str | None = None,
     memory_host: str = "http://localhost:11434",
     memory_timeout: float = 180,
+    polish_md: bool = False,
+    polish_md_model: str | None = None,
+    polish_md_host: str = "http://localhost:11434",
+    allow_remote_ollama: bool = False,
 ) -> CaptureBatchResult:
     """Capture every item into one vault, sizing an omitted memory model to local RAM."""
     from omd import _progress
@@ -260,6 +291,10 @@ def capture_batch(
                 memory_model=memory_model,
                 memory_host=memory_host,
                 memory_timeout=memory_timeout,
+                polish_md=polish_md,
+                polish_md_model=polish_md_model,
+                polish_md_host=polish_md_host,
+                allow_remote_ollama=allow_remote_ollama,
             )
             results.append(result)
             bar.update()
@@ -324,6 +359,10 @@ def _capture_one_with_retries(
     memory_model: str,
     memory_host: str,
     memory_timeout: float,
+    polish_md: bool,
+    polish_md_model: str | None,
+    polish_md_host: str,
+    allow_remote_ollama: bool,
 ) -> CaptureResult:
     last = capture_one(
         target,
@@ -336,6 +375,10 @@ def _capture_one_with_retries(
         memory_model=memory_model,
         memory_host=memory_host,
         memory_timeout=memory_timeout,
+        polish_md=polish_md,
+        polish_md_model=polish_md_model,
+        polish_md_host=polish_md_host,
+        allow_remote_ollama=allow_remote_ollama,
     )
     for _attempt in range(retries):
         if last.return_code == 0:
@@ -351,6 +394,10 @@ def _capture_one_with_retries(
             memory_model=memory_model,
             memory_host=memory_host,
             memory_timeout=memory_timeout,
+            polish_md=polish_md,
+            polish_md_model=polish_md_model,
+            polish_md_host=polish_md_host,
+            allow_remote_ollama=allow_remote_ollama,
         )
     return last
 
@@ -463,6 +510,9 @@ def capture_metadata(
     generated_tags: list[str] | None = None,
     memory_warnings: list[str] | None = None,
     memory_error: str = "",
+    markdown_polish_requested: bool = False,
+    markdown_polish_model: str | None = None,
+    markdown_polish_host: str = "http://localhost:11434",
 ) -> dict[str, object]:
     from omd._manifest import MANIFEST_VERSION, capture_id_for, source_hash_for, source_id_for
 
@@ -481,6 +531,7 @@ def capture_metadata(
     if path:
         path = str(Path(path).expanduser().resolve(strict=False))
     source_hash = source_hash_for(source)
+    markdown_polish_model = (markdown_polish_model or "").strip() or recommended_local_text_model()
     fields: dict[str, object] = {
         "omd_version": __version__,
         "manifest_version": MANIFEST_VERSION,
@@ -493,8 +544,16 @@ def capture_metadata(
         "privacy": "local_storage",
         "storage": "local",
         "network_fetch": bool(preflight.get("needs_network", False)),
-        "model_endpoint": _model_endpoint_for_memory(memory_attempted, memory_host) or _model_endpoint(reel_extra),
-        "llm_used": memory_model if memory_attempted else _llm_used(reel_extra),
+        "model_endpoint": (
+            _model_endpoint_for_memory(memory_attempted, memory_host)
+            or (_model_endpoint_for_host(markdown_polish_host) if markdown_polish_requested else None)
+            or _model_endpoint(reel_extra)
+        ),
+        "llm_used": (
+            memory_model
+            if memory_attempted
+            else markdown_polish_model if markdown_polish_requested else _llm_used(reel_extra)
+        ),
         "detected_type": preflight.get("detected_type"),
         "tags": normalize_tags(tags, source_type=source_type),
     }
@@ -513,6 +572,9 @@ def capture_metadata(
         fields["summary_generated"] = False
         if memory_error:
             fields["memory_error"] = memory_error
+    if markdown_polish_requested:
+        fields["markdown_polish_requested"] = True
+        fields["markdown_polish_model"] = markdown_polish_model
     if url:
         fields["source_url"] = url
     if path:
@@ -610,8 +672,60 @@ def clean_capture_title(value: str) -> str:
     title = re.sub(r"\s*#{1,2}[\w\u4e00-\u9fff-]+", "", title)
     title = title.replace("_", " ")
     title = re.sub(r"\.{3,}", "…", title)
-    title = re.sub(r"\s+", " ", title).strip(" -_·|…")
+    title = re.sub(r"\s+", " ", title).strip(" -_·|…[")
     return title[:120].strip() or "Capture"
+
+
+def normalize_captured_markdown(markdown: str) -> str:
+    """Repair converter artifacts that can break CommonMark rendering.
+
+    The pass is intentionally structural and deterministic. It never rewrites
+    prose: it removes a leaked HTML doctype, strips Sphinx heading permalinks,
+    and fences terminal progress output so sequences such as ``<?`` cannot
+    turn the remainder of an Obsidian note into a raw HTML block.
+    """
+    lines = markdown.splitlines()
+    normalized: list[str] = []
+    fence: str | None = None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip()
+        if fence is not None:
+            normalized.append(line)
+            if stripped.startswith(fence):
+                fence = None
+            index += 1
+            continue
+        if stripped.startswith("```"):
+            fence = "```"
+            normalized.append(line)
+            index += 1
+            continue
+        if stripped.startswith("~~~"):
+            fence = "~~~"
+            normalized.append(line)
+            index += 1
+            continue
+        if _DOCTYPE_LINE_RE.match(line):
+            index += 1
+            continue
+        heading = _SPHINX_HEADING_LINK_RE.match(line)
+        if heading:
+            normalized.append(heading.group("heading").rstrip())
+            index += 1
+            continue
+        if _TERMINAL_PROGRESS_RE.match(line):
+            normalized.append("```text")
+            while index < len(lines) and _TERMINAL_PROGRESS_RE.match(lines[index]):
+                normalized.append(lines[index])
+                index += 1
+            normalized.append("```")
+            continue
+        normalized.append(line)
+        index += 1
+    result = "\n".join(normalized).strip("\n")
+    return result + ("\n" if result else "")
 
 
 def update_index(vault: str | Path, *, output_path: Path, metadata: dict[str, object]) -> Path:

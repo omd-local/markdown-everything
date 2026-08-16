@@ -44,6 +44,75 @@ def test_local_text_model_recommendation_uses_safe_fallback_when_memory_is_unkno
     assert recommendation.max_parameters_billions == 4.0
 
 
+def test_assess_local_text_model_reports_ready_when_installed_and_within_memory_tier():
+    from omd._models import assess_local_text_model
+
+    assessment = assess_local_text_model(
+        "qwen2.5:3b-instruct",
+        installed_models={"qwen2.5:3b-instruct"},
+        total_memory_bytes=16 * GIB,
+    )
+
+    assert assessment.status == "ready"
+    assert assessment.installed is True
+    assert assessment.model_parameters_billions == 3.0
+    assert assessment.max_parameters_billions == 4.0
+
+
+def test_assess_local_text_model_warns_when_model_exceeds_machine_tier():
+    from omd._models import assess_local_text_model
+
+    assessment = assess_local_text_model(
+        "qwen2.5:14b-instruct",
+        installed_models={"qwen2.5:14b-instruct"},
+        total_memory_bytes=16 * GIB,
+    )
+
+    assert assessment.status == "too_large"
+    assert assessment.installed is True
+    assert "14" in assessment.reason
+    assert assessment.recommended_model == "qwen3:4b-instruct"
+
+
+def test_assess_local_text_model_never_claims_uninstalled_model_is_ready():
+    from omd._models import assess_local_text_model
+
+    assessment = assess_local_text_model(
+        "qwen3:4b-instruct",
+        installed_models=set(),
+        total_memory_bytes=24 * GIB,
+    )
+
+    assert assessment.status == "missing"
+    assert assessment.installed is False
+
+
+def test_assess_local_text_model_marks_unknown_size_as_advisory_unknown():
+    from omd._models import assess_local_text_model
+
+    assessment = assess_local_text_model(
+        "custom-instruct:latest",
+        installed_models={"custom-instruct:latest"},
+        total_memory_bytes=24 * GIB,
+    )
+
+    assert assessment.status == "unknown_size"
+    assert assessment.installed is True
+
+
+def test_assess_local_text_model_rejects_thinking_only_alias_even_when_installed():
+    from omd._models import assess_local_text_model
+
+    assessment = assess_local_text_model(
+        "qwen3:4b",
+        installed_models={"qwen3:4b"},
+        total_memory_bytes=24 * GIB,
+    )
+
+    assert assessment.status == "incompatible"
+    assert "thinking-only" in assessment.reason
+
+
 def test_model_parameter_billions_reads_ollama_parameter_tag():
     assert _models.model_parameter_billions("qwen2.5:14b-instruct-q4_K_M") == 14.0
     assert _models.model_parameter_billions("custom:latest") is None

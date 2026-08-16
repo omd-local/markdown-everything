@@ -8,6 +8,9 @@ import urllib.request
 from dataclasses import dataclass
 
 from omd._models import TEXT_POLISH_MODEL
+from omd._network_policy import validate_ollama_host
+from omd.ollama_runtime import ollama_keep_alive, request_ollama_json
+from omd.tag_normalization import normalize_generated_tags
 
 CHUNK_CHARS = 6000
 MAX_CHUNKS = 8
@@ -36,6 +39,7 @@ def generate_memory_cards(
     timeout: float = 180,
     title: str = "",
     source_type: str = "",
+    allow_remote: bool = False,
     _chat_fn=None,
 ) -> MemoryCardsResult:
     """Generate summary, tags, and memory cards through an Ollama-compatible API.
@@ -43,9 +47,11 @@ def generate_memory_cards(
     The local UI enables this for vault capture by default; CLI capture remains
     explicit and calls it only when the user passes --memory-cards.
     """
+    validate_ollama_host(host, allow_remote=allow_remote)
     chunks, truncated = _chunk_markdown(markdown)
     if _chat_fn is None:
-        chat = lambda prompt, model, host: _chat_ollama(prompt, model, host, timeout=timeout)
+        def chat(prompt, model, host):
+            return _chat_ollama(prompt, model, host, timeout=timeout)
     else:
         chat = _chat_fn
     if len(chunks) == 1:
@@ -110,6 +116,7 @@ def _chat_ollama(prompt: str, model: str, host: str, *, timeout: float = 180) ->
             "model": model,
             "stream": False,
             "think": False,
+            "keep_alive": ollama_keep_alive(),
             "messages": [
                 {
                     "role": "system",
@@ -130,9 +137,8 @@ def _chat_ollama(prompt: str, model: str, host: str, *, timeout: float = 180) ->
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        payload = request_ollama_json(request, timeout=timeout)
+    except (OSError, urllib.error.URLError, RuntimeError) as exc:
         raise RuntimeError(f"Ollama memory-card generation failed: {exc}") from exc
     message = payload.get("message") if isinstance(payload, dict) else None
     if isinstance(message, dict):
@@ -203,20 +209,7 @@ def _parse_model_json(text: str) -> dict[str, object]:
 
 
 def _normalize_generated_tags(value: object) -> list[str]:
-    raw_items: list[object]
-    if isinstance(value, list):
-        raw_items = value
-    elif isinstance(value, str):
-        raw_items = re.split(r"[,，;\n]", value)
-    else:
-        raw_items = []
-    tags: list[str] = []
-    for raw in raw_items:
-        tag = str(raw).strip().lstrip("#").replace("_", "-").replace(" ", "-").lower()
-        tag = re.sub(r"[^a-z0-9\u4e00-\u9fff/-]+", "-", tag).strip("-")
-        if tag and tag not in tags:
-            tags.append(tag)
-    return tags[:12]
+    return normalize_generated_tags(value)
 
 
 def _drift_warnings(

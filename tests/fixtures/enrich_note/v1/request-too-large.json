@@ -1,0 +1,7 @@
+{
+  "fixture_kind": "expanded_request",
+  "request_id": "too-large-1",
+  "repeat_character": "x",
+  "repeat_bytes": 524289,
+  "expected_error": "request_too_large"
+}

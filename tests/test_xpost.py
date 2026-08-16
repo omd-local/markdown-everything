@@ -169,6 +169,54 @@ def test_convert_url_falls_back_to_oembed(monkeypatch, tmp_path):
     assert "just setting up my twttr" in out.read_text(encoding="utf-8")
 
 
+def test_convert_url_falls_back_when_syndication_request_fails(monkeypatch, tmp_path):
+    from omd import xpost
+
+    monkeypatch.setattr(
+        xpost,
+        "fetch_syndication",
+        lambda _post_id: (_ for _ in ()).throw(OSError("syndication unavailable")),
+    )
+    monkeypatch.setattr(xpost, "fetch_page", lambda _url: (_ for _ in ()).throw(OSError("blocked")))
+    monkeypatch.setattr(xpost, "fetch_oembed", lambda _url: (SAMPLE_OEMBED, ""))
+    out = tmp_path / "x.md"
+
+    rc = xpost.convert_url("https://twitter.com/jack/status/20", out)
+
+    assert rc == 0
+    assert "just setting up my twttr" in out.read_text(encoding="utf-8")
+
+
+def test_convert_url_normalizes_failure_when_all_sources_error(monkeypatch):
+    from omd import xpost
+
+    monkeypatch.setattr(
+        xpost,
+        "fetch_syndication",
+        lambda _post_id: (_ for _ in ()).throw(OSError("syndication unavailable")),
+    )
+    monkeypatch.setattr(xpost, "fetch_page", lambda _url: (_ for _ in ()).throw(OSError("blocked")))
+    monkeypatch.setattr(xpost, "fetch_oembed", lambda _url: (_ for _ in ()).throw(OSError("blocked")))
+
+    with pytest.raises(SystemExit, match="X/Twitter returned no public post text"):
+        xpost.convert_url("https://twitter.com/jack/status/20")
+
+
+def test_convert_url_uses_oembed_when_syndication_is_truncated_and_page_fails(monkeypatch, tmp_path):
+    from omd import xpost
+
+    truncated = {**SAMPLE_SYNDICATION, "text": "just setting up…"}
+    monkeypatch.setattr(xpost, "fetch_syndication", lambda _post_id: (truncated, ""))
+    monkeypatch.setattr(xpost, "fetch_page", lambda _url: (_ for _ in ()).throw(OSError("blocked")))
+    monkeypatch.setattr(xpost, "fetch_oembed", lambda _url: (SAMPLE_OEMBED, ""))
+    out = tmp_path / "x.md"
+
+    rc = xpost.convert_url("https://twitter.com/jack/status/20", out)
+
+    assert rc == 0
+    assert "just setting up my twttr" in out.read_text(encoding="utf-8")
+
+
 def test_convert_url_uses_public_page_when_embed_is_truncated(monkeypatch, tmp_path):
     from omd import xpost
 

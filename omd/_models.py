@@ -22,6 +22,20 @@ class LocalModelRecommendation:
     total_memory_bytes: int | None
 
 
+@dataclass(frozen=True)
+class LocalModelAssessment:
+    """Advisory availability and machine-fit result for one selected model."""
+
+    model: str
+    status: str
+    reason: str
+    installed: bool
+    recommended_model: str
+    max_parameters_billions: float
+    model_parameters_billions: float | None
+    total_memory_bytes: int | None
+
+
 _LOCAL_TEXT_MODEL_TIERS = (
     (12, "qwen2.5:1.5b-instruct", 1.5),
     (16, "qwen2.5:3b-instruct", 3.0),
@@ -91,6 +105,59 @@ def local_text_model_issue(model: str) -> str | None:
             f"on reasoning; use {replacement} for bounded OMD text generation"
         )
     return None
+
+
+def assess_local_text_model(
+    model: str,
+    *,
+    installed_models: set[str] | frozenset[str],
+    total_memory_bytes: int | None = None,
+) -> LocalModelAssessment:
+    """Assess the selected tag without downloading or silently substituting a model."""
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model must be a non-empty string")
+    if not isinstance(installed_models, (set, frozenset)) or any(
+        not isinstance(value, str) for value in installed_models
+    ):
+        raise TypeError("installed_models must be a set of strings")
+
+    selected = model.strip()
+    memory = detect_total_memory_bytes() if total_memory_bytes is None else total_memory_bytes
+    recommendation = model_recommendation_for_memory(memory)
+    parameters = model_parameter_billions(selected)
+    installed = selected in installed_models
+
+    if not installed:
+        status = "missing"
+        reason = f"{selected} is not installed in Ollama"
+    elif issue := local_text_model_issue(selected):
+        status = "incompatible"
+        reason = issue
+    elif parameters is None:
+        status = "unknown_size"
+        reason = (
+            f"OMD cannot infer the parameter size of {selected}; machine fit is unknown"
+        )
+    elif parameters > recommendation.max_parameters_billions:
+        status = "too_large"
+        reason = (
+            f"{selected} is approximately {parameters:g}B, above this machine's "
+            f"conservative {recommendation.max_parameters_billions:g}B text-model tier"
+        )
+    else:
+        status = "ready"
+        reason = f"{selected} is installed and within the conservative machine tier"
+
+    return LocalModelAssessment(
+        model=selected,
+        status=status,
+        reason=reason,
+        installed=installed,
+        recommended_model=recommendation.model,
+        max_parameters_billions=recommendation.max_parameters_billions,
+        model_parameters_billions=parameters,
+        total_memory_bytes=memory,
+    )
 
 
 def estimated_text_tokens(text: str) -> int:

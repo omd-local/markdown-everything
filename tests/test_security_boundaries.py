@@ -59,6 +59,14 @@ def test_public_url_policy_rejects_private_redirect():
         )
 
 
+def test_ai_transport_redirect_handler_refuses_all_redirects():
+    from omd._network_policy import NoRedirectHandler
+
+    handler = NoRedirectHandler()
+
+    assert handler.redirect_request(None, None, 307, "Temporary Redirect", {}, "https://other.test") is None
+
+
 def test_public_resolver_guard_rejects_dns_rebinding_to_private_address(monkeypatch):
     from omd import _network_policy
 
@@ -102,6 +110,17 @@ def test_ollama_policy_accepts_opted_in_https_remote_host():
     from omd._network_policy import validate_ollama_host
 
     validate_ollama_host("https://models.example.com", allow_remote=True)
+
+
+def test_inbox_ai_task_rejects_remote_ollama_host_before_preview_or_execution():
+    from omd.ui import _ai_note_task
+
+    with pytest.raises(ValueError, match="explicit opt-in"):
+        _ai_note_task(
+            "Local Ollama",
+            "qwen2.5:7b-instruct",
+            "https://models.example.com",
+        )
 
 
 def test_xhs_shortlink_expansion_does_not_send_cookies(monkeypatch):

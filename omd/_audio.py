@@ -53,9 +53,41 @@ def run_with_estimated_progress(cmd: list[str], audio: Path, label: str) -> subp
     95% until the subprocess exits.
     """
     from omd import _progress
+    from omd import _events
 
     if _progress.is_verbose():
         return subprocess.run(cmd, check=True)
+
+    if _events.is_enabled():
+        duration = duration_seconds(audio)
+        _events.stage(
+            "transcribing",
+            stage_id="transcribe",
+            state="indeterminate",
+            unit="audio_seconds",
+            total=duration,
+        )
+        started = time.monotonic()
+        try:
+            result = _run_captured(cmd)
+        except BaseException:
+            _events.stage_state(
+                "transcribe",
+                "failed",
+                elapsed_s=time.monotonic() - started,
+                unit="audio_seconds",
+                total=duration,
+            )
+            raise
+        _events.stage_state(
+            "transcribe",
+            "completed",
+            elapsed_s=time.monotonic() - started,
+            unit="audio_seconds",
+            completed=duration,
+            total=duration,
+        )
+        return result
 
     estimate = estimated_transcribe_seconds(audio)
     if estimate is None:

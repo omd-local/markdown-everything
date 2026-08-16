@@ -24,14 +24,15 @@ import os
 import re
 import urllib.error
 import urllib.request
-from typing import Iterable
-
 from omd._models import (
     LOCAL_TEXT_CONTEXT_TOKENS,
     TEXT_POLISH_MODEL,
     bounded_edit_output_budget,
+    estimated_text_tokens,
     local_text_model_issue,
 )
+from omd._network_policy import validate_ollama_host
+from omd.ollama_runtime import ollama_keep_alive, request_ollama_json
 
 POLISH_CHUNK_SIZE = 1500
 WARN_THRESHOLD_CHARS = 20_000
@@ -111,31 +112,38 @@ def _split_around_code(text: str) -> list[tuple[str, bool]]:
 
 
 def _chunk_for_polish(text: str, max_chars: int) -> list[str]:
-    """Group text into ≤max_chars chunks at paragraph boundaries when
-    possible. Falls back to char-split if a single paragraph is too big."""
+    """Split text without discarding Markdown-significant whitespace.
+
+    Prefer paragraph boundaries, then fall back to a hard character boundary.
+    Joining the returned chunks must always reproduce ``text`` exactly so the
+    reassembly pass can restore whitespace stripped by a local model.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
     if len(text) <= max_chars:
         return [text]
-    paragraphs = text.split("\n\n")
+
     chunks: list[str] = []
-    cur = ""
-    for para in paragraphs:
-        candidate = (cur + "\n\n" + para).strip() if cur else para
-        if len(candidate) > max_chars and cur:
-            chunks.append(cur)
-            cur = para
+    start = 0
+    while len(text) - start > max_chars:
+        limit = start + max_chars
+        boundary = text.rfind("\n\n", start, limit)
+        if boundary > start:
+            end = boundary + 2
         else:
-            cur = candidate
-    if cur:
-        chunks.append(cur)
-    # Hard fallback: any chunk still over limit gets char-split.
-    out: list[str] = []
-    for c in chunks:
-        if len(c) <= max_chars:
-            out.append(c)
-        else:
-            for i in range(0, len(c), max_chars):
-                out.append(c[i:i + max_chars])
-    return out
+            end = limit
+        chunks.append(text[start:end])
+        start = end
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
+
+
+def _preserve_edge_whitespace(source: str, replacement: str) -> str:
+    """Keep Markdown block boundaries even when a model strips whitespace."""
+    leading = source[: len(source) - len(source.lstrip())]
+    trailing = source[len(source.rstrip()):]
+    return leading + replacement.strip() + trailing
 
 
 def _polish_chunk(text: str, model: str, host: str) -> str:
@@ -151,6 +159,7 @@ def _polish_chunk(text: str, model: str, host: str) -> str:
         "prompt": prompt,
         "stream": False,
         "think": False,
+        "keep_alive": ollama_keep_alive(),
         "options": {
             "temperature": 0.1,
             "num_ctx": LOCAL_TEXT_CONTEXT_TOKENS,
@@ -162,8 +171,7 @@ def _polish_chunk(text: str, model: str, host: str) -> str:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=POLISH_CHUNK_TIMEOUT_SECONDS) as r:
-        payload = json.loads(r.read())
+    payload = request_ollama_json(req, timeout=POLISH_CHUNK_TIMEOUT_SECONDS)
     if payload.get("done_reason") == "length":
         raise RuntimeError(
             f"model reached its output limit ({output_budget} tokens) before finishing"
@@ -188,9 +196,8 @@ def _ollama_ready(model: str, host: str, *, timeout: float = READINESS_TIMEOUT_S
         return False, issue
     req = urllib.request.Request(f"{host.rstrip('/')}/api/tags")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        payload = request_ollama_json(req, timeout=timeout)
+    except (OSError, urllib.error.URLError, TimeoutError, RuntimeError) as exc:
         return False, f"Ollama is not reachable at {host}: {exc}"
     models = payload.get("models") if isinstance(payload, dict) else None
     names = {
@@ -211,6 +218,7 @@ def polish_markdown(
     host: str = "http://localhost:11434",
     *,
     force: bool = False,
+    allow_remote: bool = False,
     readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
     _polish_fn=None,
 ) -> str:
@@ -221,6 +229,7 @@ def polish_markdown(
     regardless of the underlying call.
     """
     from omd import _progress
+    validate_ollama_host(host, allow_remote=allow_remote)
     n = len(md)
     if not force and n > HARD_REFUSE_CHARS:
         from omd import _events
@@ -228,12 +237,6 @@ def polish_markdown(
             "polish_too_big",
             f"file is {n} chars (>{HARD_REFUSE_CHARS}); pass --force to override",
         )
-    if n > WARN_THRESHOLD_CHARS:
-        _progress.warn(
-            f"polishing {n} chars — this will take a while via Ollama (~"
-            f"{max(1, n // 1500)} chunks)"
-        )
-
     fn = _polish_fn or _polish_chunk
     if _polish_fn is None:
         ready, reason = _ollama_ready(model, host, timeout=readiness_timeout)
@@ -283,10 +286,22 @@ def polish_markdown(
     total = len(chunk_plan)
     if total == 0:
         return md  # nothing polishable
+    if n > WARN_THRESHOLD_CHARS:
+        _progress.warn(
+            f"polishing {n} chars — this will take a while via Ollama "
+            f"({total} chunks)"
+        )
+    chunk_units = [estimated_text_tokens(entry[2]) for entry in chunk_plan]
+    total_units = sum(chunk_units)
 
     # Polish each chunk; build replacement map.
     polished_by_plan_idx: list[str] = []
-    with _progress.ProgressBar("Polish (md)", total=total) as bar:
+    with _progress.ProgressBar(
+        "Polish (md)",
+        total=total_units,
+        stage_id="polish",
+        unit="tokens",
+    ) as bar:
         for plan_i, (s_i, p_i, c) in enumerate(chunk_plan):
             try:
                 polished_by_plan_idx.append(fn(c, model, host))
@@ -302,14 +317,14 @@ def polish_markdown(
                     f"all remaining Markdown unchanged.{skipped} Start Ollama and pull {model}, "
                     "choose another local model, or turn off Polish Markdown."
                 )
-                bar.update(total - plan_i)
+                bar.update(sum(chunk_units[plan_i:]))
                 if plan_i == 0:
                     return md
                 polished_by_plan_idx.append(c)
                 polished_by_plan_idx.extend(entry[2] for entry in chunk_plan[plan_i + 1:])
                 break
             else:
-                bar.update()
+                bar.update(chunk_units[plan_i])
 
     # Reassemble.
     plan_iter = iter(zip(chunk_plan, polished_by_plan_idx))
@@ -317,7 +332,7 @@ def polish_markdown(
 
     for s_i, (heading, _orig_body) in enumerate(sections):
         if heading:
-            out_parts.append(heading + "\n")
+            out_parts.append(heading)
         for p_i, sub_chunks in enumerate(section_parts[s_i]):
             for c_i, c in enumerate(sub_chunks):
                 if (
@@ -325,7 +340,7 @@ def polish_markdown(
                     and next_plan[0][:2] == (s_i, p_i)
                     and next_plan[0][2] == c
                 ):
-                    out_parts.append(next_plan[1])
+                    out_parts.append(_preserve_edge_whitespace(c, next_plan[1]))
                     next_plan = next(plan_iter, None)
                 else:
                     out_parts.append(c)
@@ -340,6 +355,7 @@ def polish_file(
     *,
     force: bool = False,
     keep_raw: bool = False,
+    allow_remote: bool = False,
     readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
     _polish_fn=None,
 ) -> None:
@@ -354,6 +370,7 @@ def polish_file(
         model=model,
         host=host,
         force=force,
+        allow_remote=allow_remote,
         readiness_timeout=readiness_timeout,
         _polish_fn=_polish_fn,
     )

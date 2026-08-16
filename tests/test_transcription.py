@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+
+def _json_events(stderr: str) -> list[dict]:
+    return [json.loads(line) for line in stderr.splitlines() if line.startswith("{")]
 
 
 def _fake_mlx_runner(seen_output_dirs: list[Path], *, text: str = "current transcript"):
@@ -99,6 +104,37 @@ def test_mlx_transcription_rejects_stale_json_when_current_run_writes_none(
 
     with pytest.raises(SystemExit, match="produced no JSON"):
         reel._transcribe_mlx(current_audio, keep_dir, "model", "en")
+
+
+def test_audio_progress_is_indeterminate_until_backend_reports_real_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    from omd import _audio, _events, _progress
+
+    audio = tmp_path / "memo.wav"
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(_audio, "duration_seconds", lambda _path: 60.0)
+    monkeypatch.setattr(
+        _audio,
+        "_run_captured",
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    _events.configure(True)
+    _progress.configure()
+
+    _audio.run_with_estimated_progress(["whisper", str(audio)], audio, "Transcribing audio")
+    events = _json_events(capsys.readouterr().err)
+    _events.configure(False)
+
+    assert events[0]["stage_id"] == "transcribe"
+    assert events[0]["state"] == "indeterminate"
+    assert events[0]["unit"] == "audio_seconds"
+    assert events[0]["total"] == 60.0
+    assert not any(event.get("percent") == 95.0 for event in events)
+    assert events[-1]["state"] == "completed"
+    assert events[-1]["completed"] == 60.0
 
 
 def test_podcast_audio_path_is_source_specific(tmp_path: Path):

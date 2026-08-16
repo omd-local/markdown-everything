@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "request_id": "request-1",
+  "action": "enrich_note_preview",
+  "note": {
+    "path": "Inbox/example.md",
+    "content_sha256": "98887e41f98d63015e070641789fe375c7db3f458c9bb5823d125eefa460894a"
+  },
+  "proposal": {
+    "summary": "这篇笔记讨论本地 AI 与个人知识工作流。",
+    "existing_links": [
+      {
+        "candidate_id": "candidate-1",
+        "target_path": "Notes/Local AI.md",
+        "display": "Local AI",
+        "reason": "主题直接相关",
+        "evidence": "本地 AI",
+        "recommended": true
+      }
+    ],
+    "new_concepts": [
+      {
+        "label": "个人知识工作流",
+        "reason": "可发展为独立概念"
+      }
+    ],
+    "existing_tags": [
+      {
+        "tag": "ai/local",
+        "reason": "匹配核心主题",
+        "recommended": true
+      }
+    ],
+    "new_tags": [
+      {
+        "tag": "knowledge-workflow",
+        "reason": "描述工作流主题"
+      }
+    ]
+  },
+  "warnings": [],
+  "generation": {
+    "provider": "ollama",
+    "model": "qwen3:4b-instruct",
+    "endpoint_class": "local_loopback"
+  }
+}
