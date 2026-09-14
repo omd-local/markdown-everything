@@ -24,7 +24,7 @@ def _load(name: str):
 
 
 def _request_payload(vault_path: str = "/vault", request_id: str = "request-1"):
-    content = "本地 AI 可以辅助个人知识工作流。"
+    content = "Local AI can support personal knowledge workflows."
     return {
         "schema_version": 1,
         "request_id": request_id,
@@ -40,9 +40,9 @@ def _request_payload(vault_path: str = "/vault", request_id: str = "request-1"):
                 "id": "candidate-1",
                 "path": "Notes/Local AI.md",
                 "title": "Local AI",
-                "aliases": ["本地 AI"],
+                "aliases": ["On-device AI"],
                 "tags": ["ai/local", "research"],
-                "evidence": "本地 AI 与个人知识工作流。",
+                "evidence": "Local AI and personal knowledge workflows.",
             }
         ],
         "vault_tags": ["ai/local", "research", "workflow"],
@@ -58,12 +58,14 @@ def _decode(payload):
 @pytest.mark.parametrize("legacy_multiline", [False, True])
 def test_home_builder_fixture_reaches_proposal_without_changing_files(tmp_path, legacy_multiline):
     payload = _load("home-multiline-request.json")
-    builder_input = json.loads((FIXTURES.parent / "home-multiline-input.json").read_text())
+    builder_input = json.loads(
+        (FIXTURES.parent / "home-multiline-input.json").read_text(encoding="utf-8")
+    )
     expected = [
         "- Source: https://example.com/ - Author: Example - Published: 2024-08-30",
         (
             "Dense and sparse embeddings represent text across languages. "
-            "- Dense: 语义 🙂 across a wrapped list item. - Sparse: lexical features."
+            "- Dense: semantic meaning across a wrapped list item. - Sparse: lexical features."
         ),
     ]
     assert [candidate["evidence"] for candidate in payload["candidates"]] == expected
@@ -111,20 +113,20 @@ def test_home_builder_fixture_reaches_proposal_without_changing_files(tmp_path, 
 def test_valid_response_fixture_matches_runtime_validation_and_serializer():
     request = _decode(_request_payload())
     model_output = {
-        "summary": "这篇笔记讨论本地 AI 与个人知识工作流。",
+        "summary": "This note discusses local AI and personal knowledge workflows.",
         "existing_links": [
             {
                 "candidate_id": "candidate-1",
-                "reason": "主题直接相关",
-                "evidence": "本地 AI",
+                "reason": "Directly related topic",
+                "evidence": "Local AI",
                 "recommended": True,
             }
         ],
-        "new_concepts": [{"label": "个人知识工作流", "reason": "可发展为独立概念"}],
+        "new_concepts": [{"label": "Personal knowledge workflows", "reason": "Could become a separate concept"}],
         "existing_tags": [
-            {"tag": "ai/local", "reason": "匹配核心主题", "recommended": True}
+            {"tag": "ai/local", "reason": "Matches the main topic", "recommended": True}
         ],
-        "new_tags": [{"tag": "knowledge-workflow", "reason": "描述工作流主题"}],
+        "new_tags": [{"tag": "knowledge-workflow", "reason": "Describes the workflow topic"}],
     }
 
     response = build_proposal_response(

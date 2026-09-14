@@ -4,37 +4,37 @@
   "action": "enrich_note_preview",
   "note": {
     "path": "Inbox/example.md",
-    "content_sha256": "98887e41f98d63015e070641789fe375c7db3f458c9bb5823d125eefa460894a"
+    "content_sha256": "794d84d3ead3ddea098401834de3cbe1097fa711f287233205ae75ecc031dc79"
   },
   "proposal": {
-    "summary": "这篇笔记讨论本地 AI 与个人知识工作流。",
+    "summary": "This note discusses local AI and personal knowledge workflows.",
     "existing_links": [
       {
         "candidate_id": "candidate-1",
         "target_path": "Notes/Local AI.md",
         "display": "Local AI",
-        "reason": "主题直接相关",
-        "evidence": "本地 AI",
+        "reason": "Directly related topic",
+        "evidence": "Local AI",
         "recommended": true
       }
     ],
     "new_concepts": [
       {
-        "label": "个人知识工作流",
-        "reason": "可发展为独立概念"
+        "label": "Personal knowledge workflows",
+        "reason": "Could become a separate concept"
       }
     ],
     "existing_tags": [
       {
         "tag": "ai/local",
-        "reason": "匹配核心主题",
+        "reason": "Matches the main topic",
         "recommended": true
       }
     ],
     "new_tags": [
       {
         "tag": "knowledge-workflow",
-        "reason": "描述工作流主题"
+        "reason": "Describes the workflow topic"
       }
     ]
   },

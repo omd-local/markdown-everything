@@ -5,8 +5,8 @@
   "vault_path": "/vault",
   "note": {
     "path": "Inbox/Embeddings.md",
-    "content": "# Embeddings\r\n\r\nDense and sparse embeddings represent text.\n\n- 保留原文\t🙂\n",
-    "content_sha256": "d9039e963529c73f3d311f04c8a631f1a56dfad9f6313f357407c147081093ee"
+    "content": "# Embeddings\r\n\r\nDense and sparse embeddings represent text.\n\n- Preserve original text\texactly\n",
+    "content_sha256": "7ed435ec487da2e305752cd51b53006b969a261ad364024e90d76a0425a8b3fe"
   },
   "candidates": [
     {
@@ -23,7 +23,7 @@
       "title": "Embedding methods",
       "aliases": [],
       "tags": [],
-      "evidence": "Dense and sparse embeddings represent text across languages. - Dense: 语义 🙂 across a wrapped list item. - Sparse: lexical features."
+      "evidence": "Dense and sparse embeddings represent text across languages. - Dense: semantic meaning across a wrapped list item. - Sparse: lexical features."
     }
   ],
   "vault_tags": [],
