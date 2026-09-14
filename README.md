@@ -334,12 +334,7 @@ Ollama. See the [privacy model](docs/privacy.md) and
 | [Examples](examples/README.md) | Copy-ready conversion, capture, inspect, batch, and polish commands |
 | [Obsidian vault capture](docs/obsidian.md) | Folder layout, sidecars, indexes, and repeated captures |
 | [Memory cards guide](docs/memory-cards-user-guide.md) | Local model setup and generated note sections |
-| [`enrich-note` contract v1](docs/enrich-note-contract-v1.md) | Proposal-only CLI/stdin integration, limits, errors, and trust boundary |
-| [Obsidian plugin integration](docs/obsidian-plugin-integration.md) | Safe capability negotiation, managed subprocess use, and apply ownership |
-| [OMD Home Phase 2 gap plan](docs/obsidian-plugin-phase2-gap-plan.md) | Remaining capability, validator, review/apply, and deployment gates |
-| [Obsidian plugin UX acceptance (中文)](docs/obsidian-plugin-ux-acceptance-guide.zh-CN.md) | Additional acceptance tasks for proposal review, apply, conflicts, and cancellation |
 | [Privacy model](docs/privacy.md) | What stays local and when network access is used |
-| [Positioning](docs/positioning.md) | Product scope and what OMD is not |
 | [Changelog](CHANGELOG.md) | Release history and current beta changes |
 
 <div align="center">
