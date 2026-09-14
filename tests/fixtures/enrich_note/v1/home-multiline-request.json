@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "request_id": "home-multiline-1",
+  "action": "enrich_note_preview",
+  "vault_path": "/vault",
+  "note": {
+    "path": "Inbox/Embeddings.md",
+    "content": "# Embeddings\r\n\r\nDense and sparse embeddings represent text.\n\n- Preserve original text\texactly\n",
+    "content_sha256": "7ed435ec487da2e305752cd51b53006b969a261ad364024e90d76a0425a8b3fe"
+  },
+  "candidates": [
+    {
+      "id": "candidate-1",
+      "path": "Sources/Web/Example.md",
+      "title": "Example source",
+      "aliases": [],
+      "tags": [],
+      "evidence": "- Source: https://example.com/ - Author: Example - Published: 2024-08-30"
+    },
+    {
+      "id": "candidate-2",
+      "path": "Notes/Embeddings.md",
+      "title": "Embedding methods",
+      "aliases": [],
+      "tags": [],
+      "evidence": "Dense and sparse embeddings represent text across languages. - Dense: semantic meaning across a wrapped list item. - Sparse: lexical features."
+    }
+  ],
+  "vault_tags": [],
+  "model": "qwen3:0.6b",
+  "host": "http://localhost:11434"
+}

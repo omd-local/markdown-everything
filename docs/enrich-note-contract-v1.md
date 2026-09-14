@@ -55,17 +55,17 @@ missing fields are errors.
   "vault_path": "/absolute/vault/path",
   "note": {
     "path": "Inbox/example.md",
-    "content": "本地 AI 可以辅助个人知识工作流。",
-    "content_sha256": "98887e41f98d63015e070641789fe375c7db3f458c9bb5823d125eefa460894a"
+    "content": "Local AI can support personal knowledge workflows.",
+    "content_sha256": "794d84d3ead3ddea098401834de3cbe1097fa711f287233205ae75ecc031dc79"
   },
   "candidates": [
     {
       "id": "candidate-1",
       "path": "Notes/Local AI.md",
       "title": "Local AI",
-      "aliases": ["本地 AI"],
+      "aliases": ["On-device AI"],
       "tags": ["ai/local", "research"],
-      "evidence": "本地 AI 与个人知识工作流。"
+      "evidence": "Local AI and personal knowledge workflows."
     }
   ],
   "vault_tags": ["ai/local", "research", "workflow"],
@@ -79,6 +79,23 @@ missing fields are errors.
 vault-relative `.md` paths using POSIX separators; absolute paths, `..`, hidden
 or system components, control characters, missing files, and symlink traversal
 are rejected. Candidate IDs are request-local, opaque, and unique.
+
+`candidate.evidence` is an optional-in-content snippet (the field is required,
+but an empty string is allowed), limited to 400 Unicode code points in the raw
+input. OMD accepts ordinary LF, CR/CRLF, and TAB in this field and folds runs of
+Unicode whitespace to one ASCII space, removing leading/trailing whitespace,
+before using the snippet downstream. Other C0 controls (including vertical tab
+and form feed) and DEL remain prohibited. Raw field and request limits are
+checked before folding, so whitespace cannot bypass a size limit. This
+compatibility clarification applies only to candidate evidence; IDs, titles,
+paths, aliases, and tags retain their existing single-line validation.
+`note.content`, its SHA-256, and the caller-owned files are never normalized.
+
+Clients should canonicalize candidate snippets at their final request boundary:
+reject prohibited controls, fold ordinary whitespace, trim, then truncate to
+400 Unicode code points. Preserve separators between words and leave the target
+note and hash untouched. OMD also accepts bounded multiline snippets from older
+clients defensively.
 
 OMD Home's candidate catalog is authoritative for request mode, but OMD still
 validates every referenced path. Standalone mode deterministically scans at
@@ -96,23 +113,23 @@ Successful stdout is exactly one compact JSON object followed by a newline:
   "action": "enrich_note_preview",
   "note": {
     "path": "Inbox/example.md",
-    "content_sha256": "98887e41f98d63015e070641789fe375c7db3f458c9bb5823d125eefa460894a"
+    "content_sha256": "794d84d3ead3ddea098401834de3cbe1097fa711f287233205ae75ecc031dc79"
   },
   "proposal": {
-    "summary": "这篇笔记讨论本地 AI 与个人知识工作流。",
+    "summary": "This note discusses local AI and personal knowledge workflows.",
     "existing_links": [
       {
         "candidate_id": "candidate-1",
         "target_path": "Notes/Local AI.md",
         "display": "Local AI",
-        "reason": "主题直接相关",
-        "evidence": "本地 AI",
+        "reason": "Directly related topic",
+        "evidence": "Local AI",
         "recommended": true
       }
     ],
-    "new_concepts": [{"label":"个人知识工作流","reason":"可发展为独立概念"}],
-    "existing_tags": [{"tag":"ai/local","reason":"匹配核心主题","recommended":true}],
-    "new_tags": [{"tag":"knowledge-workflow","reason":"描述工作流主题"}]
+    "new_concepts": [{"label":"Personal knowledge workflows","reason":"Could become a separate concept"}],
+    "existing_tags": [{"tag":"ai/local","reason":"Matches the main topic","recommended":true}],
+    "new_tags": [{"tag":"knowledge-workflow","reason":"Describes the workflow topic"}]
   },
   "warnings": [],
   "generation": {
@@ -155,6 +172,7 @@ without placing vault-controlled text in the system prompt.
 |---|---:|
 | stdin request | 512 KiB |
 | target note content | 64 KiB UTF-8 |
+| raw candidate evidence | 400 Unicode code points before whitespace folding |
 | supplied candidates | 200 |
 | vault tags | 500 |
 | standalone eligible notes | 10,000 |
@@ -196,6 +214,26 @@ The command-specific stage IDs are `catalog`, `retrieve`, `generate`, and
 include the validated `request_id`. Events never include note/candidate bodies,
 prompts, credentials, environment values, or the full vault path.
 
+Invalid candidate evidence (wrong type, raw size over 400 code points, or
+prohibited controls) retains `kind: "invalid_request"` and exit status `2`.
+Its error event adds a safe, stable validation category:
+
+```json
+{"v":1,"ts":1715342460.456,"event":"error","kind":"invalid_request","message":"candidate.evidence is incompatible; link/tag suggestions were not generated. Supply a string of at most 400 Unicode code points without prohibited control characters. No vault files were changed.","request_id":"request-1","validation":{"field":"candidate.evidence","reason":"incompatible_text"}}
+```
+
+`validation` is optional; existing consumers can continue using `kind`.
+Clients should recognize the field/reason pair and display a fixed message,
+rather than raw terminal text: "Link/tag suggestions could not be generated
+because candidate text was incompatible. Update the candidate snippets before
+generating again. Your note is unchanged." If the client has already confirmed
+capture success, it should also say that capture succeeded. Changing models or
+retrying the same payload does not fix this validation failure. The category
+never includes evidence, candidate IDs, private paths, or provider details.
+Consumers must ignore unknown validation fields/reasons and retain their safe
+fallback for other errors. Proposal application still requires the caller's
+existing review action.
+
 ## Trust and network boundary
 
 All Markdown, candidate metadata, and excerpts are untrusted data. The system
@@ -222,3 +260,23 @@ v2 plus capability negotiation.
 
 The checked fixtures under `tests/fixtures/enrich_note/v1/` are the executable
 compatibility examples for this document.
+
+The synthetic `home-multiline-request.json` fixture was generated by OMD Home's
+real `buildEnrichmentRequest` at client commit `8e387a9`. Its input includes a
+Source / Author / Published list and a wrapped paragraph/list, both in English.
+Dedicated parser tests use named Unicode escapes to retain Unicode whitespace
+and code-point boundary coverage while keeping test source text in English.
+Regenerate it without a vault or model using a Node version with TypeScript
+stripping and an OMD Home checkout:
+
+```bash
+node --experimental-strip-types tests/fixtures/enrich_note/generate_home_request.mjs \
+  /path/to/omd-home > /tmp/home-multiline-request.json
+diff tests/fixtures/enrich_note/v1/home-multiline-request.json /tmp/home-multiline-request.json
+```
+
+The Python fixture test exercises both that canonical builder output and the
+legacy multiline snippets through decoding, prompt construction, and proposal
+validation with a fake model executor. It verifies unchanged note bytes/hash
+and candidate files. This is offline protocol coverage; manual Obsidian capture,
+review/apply behavior, and real model quality remain separate integration checks.
