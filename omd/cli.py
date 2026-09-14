@@ -1626,10 +1626,17 @@ def _enrich_note_human_error(
     code: str,
     message: str,
     args: argparse.Namespace | None,
+    *,
+    validation: dict[str, str] | None = None,
 ) -> str:
     """Add recovery and preservation context without changing the JSON protocol."""
     lines = [f"error: {message}"]
-    if code == "ollama_unavailable":
+    if validation == {"field": "candidate.evidence", "reason": "incompatible_text"}:
+        lines.append(
+            "next: normalize candidate snippets in the calling app before submitting "
+            "a new request; keep the note content and its hash unchanged."
+        )
+    elif code == "ollama_unavailable":
         lines.extend(
             [
                 "cause: OMD could not reach the configured Ollama service.",
@@ -1740,6 +1747,7 @@ def _run_enrich_note(argv: list[str]) -> int:
     )
 
     request_id: str | None = None
+    validation: dict[str, str] | None = None
     args: argparse.Namespace | None = None
     try:
         args = parser.parse_args(argv)
@@ -1797,13 +1805,14 @@ def _run_enrich_note(argv: list[str]) -> int:
     except EnrichNoteError as exc:
         request_id = exc.request_id or request_id
         code, message = exc.code, str(exc)
+        validation = exc.validation
     except KeyboardInterrupt:
         code, message = "cancelled", "note enrichment was cancelled"
 
     if json_events:
-        _events.error(code, message, request_id=request_id)
+        _events.error(code, message, request_id=request_id, validation=validation)
     else:
-        sys.stderr.write(_enrich_note_human_error(code, message, args))
+        sys.stderr.write(_enrich_note_human_error(code, message, args, validation=validation))
         sys.stderr.flush()
     _events.configure(False)
     return 2 if code == "invalid_request" else 1

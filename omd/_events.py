@@ -198,14 +198,22 @@ def warn(msg: str) -> None:
         _emit({"event": "warn", "message": msg})
 
 
-def error(kind: str, message: str, *, request_id: str | None = None) -> None:
+def error(
+    kind: str,
+    message: str,
+    *,
+    request_id: str | None = None,
+    validation: dict[str, str] | None = None,
+) -> None:
     """Fatal error event WITHOUT exiting. Use when the caller will sys.exit
     itself. `kind` is a stable machine token (e.g. 'tool_missing',
     'cookies_invalid'). `message` is a human-readable line."""
     if _ENABLED:
-        event = {"event": "error", "kind": kind, "message": message}
+        event: dict[str, object] = {"event": "error", "kind": kind, "message": message}
         if request_id is not None:
             event["request_id"] = request_id
+        if validation is not None:
+            event["validation"] = validation
         _emit(event)
 
 

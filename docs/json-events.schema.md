@@ -176,6 +176,7 @@ signal and use the most recent `error` event for the user-facing message.
 | `kind` | string | Stable machine token. Known examples include `"tool_missing"`, `"unsupported_extension"`, `"file_not_found"`, `"flag_conflict"`, `"format_invalid"`, `"agent_safe_blocked_flag"`, `"url_not_found"`, `"cookies_missing"`, `"cookies_invalid"`, `"network"`, `"parse_failed"`, `"fetch_failed"`, `"transcribe_failed"`, and `"f2_no_audio"`. New `kind` values may be added in v1.x; consumers should fall back to displaying `message`. |
 | `message` | string | Human-readable error line. May contain paths or URLs. |
 | `request_id` | string | Optional additive field once a request-scoped command has validated the ID. |
+| `validation` | object | Optional safe validation category. For incompatible enrichment evidence: `{"field":"candidate.evidence","reason":"incompatible_text"}`. Contains machine tokens, never submitted text or paths. Consumers must ignore unknown fields/reasons. |
 
 ### `enrich-note` stages and terminal events
 
@@ -183,6 +184,13 @@ signal and use the most recent `error` event for the user-facing message.
 `retrieve`, `generate`, and `validate` in that order. A successful run ends in
 one `done` event with `output: null`; a failed run ends in one `error` event.
 Terminal events include `request_id` when it is already known. Enrichment
+evidence validation failures keep `kind: "invalid_request"` and may include the
+additive `validation` category above. Clients should map that category to a
+fixed message explaining that candidate text prevented link/tag suggestions;
+the note is unchanged and the snippets need correction before another attempt.
+Only a client that has confirmed capture success should state that capture
+succeeded. Do not recommend model changes or repeated retries of the same
+payload for this category. Enrichment
 events never contain note/candidate bodies, prompts, credentials, environment
 values, or the full vault path. See
 [`enrich-note` contract v1](enrich-note-contract-v1.md).

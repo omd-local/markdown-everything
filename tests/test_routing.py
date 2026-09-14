@@ -147,7 +147,70 @@ def test_enrich_note_failure_has_empty_stdout_and_terminal_error(monkeypatch, ca
     assert events[-1]["event"] == "error"
     assert events[-1]["kind"] == "generation_timeout"
     assert events[-1]["request_id"] == "cli-request-2"
+    assert "validation" not in events[-1]
     assert content not in captured.err
+
+
+@pytest.mark.parametrize("evidence", [None, "x" * 401, "private-candidate\x00secret"])
+@pytest.mark.parametrize("json_events", [False, True])
+def test_enrich_note_evidence_error_is_actionable_and_private(
+    evidence, json_events, monkeypatch, capsys
+):
+    from omd import enrich_note
+
+    content = "private note body\n"
+    payload = {
+        "schema_version": 1,
+        "request_id": "evidence-error-1",
+        "action": "enrich_note_preview",
+        "vault_path": "/private-vault",
+        "note": {
+            "path": "Inbox/private-note.md",
+            "content": content,
+            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        },
+        "candidates": [{
+            "id": "candidate-1",
+            "path": "Notes/private-candidate.md",
+            "title": "Private candidate",
+            "aliases": [],
+            "tags": [],
+            "evidence": evidence,
+        }],
+        "vault_tags": [],
+        "model": "qwen3:test",
+        "host": "http://localhost:11434",
+    }
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail("invalid evidence must fail before filesystem or model work")
+
+    monkeypatch.setattr(enrich_note, "run_enrich_note", unexpected_run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    argv = ["enrich-note", "--request-json", "-"]
+    if json_events:
+        argv.append("--json-events")
+
+    assert cli.main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "candidate.evidence" in captured.err
+    assert "link/tag suggestions were not generated" in captured.err
+    assert "400 Unicode code points" in captured.err
+    for private_text in ("private-vault", "private-note", "private-candidate", "secret", content):
+        assert private_text not in captured.err
+    if json_events:
+        events = _parse_events(captured.err)
+        assert len(events) == 1
+        assert events[0]["kind"] == "invalid_request"
+        assert events[0]["request_id"] == "evidence-error-1"
+        assert events[0]["validation"] == {
+            "field": "candidate.evidence", "reason": "incompatible_text"
+        }
+    else:
+        assert "no vault files were changed" in captured.err
+        assert "next: normalize candidate snippets" in captured.err
 
 
 def test_enrich_note_request_mode_rejects_cli_contract_overrides(monkeypatch, capsys):

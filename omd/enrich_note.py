@@ -81,10 +81,18 @@ _MODEL_FIELDS = frozenset(
 
 
 class EnrichNoteError(RuntimeError):
-    def __init__(self, code: str, message: str, *, request_id: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        request_id: str | None = None,
+        validation: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.request_id = request_id
+        self.validation = validation
 
 
 @dataclass(frozen=True)
@@ -1065,9 +1073,22 @@ def _parse_candidate(value: object, request_id: str) -> EnrichCandidate:
         _request_string(item, "candidate tag", 128)
         for item in _request_list(payload["tags"], "candidate.tags", 64)
     )
-    evidence = _request_string(
-        payload["evidence"], "candidate.evidence", 400, allow_empty=True
-    )
+    try:
+        # Check the raw bound and prohibited controls before folding whitespace.
+        evidence = _request_string(
+            payload["evidence"], "candidate.evidence", 400,
+            allow_empty=True, allow_multiline=True,
+        )
+    except EnrichNoteError as exc:
+        raise EnrichNoteError(
+            "invalid_request",
+            "candidate.evidence is incompatible; link/tag suggestions were not generated. "
+            "Supply a string of at most 400 Unicode code points without prohibited "
+            "control characters. No vault files were changed.",
+            request_id=request_id,
+            validation={"field": "candidate.evidence", "reason": "incompatible_text"},
+        ) from exc
+    evidence = " ".join(evidence.split())
     return EnrichCandidate(candidate_id, path, title, aliases, tags, evidence)
 
 

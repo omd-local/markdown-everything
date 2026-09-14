@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from omd.ai_service import AIServiceError
+from omd.ai_service import AIServiceError, AITextResult
 from omd.enrich_note import (
     EnrichNoteError,
     build_proposal_response,
@@ -53,6 +53,59 @@ def _request_payload(vault_path: str = "/vault", request_id: str = "request-1"):
 
 def _decode(payload):
     return decode_request(json.dumps(payload, ensure_ascii=False).encode())
+
+
+@pytest.mark.parametrize("legacy_multiline", [False, True])
+def test_home_builder_fixture_reaches_proposal_without_changing_files(tmp_path, legacy_multiline):
+    payload = _load("home-multiline-request.json")
+    builder_input = json.loads((FIXTURES.parent / "home-multiline-input.json").read_text())
+    expected = [
+        "- Source: https://example.com/ - Author: Example - Published: 2024-08-30",
+        (
+            "Dense and sparse embeddings represent text across languages. "
+            "- Dense: 语义 🙂 across a wrapped list item. - Sparse: lexical features."
+        ),
+    ]
+    assert [candidate["evidence"] for candidate in payload["candidates"]] == expected
+    assert payload["note"]["content"] == builder_input["target"]["content"]
+    if legacy_multiline:
+        for candidate, source in zip(payload["candidates"], builder_input["candidates"]):
+            candidate["evidence"] = source["evidence"]
+    payload["vault_path"] = str(tmp_path)
+    original_files = {payload["note"]["path"]: payload["note"]["content"].encode()}
+    for candidate, source in zip(payload["candidates"], builder_input["candidates"]):
+        original_files[candidate["path"]] = source["evidence"].encode()
+    for relative, content in original_files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    request = _decode(payload)
+    generated = []
+
+    def execute(task, *, source_text, **kwargs):
+        envelope = json.loads(source_text)
+        assert [item["evidence"] for item in envelope["untrusted_candidates"]] == expected
+        assert envelope["untrusted_note"]["content"] == builder_input["target"]["content"]
+        generated.append(True)
+        proposal = {
+            "summary": "Embeddings represent text.",
+            "existing_links": [], "new_concepts": [], "existing_tags": [], "new_tags": [],
+        }
+        return AITextResult(
+            provider="ollama", requested_model=task.model, actual_model=task.model,
+            capability=task.capability, privacy_mode="local_only", destination_domain="localhost",
+            text=json.dumps(proposal), usage={}, timing={}, structured=proposal,
+        )
+
+    response = run_enrich_note(request, executor=execute)
+
+    assert generated == [True]
+    assert response["note"]["content_sha256"] == payload["note"]["content_sha256"]
+    assert response["proposal"]["summary"] == "Embeddings represent text."
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*.md")
+    } == original_files
 
 
 def test_valid_response_fixture_matches_runtime_validation_and_serializer():

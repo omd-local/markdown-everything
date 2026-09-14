@@ -122,6 +122,160 @@ def test_decode_request_accepts_normal_multiline_markdown():
 
 
 @pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        ("first\nsecond", "first second"),
+        ("first\r\nsecond", "first second"),
+        ("first\rsecond", "first second"),
+        ("first\tsecond", "first second"),
+        ("# Heading\n\n- first\r\n- second\titem", "# Heading - first - second item"),
+        (
+            " first\u0085second\u00a0third\u2003fourth\u2028fifth\u2029sixth\u3000 ",
+            "first second third fourth fifth sixth",
+        ),
+        ("  first   second  ", "first second"),
+        ("single-line evidence 🙂", "single-line evidence 🙂"),
+        ("", ""),
+        (" \t\r\n\u00a0\u2003 ", ""),
+    ],
+    ids=[
+        "lf", "crlf", "cr", "tab", "markdown", "unicode-whitespace",
+        "repeated-spaces", "single-line", "empty", "only-whitespace",
+    ],
+)
+def test_decode_request_normalizes_candidate_evidence_without_changing_note(
+    evidence, expected,
+):
+    payload = _request_payload()
+    content = "# Private note\r\n\r\n- Exact\ttext\nwith\u00a0spacing.\r"
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    payload["note"].update(content=content, content_sha256=content_hash)
+    payload["candidates"][0]["evidence"] = evidence
+
+    request = _decode(payload)
+
+    assert request.candidates[0].evidence == expected
+    assert request.note.content == content
+    assert request.note.content_sha256 == content_hash
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        ("x" * 400, "x" * 400),
+        ("🙂" * 400, "🙂" * 400),
+        ("x" + " " * 399, "x"),
+        ("🙂" + "\r\n" * 199 + " ", "🙂"),
+    ],
+    ids=["ascii", "unicode-codepoints", "spaces", "multiline-whitespace"],
+)
+def test_decode_request_accepts_candidate_evidence_at_raw_400_codepoint_limit(
+    evidence, expected,
+):
+    payload = _request_payload()
+    payload["candidates"][0]["evidence"] = evidence
+
+    assert len(evidence) == 400
+    assert _decode(payload).candidates[0].evidence == expected
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    ["x" * 401, "🙂" * 401, "x" + " " * 400, "🙂" + "\r\n" * 200],
+    ids=["ascii", "unicode-codepoints", "spaces", "multiline-whitespace"],
+)
+def test_decode_request_rejects_candidate_evidence_over_raw_400_codepoint_limit(evidence):
+    payload = _request_payload()
+    payload["candidates"][0]["evidence"] = evidence
+
+    assert len(evidence) == 401
+    with pytest.raises(EnrichNoteError) as excinfo:
+        _decode(payload)
+
+    error = excinfo.value
+    assert error.code == "invalid_request"
+    assert error.request_id == "request-1"
+    assert error.validation == {"field": "candidate.evidence", "reason": "incompatible_text"}
+    assert "candidate.evidence" in str(error)
+    assert "400" in str(error)
+    assert evidence not in str(error)
+
+
+@pytest.mark.parametrize(
+    "control",
+    [chr(value) for value in range(32) if value not in (9, 10, 13)] + ["\x7f"],
+    ids=lambda value: f"U+{ord(value):04X}",
+)
+def test_decode_request_rejects_prohibited_candidate_evidence_controls_before_normalization(
+    control,
+):
+    payload = _request_payload()
+    payload["candidates"][0]["evidence"] = f"private-evidence{control}text"
+
+    with pytest.raises(EnrichNoteError) as excinfo:
+        _decode(payload)
+
+    error = excinfo.value
+    assert error.code == "invalid_request"
+    assert error.request_id == "request-1"
+    assert error.validation == {"field": "candidate.evidence", "reason": "incompatible_text"}
+    assert "candidate.evidence" in str(error)
+    assert "control" in str(error)
+    assert "private-evidence" not in str(error)
+
+
+@pytest.mark.parametrize("evidence", [None, False, 123, [], {"private-evidence": "text"}])
+def test_decode_request_rejects_nonstring_candidate_evidence_with_validation_details(
+    evidence,
+):
+    payload = _request_payload()
+    payload["candidates"][0]["evidence"] = evidence
+
+    with pytest.raises(EnrichNoteError) as excinfo:
+        _decode(payload)
+
+    error = excinfo.value
+    assert error.code == "invalid_request"
+    assert error.request_id == "request-1"
+    assert error.validation == {"field": "candidate.evidence", "reason": "incompatible_text"}
+    assert "candidate.evidence" in str(error)
+    assert "string" in str(error)
+    assert "private-evidence" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "field_path",
+    [
+        ("request_id",),
+        ("vault_path",),
+        ("note", "path"),
+        ("note", "content_sha256"),
+        ("candidates", 0, "id"),
+        ("candidates", 0, "path"),
+        ("candidates", 0, "title"),
+        ("candidates", 0, "aliases", 0),
+        ("candidates", 0, "tags", 0),
+        ("vault_tags", 0),
+        ("model",),
+        ("host",),
+    ],
+    ids=lambda value: ".".join(str(part) for part in value),
+)
+def test_decode_request_keeps_newlines_invalid_in_other_string_fields(field_path):
+    payload = _request_payload()
+    container = payload
+    for key in field_path[:-1]:
+        container = container[key]
+    container[field_path[-1]] += "\n"
+
+    with pytest.raises(EnrichNoteError) as excinfo:
+        _decode(payload)
+
+    assert excinfo.value.code == "invalid_request"
+    assert getattr(excinfo.value, "validation", None) is None
+
+
+@pytest.mark.parametrize(
     ("mutation", "code"),
     [
         (lambda value: value.update(schema_version=2), "unsupported_schema"),
