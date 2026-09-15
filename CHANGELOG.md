@@ -3,9 +3,14 @@
 All notable changes are documented here. Version numbers follow Semantic
 Versioning and Python's beta-version convention.
 
-## Unreleased
+## 0.3.0b3 - 2026-09-15
 
 ### Added
+
+- Optional direct OpenAI, Anthropic, and DeepSeek Inbox drafting with explicit
+  per-task content previews and consent, bounded requests, and Keychain or
+  session-only credentials. Capture and conversion remain independent of AI.
+- Vault retrieval and local progress diagnostics with privacy-safe timing history.
 
 - Added the proposal-only `omd enrich-note` engine for validated existing-note
   links, concepts, and vault tags without writing to the vault.
@@ -23,6 +28,11 @@ Versioning and Python's beta-version convention.
 
 ### Fixed
 
+- Accept wrapped Markdown candidate evidence during post-capture enrichment by
+  normalizing allowed whitespace while preserving raw size and control-character
+  validation. This fixes the request-format rejection reported in issue #6.
+- Return an optional safe validation category so clients can explain incompatible
+  evidence without exposing source text or retrying deterministic failures.
 - Prevented completed Inbox decisions from being replayed or reversed, and
   cleared unsaved item-specific review state when switching items.
 - Preserved Markdown whitespace around long polish chunks and fenced code, and
