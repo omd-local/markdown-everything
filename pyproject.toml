@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omd"
-version = "0.3.0b2"
+version = "0.3.0b3"
 description = "Local AI context inbox: turn files, web pages, screenshots, audio, and folders into traceable Markdown for vaults and agents."
 readme = "README.md"
 requires-python = ">=3.10"

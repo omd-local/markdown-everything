@@ -1,6 +1,6 @@
 <div align="center">
 
-<sub>OMD.EXE // PUBLIC BETA 0.3.0b2</sub>
+<sub>OMD.EXE // PUBLIC BETA 0.3.0b3</sub>
 
 # OMD.EXE
 

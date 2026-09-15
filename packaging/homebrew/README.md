@@ -16,7 +16,7 @@ release template; keep it aligned with the published tap after every release.
 
 ```bash
 # from the omd repo root
-VERSION=0.3.0b2
+VERSION=0.3.0b3
 git add -A
 git commit -m "release: v${VERSION}"
 git tag -a "v${VERSION}" -m "OMD ${VERSION}"
