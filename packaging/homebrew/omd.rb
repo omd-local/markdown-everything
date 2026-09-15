@@ -4,8 +4,8 @@ class Omd < Formula
   desc "One command. Anything (URL, doc, image, reel, podcast) to Markdown"
   homepage "https://github.com/omd-local/markdown-everything"
   # Update url + sha256 on each release. See packaging/homebrew/README.md for steps.
-  url "https://github.com/omd-local/markdown-everything/releases/download/v0.3.0b2/omd-0.3.0b2.tar.gz"
-  sha256 "11fbb188590ba0cbb68e3bfc1c5dc2911da1368a857658748b0d0b28e1843c46"
+  url "https://github.com/omd-local/markdown-everything/releases/download/v0.3.0b3/omd-0.3.0b3.tar.gz"
+  sha256 "c89d2c9d36f58cb36a46489f576b4622aaa560762e48c0e29c295534a243342e"
   license "MIT"
   head "https://github.com/omd-local/markdown-everything.git", branch: "main"
 
