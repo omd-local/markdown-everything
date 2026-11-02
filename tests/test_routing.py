@@ -32,11 +32,19 @@ def test_root_help_lists_discoverable_commands(capsys):
     assert captured.err == ""
 
 
-def test_capabilities_command_emits_exact_static_json(capsys):
+def test_capabilities_command_emits_exact_machine_json(capsys, monkeypatch):
+    from datetime import date
+    from omd import capabilities
+    from omd.provider_disclosure import disclosure_readiness
+
+    monkeypatch.setattr(
+        capabilities, "disclosure_readiness",
+        lambda **kwargs: disclosure_readiness(as_of=date(2026, 11, 2)),
+    )
     assert cli.main(["capabilities", "--json"]) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == '{"enrich_note":{"schema_versions":[1],"supported":true}}\n'
+    assert captured.out == capabilities.capabilities_json(as_of=date(2026, 11, 2))
     assert captured.err == ""
 
 

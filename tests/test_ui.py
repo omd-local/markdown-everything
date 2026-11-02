@@ -1486,7 +1486,7 @@ def test_cloud_request_preview_names_destination_without_echoing_source(tmp_path
         "OpenAI API",
         "gpt-selected",
         "http://localhost:11434",
-        as_of=date(2026, 7, 19),
+        as_of=date(2026, 11, 2),
     )
 
     assert "api.openai.com" in preview
@@ -1496,10 +1496,17 @@ def test_cloud_request_preview_names_destination_without_echoing_source(tmp_path
     assert "consumer ChatGPT login" in preview
 
 
-def test_cloud_request_preview_for_ui_creates_source_bound_unchecked_grant(tmp_path):
+def test_cloud_request_preview_for_ui_creates_source_bound_unchecked_grant(tmp_path, monkeypatch):
     from omd.ai_service import AIConsentGrant
     from omd.inbox import InboxItem
     from omd.inbox_workflow import save_inbox_item
+
+    from functools import partial
+    from omd.ai_service import create_text_task_consent, prepare_text_task
+
+    # This UI callback has no date parameter; inject dates into its service calls.
+    monkeypatch.setattr(ui, "prepare_text_task", partial(prepare_text_task, as_of=date(2026, 11, 2)))
+    monkeypatch.setattr(ui, "create_text_task_consent", partial(create_text_task_consent, as_of=date(2026, 11, 2)))
 
     source = "Private source for one exact preview."
     item = InboxItem(

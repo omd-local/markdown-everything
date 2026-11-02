@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, "codex/**"]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
 
 permissions:
   contents: read
@@ -13,7 +16,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  disclosure-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Hosted AI disclosure review freshness
+        run: python -m omd.provider_disclosure
+
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -37,6 +52,7 @@ jobs:
         run: python -m compileall -q -x '(^|/)\._' omd tests
 
   wheel:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -58,6 +74,7 @@ jobs:
           "$RUNNER_TEMP/omd-wheel/bin/omd-mcp" </dev/null
 
   dependency-audit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

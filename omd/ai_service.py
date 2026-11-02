@@ -234,6 +234,10 @@ class AIServiceError(RuntimeError):
         self.provider = provider
         self.code = code
 
+    def to_dict(self) -> dict[str, str]:
+        """Machine metadata only: exception messages/causes can contain private data."""
+        return {"provider": self.provider, "code": self.code}
+
 
 def prepare_text_task(
     task: AITextTask,

@@ -3,7 +3,7 @@ PYTHON ?= python3
 VERSION ?= $(shell $(PYTHON) -c "import tomllib,sys; sys.stdout.write(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 TARBALL_URL = https://github.com/omd-local/markdown-everything/archive/refs/tags/v$(VERSION).tar.gz
 
-.PHONY: help install install-dev install-ui install-audit ui test audit smoke clean uninstall release-tag release-sha
+.PHONY: help install install-dev install-ui install-audit ui test audit check-disclosures smoke clean uninstall release-tag release-sha
 
 help:
 	@echo "omd targets:"
@@ -15,6 +15,7 @@ help:
 	@echo "  make smoke          run a quick OCR routing smoke test"
 	@echo "  make test           pytest"
 	@echo "  make audit          pip-audit dependency CVE scan"
+	@echo "  make check-disclosures  fail when a policy review is due within 14 days"
 	@echo "  make clean          remove build artifacts and __pycache__"
 	@echo "  make uninstall      pip uninstall omd"
 	@echo "  make release-tag    git tag v\$$(VERSION) and push (reads pyproject.toml)"
@@ -41,6 +42,9 @@ test:
 audit:
 	$(PYTHON) -m pip_audit
 
+check-disclosures:
+	$(PYTHON) -m omd.provider_disclosure
+
 smoke:
 	@echo "→ Routing dry-run via python -m omd.cli --help"
 	$(PYTHON) -m omd.cli --help | head -20
@@ -53,7 +57,7 @@ clean:
 uninstall:
 	$(PYTHON) -m pip uninstall -y omd
 
-release-tag:
+release-tag: check-disclosures
 	@echo "→ tagging v$(VERSION) and pushing"
 	git tag v$(VERSION)
 	git push origin main --tags
