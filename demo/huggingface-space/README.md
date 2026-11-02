@@ -18,6 +18,12 @@ tags:
 
 # Hosted OMD sample demo on Hugging Face Spaces
 
+> **Deferred for 0.3.0b4:** this release ships the core backend for OMD Home,
+> CLI, and MCP. Do not deploy this browser demo until Gradio and Pillow have
+> a compatible security update and the deferred UI dependency audit passes.
+> Its historical requirements remain for auditing; they are not installed by
+> the core release or Homebrew formula.
+
 This Space is a deliberately limited public sample of the current `omd-ui`
 Gradio app. It converts public web pages and uploaded documents into Markdown.
 

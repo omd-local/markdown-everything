@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omd"
-version = "0.3.0b3"
+version = "0.3.0b4"
 description = "Local AI context inbox: turn files, web pages, screenshots, audio, and folders into traceable Markdown for vaults and agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,35 +34,29 @@ dependencies = []
 # Lower bounds keep installs flexible. Release builds should use a constraints
 # file or audited lock because parsers and agent-facing tools are supply-chain
 # sensitive.
-markitdown = ["markitdown[all]>=0.1.6,<0.2"]
+# Conversion extras require Python 3.11+ because their Pillow dependency must
+# include the current security fixes. The dependency-free core supports 3.10+.
+markitdown = ["markitdown[all]>=0.1.6,<0.2", "pillow>=13.0.0,<14"]
 # yt-dlp is the easiest Python dep for non-Douyin reels.
 reel = ["yt-dlp>=2024.10.0"]
-# Gradio browser UI (omd-ui). Keep security-sensitive upload/parser
-# transitive dependencies above their first fixed releases.
-ui = [
-    "gradio>=6.20.0,<7",
-    "pillow>=12.3.0,<13",
-    "python-multipart>=0.0.32,<1",
-    "starlette>=1.3.1,<2",
-]
+# The browser UI is deferred for this core backend release. Do not restore its
+# extra until Gradio accepts a Pillow version that passes the release audit.
 # Test runner for maintainers and contributors.
 test = ["pytest>=8.0"]
 # Local security audit tooling for maintainers.
 audit = ["pip-audit>=2.10.0"]
-# All-in-one (still needs system tesseract/ffmpeg/mlx_whisper/f2/ollama)
+# All conversion extras (still needs system tesseract/ffmpeg/mlx_whisper/f2/ollama).
+# Browser UI dependencies are intentionally excluded.
 all = [
     "markitdown[all]>=0.1.6,<0.2",
+    "pillow>=13.0.0,<14",
     "yt-dlp>=2024.10.0",
-    "gradio>=6.20.0,<7",
-    "pillow>=12.3.0,<13",
-    "python-multipart>=0.0.32,<1",
-    "starlette>=1.3.1,<2",
 ]
 
 [project.scripts]
 omd = "omd.cli:main"
 omd-mcp = "omd.mcp_server:main"
-omd-ui = "omd.ui:main"
+omd-ui = "omd.ui_unavailable:main"
 
 [project.urls]
 Homepage = "https://github.com/omd-local/markdown-everything"

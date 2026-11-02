@@ -1,0 +1,25 @@
+name: Deferred browser UI dependency audit
+
+# Keep the unresolved UI dependency risk visible without treating it as part
+# of the explicitly core-only release. Restore the UI gate before shipping UI.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 9 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  deferred-ui-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit deferred browser UI requirements
+        run: |
+          python -m pip install "pip-audit>=2.10.0"
+          python -m pip_audit -r demo/huggingface-space/requirements.txt --progress-spinner off

@@ -1,6 +1,7 @@
 """omd UI - minimal Gradio wrapper around the `omd` CLI.
 
-Run: `omd-ui` (after `pip install -e '.[ui]'`) or `python -m omd.ui`.
+Retained for future UI development. The 0.3.0b4 core release disables launch
+until the browser dependencies have a compatible security update.
 
 Opens a local browser tab. Paste a URL/share-blob or pick a file, choose an
 output folder or vault folder, tick options, hit Run. Stderr streams to the log
@@ -6942,7 +6943,8 @@ def _write_ui_startup_error(exc: Exception, *, port: int) -> None:
     sys.stderr.flush()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _browser_main(argv: Sequence[str] | None = None) -> int:
+    """Retained browser implementation; not a supported release entry point."""
     args = _ui_argument_parser().parse_args(argv)
     try:
         app = build_app()
@@ -6956,6 +6958,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_ui_startup_error(exc, port=args.port)
         return 1
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    from omd.ui_unavailable import main as unavailable_main
+
+    return unavailable_main(argv)
 
 
 if __name__ == "__main__":

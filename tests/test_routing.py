@@ -32,11 +32,19 @@ def test_root_help_lists_discoverable_commands(capsys):
     assert captured.err == ""
 
 
-def test_capabilities_command_emits_exact_static_json(capsys):
+def test_capabilities_command_emits_exact_machine_json(capsys, monkeypatch):
+    from datetime import date
+    from omd import capabilities
+    from omd.provider_disclosure import disclosure_readiness
+
+    monkeypatch.setattr(
+        capabilities, "disclosure_readiness",
+        lambda **kwargs: disclosure_readiness(as_of=date(2026, 11, 2)),
+    )
     assert cli.main(["capabilities", "--json"]) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == '{"enrich_note":{"schema_versions":[1],"supported":true}}\n'
+    assert captured.out == capabilities.capabilities_json(as_of=date(2026, 11, 2))
     assert captured.err == ""
 
 
@@ -1370,7 +1378,7 @@ def test_copy_with_progress_emits_byte_units_in_events_mode(capsys):
 
 
 def test_image_ocr_emits_real_pixel_work_units(tmp_path, monkeypatch, capsys):
-    from PIL import Image
+    Image = pytest.importorskip("PIL.Image", reason="Optional Pillow 13 requires Python 3.11+")
     from omd import _events, _progress, cli
 
     source = tmp_path / "scan.png"
@@ -1396,6 +1404,11 @@ def test_image_ocr_emits_real_pixel_work_units(tmp_path, monkeypatch, capsys):
     assert work[0]["total"] == 12
     assert work[-1]["state"] == "completed"
     assert work[-1]["completed"] == 12
+
+
+def test_image_pixel_count_is_optional_without_pillow(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    assert cli._image_pixel_count(tmp_path / "scan.png") is None
 
 
 def test_local_file_conversion_emits_real_byte_work_units(tmp_path, monkeypatch, capsys):

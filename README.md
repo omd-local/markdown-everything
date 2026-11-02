@@ -1,6 +1,6 @@
 <div align="center">
 
-<sub>OMD.EXE // PUBLIC BETA 0.3.0b3</sub>
+<sub>OMD.EXE // PUBLIC BETA 0.3.0b4</sub>
 
 # OMD.EXE
 
@@ -14,26 +14,15 @@ URLs into traceable Markdown that stays in folders you control.
 [![License: MIT](https://img.shields.io/badge/License-MIT-f0b429?style=flat-square)](LICENSE)
 [![Local first](https://img.shields.io/badge/Mode-local--first-202124?style=flat-square)](docs/privacy.md)
 
-[Live demo](https://shionshine-omd-public-demo.hf.space) ·
 [Install](#quick-start) ·
-[Walkthrough](#walkthrough) ·
 [Documentation](#documentation) ·
 [Report an issue](https://github.com/omd-local/markdown-everything/issues)
 
 </div>
 
-## Walkthrough
-
-<p align="center">
-  <a href="docs/assets/omd-walkthrough.gif">
-    <img src="docs/assets/omd-walkthrough.gif" alt="OMD.EXE walkthrough: add URLs or files, choose Markdown or an Obsidian vault, and run the local conversion" width="640">
-  </a>
-</p>
-
-<p align="center">
-  <strong>Try the hosted sample with a public webpage or non-sensitive document.</strong><br>
-  Private files, cookies, vault writes, media transcription, and local models belong in the local app.
-</p>
+**Beta 0.3.0b4 provides the core backend for OMD Home, the command line, and
+MCP.** The browser UI is deferred until its Gradio/Pillow dependencies have a
+compatible, audited installation. OMD Home does not require that browser UI.
 
 ## How conversion stays recoverable
 
@@ -54,23 +43,40 @@ missing model or failed call leaves the raw Markdown intact.
 ```bash
 brew install omd-local/omd/omd
 omd doctor
-omd-ui
+omd capabilities --json
 ```
 
-Choose **Markdown file** for a normal export or **Capture to vault note** for an
-Obsidian folder. An Obsidian vault is just a local folder; OMD does not require
-an Obsidian plugin or account.
+For an existing Homebrew installation:
 
-For quick personal thoughts and exact highlights, open **Inbox / review**. The
-screen follows three steps: save the text, review the unchanged original, then
-choose **Create note in Notes** or **Mark as not needed**. Creating a note makes
-a traceable derivative under `Notes/`; either choice leaves the original under
-`Inbox/`. Saving and reviewing do not call AI.
+```bash
+brew update
+brew upgrade omd-local/omd/omd
+```
+
+In **OMD Home** settings, use the absolute executable path printed by:
+
+```bash
+echo "$(brew --prefix omd-local/omd/omd)/bin/omd"
+```
+
+Run `omd capabilities --json` with that executable to confirm `package_version`
+is `0.3.0b4` and `protocol_version` is `1`, then refresh Home's backend check.
+Home still needs a separate client update for disclosure readiness preflight
+and the explicit **"Nothing was sent"** error. Updating this backend does not
+change Home's error display.
+
+The command line can also convert directly or capture into an Obsidian folder:
+
+```bash
+omd report.pdf -o report.md
+omd capture report.pdf --vault ~/Obsidian/AI-Memory
+```
 
 The custom Homebrew tap includes the project organisation in the command.
 `omd-local` is the project owner, not a personal account. The beta installs the
-CLI, MCP server, local browser UI, common document converters, and `yt-dlp`.
-Large transcription and local-model tools remain optional.
+CLI, MCP server, common document converters, and `yt-dlp`. The `omd-ui` command
+explains that the browser UI is unavailable in this release; it does not start
+a server. Large transcription and local-model tools remain optional.
 
 <details>
 <summary><strong>SETUP MENU // manual install and optional local tools</strong></summary>
@@ -80,12 +86,17 @@ Large transcription and local-model tools remain optional.
 ```bash
 git clone https://github.com/omd-local/markdown-everything.git omd
 cd omd
-pip install -e '.[all]'
+pip install -e .
+pip install 'markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.6,<0.2' 'pillow>=13.0.0,<14' yt-dlp
 omd doctor
 ```
 
-Python 3.10 or newer is required. A minimal `pip install -e .` registers `omd`
-and `omd-mcp`; the `all` extra adds the UI, MarkItDown, and Python `yt-dlp`.
+The dependency-free core supports Python 3.10 or newer. The optional document
+converters require Python 3.11 or newer for Pillow 13; Homebrew uses Python 3.12.
+A minimal `pip install -e .` registers `omd`
+and `omd-mcp` without Python runtime dependencies. Document converters and media
+tools are optional. The `all` extra includes conversion tools, not the deferred
+browser UI; there is no supported `ui` extra in this release.
 
 ### Optional local model
 
@@ -97,29 +108,22 @@ instruct model from the machine's total memory; this is a 16 GB example:
 ollama pull qwen3:4b-instruct
 ```
 
-Keep the UI host at `http://localhost:11434` for fully local model calls. Core
+Keep the Ollama host at `http://localhost:11434` for fully local model calls. Core
 conversion still works when Ollama is absent or stopped.
 
-### Optional AI draft for one Inbox item
+### Hosted AI readiness
 
-Inbox review can optionally ask local Ollama to draft a takeaway, quote exact
-evidence, and suggest tags. It reads the Inbox original by default. You may
-instead explicitly select one read-only Markdown file from the unified vault
-source list; OMD then uses only that file and can add its vault-relative
-`[[wikilink]]` to the derived note. It never opens a URL or reads an unselected
-file. Results without exact evidence are rejected, and the draft is not included
-in a note unless you choose it.
+Hosted AI is optional and requires explicit consent for each request. The
+backend validates provider disclosures before credentials, model checks, or
+provider requests. OpenAI and Anthropic disclosures were reviewed on
+2026-11-02; DeepSeek remains unavailable because the reviewed official sources
+do not establish an applicable API retention policy for OMD evidence.
 
-You can instead send the selected text directly to the **OpenAI API**,
-**Anthropic API**, or **DeepSeek API** using your own developer API key. Cloud
-providers show a one-request preview and consent action with the exact provider,
-model, destination, content size, and current policy link. This is never required
-for capture or conversion; OMD does not use consumer ChatGPT/Claude login
-sessions, route through OpenRouter, or silently fall back to another provider.
-UI credentials use macOS Keychain when available or remain session-only. OMD
-checks a conservative request budget before reading the credential or contacting
-the provider; an oversized Inbox item is left unchanged and must be split rather
-than being silently truncated.
+`omd capabilities --json` reports current disclosure readiness without reading
+Vault evidence. A missing, expired, or unverified disclosure fails closed with
+`disclosure_unavailable`. Disclosure readiness alone does not authorize a request
+or guarantee model availability. Capture, conversion, and local AI do not depend
+on Hosted AI readiness.
 
 ### Optional transcription and OCR
 
@@ -164,16 +168,15 @@ anonymous converter.
 
 These advanced local-only routes normally need separate Netscape `cookies.txt`
 exports. Export cookies only from an account and content you are authorised to
-use, then select the matching file in the UI:
+use, then pass the matching file with `--cookies`:
 
 - **Douyin cookies:** export while signed in to `douyin.com`.
 - **Xiaohongshu cookies:** export while signed in to `xiaohongshu.com`.
 - Do not reuse one platform's cookie file for the other platform.
-- Cookies are disabled in the hosted demo and should never be committed.
+- Never commit cookie files.
 
-Use **Inspect source / cookies** before starting. OMD warns when the current
-source list contains one of these platforms but its matching cookie file is
-missing.
+Use `omd inspect "<url>" --with-readiness --cookies /path/to/cookies.txt` before
+starting to check local source and cookie readiness.
 
 </details>
 
@@ -273,11 +276,12 @@ folders you intend the client to access.
 
 | Symptom | What to check |
 |---|---|
-| `markitdown` missing | Reinstall the Homebrew package or `pip install -e '.[all]'`. |
+| `markitdown` missing | Reinstall the Homebrew package or install the common document converters shown above. |
+| `omd-ui` reports unavailable | Beta 0.3.0b4 ships the core backend. Use OMD Home or the CLI while the browser UI is deferred. |
 | OCR language unavailable | Install `tesseract-lang`; use `eng` or `chi_sim+eng`. |
 | Local model warning | Start Ollama and run the displayed `ollama pull <model>` command. Raw Markdown is retained. |
 | Web or Reddit HTTP 403 | The source rejected automated access. Save an authorised copy as HTML or PDF and convert the local file. |
-| Douyin / Xiaohongshu warning | Export a fresh platform-specific cookie file and select it in the matching UI field. |
+| Douyin / Xiaohongshu warning | Export a fresh platform-specific cookie file and pass it with `--cookies`. |
 | Partial failure in a multi-file run | Open the output folder; successful items and partial raw outputs are retained when safe. |
 
 Run `omd doctor` for local capability checks. For a reproducible report, include
@@ -323,7 +327,7 @@ under the [MIT License](LICENSE).
 
 Local-first does not mean every URL workflow is offline: URLs contact their
 source platform, and explicitly configured remote model endpoints receive the
-content sent to them. Keep private material in the local app with loopback
+content sent to them. Keep private material in local workflows with loopback
 Ollama. See the [privacy model](docs/privacy.md) and
 [security policy](SECURITY.md).
 
@@ -342,7 +346,6 @@ Ollama. See the [privacy model](docs/privacy.md) and
 **LOCAL SOURCES -> TRACEABLE MARKDOWN -> CONTEXT YOU CONTROL**
 
 [Star this repository](https://github.com/omd-local/markdown-everything) ·
-[Open the demo](https://shionshine-omd-public-demo.hf.space) ·
 [Report a bug](https://github.com/omd-local/markdown-everything/issues) ·
 [MIT License](LICENSE)
 

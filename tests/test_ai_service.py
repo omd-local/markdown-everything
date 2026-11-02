@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -39,7 +39,7 @@ def test_cloud_execution_requires_fresh_per_task_consent_before_key_or_network_a
             credential_loader=lambda provider: calls.append("credential"),
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
         )
 
     assert excinfo.value.code == "consent_required"
@@ -67,7 +67,7 @@ def test_cloud_checkbox_without_matching_preview_grant_does_not_send():
             credential_loader=lambda provider: calls.append("credential"),
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
             now=lambda: 100.0,
         )
 
@@ -96,7 +96,7 @@ def test_cloud_preview_grant_expires_before_credentials_are_loaded():
     grant = create_text_task_consent(
         task,
         source_text=source,
-        as_of=date(2026, 7, 19),
+        as_of=date(2026, 11, 2),
         now=lambda: 100.0,
         ttl_seconds=30,
     )
@@ -110,7 +110,7 @@ def test_cloud_preview_grant_expires_before_credentials_are_loaded():
             credential_loader=lambda provider: calls.append("credential"),
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
             now=lambda: 131.0,
         )
 
@@ -127,8 +127,8 @@ def test_cloud_preview_grant_is_bound_to_exact_source_and_model():
     )
 
     task = AITextTask(
-        provider="deepseek",
-        model="deepseek-selected",
+        provider="anthropic",
+        model="claude-selected",
         capability="note_organisation",
         operation="Organise this note",
         system_prompt="Keep source claims unchanged.",
@@ -137,7 +137,7 @@ def test_cloud_preview_grant_is_bound_to_exact_source_and_model():
     grant = create_text_task_consent(
         task,
         source_text="Original source",
-        as_of=date(2026, 7, 19),
+        as_of=date(2026, 11, 2),
         now=lambda: 100.0,
     )
 
@@ -150,7 +150,7 @@ def test_cloud_preview_grant_is_bound_to_exact_source_and_model():
             credential_loader=lambda provider: "sk-secret",
             model_validator=lambda provider, model, **kwargs: _availability(provider, model),
             requester=lambda request: None,
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
             now=lambda: 101.0,
         )
 
@@ -179,7 +179,7 @@ def test_cancelled_task_stops_before_credentials_or_network_access():
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
             is_cancelled=lambda: True,
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
         )
 
     assert excinfo.value.code == "cancelled"
@@ -207,7 +207,7 @@ def test_oversized_context_is_rejected_before_credentials_or_network_access():
             credential_loader=lambda provider: calls.append("credential"),
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
         )
 
     assert excinfo.value.code == "context_limit_exceeded"
@@ -304,7 +304,7 @@ def test_stale_cloud_disclosure_blocks_request_before_credential_access():
             credential_loader=lambda provider: calls.append("credential"),
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
-            as_of=date(2027, 1, 19),
+            as_of=date(2026, 11, 2) + timedelta(days=91),
         )
 
     assert excinfo.value.code == "disclosure_unavailable"
@@ -321,7 +321,7 @@ def test_unavailable_selected_model_is_not_replaced_or_sent():
 
     requested = []
     task = AITextTask(
-        provider="deepseek",
+        provider="anthropic",
         model="requested-model",
         capability="memory_cards",
         operation="Create memory cards",
@@ -333,7 +333,7 @@ def test_unavailable_selected_model_is_not_replaced_or_sent():
     grant = create_text_task_consent(
         task,
         source_text=source,
-        as_of=date(2026, 7, 19),
+        as_of=date(2026, 11, 2),
         now=lambda: 100.0,
     )
 
@@ -348,7 +348,7 @@ def test_unavailable_selected_model_is_not_replaced_or_sent():
                 provider, model, available=False
             ),
             requester=lambda request: requested.append(request),
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
             now=lambda: 101.0,
         )
 
@@ -385,7 +385,7 @@ def test_cloud_result_exposes_usage_and_destination_but_not_secret():
     grant = create_text_task_consent(
         task,
         source_text=source,
-        as_of=date(2026, 7, 19),
+        as_of=date(2026, 11, 2),
         now=lambda: 100.0,
     )
     result = execute_text_task(
@@ -396,7 +396,7 @@ def test_cloud_result_exposes_usage_and_destination_but_not_secret():
         credential_loader=lambda provider: secret,
         model_validator=lambda provider, model, **kwargs: _availability(provider, model),
         requester=requester,
-        as_of=date(2026, 7, 19),
+        as_of=date(2026, 11, 2),
         now=lambda: 101.0,
     )
 
@@ -453,20 +453,20 @@ def test_prepare_preview_never_retains_source_text():
 
     source = "This private text must not be retained."
     task = AITextTask(
-        provider="deepseek",
-        model="deepseek-selected",
+        provider="anthropic",
+        model="claude-selected",
         capability="note_organisation",
         operation="Organise note",
         system_prompt="Keep claims exact.",
         max_output_tokens=128,
     )
 
-    preview = prepare_text_task(task, source_text=source, as_of=date(2026, 7, 19))
+    preview = prepare_text_task(task, source_text=source, as_of=date(2026, 11, 2))
 
     assert preview.character_count == len(source)
     assert source not in repr(preview)
     assert "source_text" not in preview.__dict__
-    assert preview.destination_domain == "api.deepseek.com"
+    assert preview.destination_domain == "api.anthropic.com"
 
 
 def test_unsupported_capability_fails_before_credential_or_network_access():
@@ -490,7 +490,7 @@ def test_unsupported_capability_fails_before_credential_or_network_access():
             credential_loader=lambda provider: calls.append("credential"),
             model_validator=lambda *args, **kwargs: calls.append("model"),
             requester=lambda request: calls.append("request"),
-            as_of=date(2026, 7, 19),
+            as_of=date(2026, 11, 2),
         )
 
     assert excinfo.value.code == "unsupported_capability"
@@ -638,3 +638,82 @@ def test_remote_ollama_preview_rejects_non_base_url():
 
     with pytest.raises(ValueError, match="base URL"):
         prepare_text_task(task, source_text="Private note")
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "deepseek"])
+@pytest.mark.parametrize("state", ["expired", "missing", "unverified"])
+def test_disclosure_failure_has_same_contract_before_all_external_work(monkeypatch, provider, state):
+    from dataclasses import replace
+
+    from omd import ai_service, provider_disclosure
+    from omd.ai_service import AIServiceError, AITextTask, execute_text_task, prepare_text_task
+    from omd.provider_disclosure import ProviderDisclosureUnavailableError
+
+    task = AITextTask(
+        provider=provider, model="selected-model", capability="note_organisation",
+        operation="Organise note", system_prompt="Preserve claims.", max_output_tokens=128,
+    )
+    as_of = date(2026, 11, 2)
+    if state == "expired":
+        as_of += timedelta(days=91)
+    elif state == "missing":
+        monkeypatch.delitem(provider_disclosure._DISCLOSURES, provider)
+    else:
+        monkeypatch.setitem(provider_disclosure._DISCLOSURES, provider, replace(
+            provider_disclosure._DISCLOSURES[provider], verified=False
+        ))
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append("external work")
+        pytest.fail("disclosure must block credentials, model validation, and provider requests")
+
+    for name in ("load_api_key", "validate_selected_model", "request_text"):
+        monkeypatch.setattr(ai_service, name, forbidden)
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    source = "Vault evidence canary never sent"
+    with pytest.raises(ProviderDisclosureUnavailableError) as prepared:
+        prepare_text_task(task, source_text=source, as_of=as_of)
+    with pytest.raises(AIServiceError) as executed:
+        execute_text_task(
+            task, source_text=source, consent_granted=True, as_of=as_of,
+            credential_loader=forbidden, model_validator=forbidden, requester=forbidden,
+        )
+    expected = {"provider": provider, "code": "disclosure_unavailable"}
+    assert prepared.value.to_dict() == executed.value.to_dict() == expected
+    assert isinstance(executed.value.__cause__, ProviderDisclosureUnavailableError)
+    assert calls == []
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_prepared_consent_does_not_bypass_newly_expired_disclosure(provider):
+    from omd.ai_service import AIServiceError, AITextTask, create_text_task_consent, execute_text_task
+
+    task = AITextTask(
+        provider=provider, model="selected-model", capability="note_organisation",
+        operation="Organise note", system_prompt="Preserve claims.", max_output_tokens=128,
+    )
+    source = "Synthetic fixture only"
+    grant = create_text_task_consent(
+        task, source_text=source, as_of=date(2026, 11, 2), now=lambda: 100.0,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("expired review reached external work")
+
+    with pytest.raises(AIServiceError) as error:
+        execute_text_task(
+            task, source_text=source, consent_granted=True, consent_grant=grant,
+            as_of=date(2026, 11, 2) + timedelta(days=91), now=lambda: 101.0,
+            credential_loader=forbidden, model_validator=forbidden, requester=forbidden,
+        )
+    assert error.value.to_dict() == {"provider": provider, "code": "disclosure_unavailable"}
+
+
+def test_service_error_payload_excludes_secrets_evidence_and_http_body():
+    from omd.ai_service import AIServiceError
+
+    private = "sk-secret Vault evidence HTTP response body"
+    error = AIServiceError("openai", "disclosure_unavailable", private)
+    error.__cause__ = RuntimeError(private)
+    assert error.to_dict() == {"provider": "openai", "code": "disclosure_unavailable"}

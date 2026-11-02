@@ -2382,10 +2382,13 @@ def main(argv: list[str] | None = None) -> int:
   omd enrich-note NOTE --vault VAULT  Return a read-only local-AI proposal.
 
 Browser UI:
-  omd-ui --help                       Show UI launch and port options.""",
+  omd-ui --help                       Explain browser UI availability in this core release.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
     )
+    from omd import __version__
+
+    p.add_argument("--version", action="version", version=f"omd {__version__}")
     p.add_argument("input", help="URL, file path, or directory")
     p.add_argument("-o", "--output", help="Output .md/.Rmd path (or dir for batch)")
     p.add_argument("--format", dest="output_format", choices=sorted(OUTPUT_FORMATS), default=None,

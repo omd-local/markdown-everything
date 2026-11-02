@@ -78,3 +78,6 @@ credentials.json
 *.p12
 *.pfx
 *.mobileprovision
+
+# Generated package provenance
+omd/_build_info.py

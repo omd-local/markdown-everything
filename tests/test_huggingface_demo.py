@@ -6,12 +6,16 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPACE_DIR = REPO_ROOT / "demo" / "huggingface-space"
 
 
 def load_upload_module():
+    if importlib.util.find_spec("huggingface_hub") is None:
+        pytest.skip("Deferred demo upload dependency is not installed: huggingface_hub")
     spec = importlib.util.spec_from_file_location(
         "omd_hf_upload_existing", SPACE_DIR / "upload_existing.py"
     )

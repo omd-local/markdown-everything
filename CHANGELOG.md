@@ -3,6 +3,42 @@
 All notable changes are documented here. Version numbers follow Semantic
 Versioning and Python's beta-version convention.
 
+## 0.3.0b4 - 2026-11-02
+
+### Fixed
+
+- Re-reviewed Hosted AI disclosures individually against official policies on
+  2026-11-02. OpenAI and Anthropic previews are available with current handling
+  summaries; DeepSeek remains unavailable because the reviewed sources do not
+  verify applicable downstream API retention.
+- Expose stable `disclosure_unavailable` metadata from preparation and execution
+  while preserving existing exception types. Missing, expired, or unverified
+  disclosures stop before credentials, model validation, or provider requests.
+
+### Added
+
+- Add versioned, local-only Hosted AI disclosure readiness to capabilities,
+  alongside package, protocol, and persistent release-commit identity.
+- Check review deadlines before release tagging and in weekly CI, failing
+  14 days before the inclusive 90-day validity window ends.
+- Cover disclosure boundaries, safe errors, and offline preparation with
+  deterministic regression tests. See the
+  [maintenance guide](docs/provider-disclosure-maintenance.md) for policy evidence.
+
+### Compatibility
+
+- This release ships the core backend for OMD Home, the CLI, and MCP, including
+  common document conversion in Homebrew. Browser UI dependencies are excluded
+  while the Pillow version required by the security audit is incompatible with
+  Gradio's dependency constraints. Browser UI support will return in a later
+  release after compatibility and security checks pass.
+- `omd-ui` remains a diagnostic command: `--help` succeeds and a launch exits
+  with status 2 explaining that the browser UI is deferred. The `ui` extra is
+  unavailable, and `all` now includes conversion extras without the browser UI.
+- Protocol v1 remains compatible through additive capability fields. OMD Home
+  still needs separate readiness preflight and a clear "Nothing was sent" error.
+  Capture and local AI behavior are unchanged by this release.
+
 ## 0.3.0b3 - 2026-09-15
 
 ### Added

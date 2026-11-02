@@ -11,3 +11,13 @@ def test_package_version_matches_project_metadata():
 
     assert match is not None
     assert __version__ == match.group(1)
+
+
+def test_cli_reports_package_version_without_input(capsys):
+    import pytest
+    from omd.cli import main
+
+    with pytest.raises(SystemExit) as result:
+        main(["--version"])
+    assert result.value.code == 0
+    assert capsys.readouterr().out == f"omd {__version__}\n"
