@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from omd import doctor
 
 
@@ -43,6 +45,18 @@ def test_capability_status_reports_missing_required_tools():
     assert by_name["rmarkdown"].ok is True
     assert by_name["douyin"].ok is False
     assert by_name["douyin"].missing_required == ["f2"]
+
+
+@pytest.mark.parametrize("gradio_installed", [False, True])
+def test_doctor_reports_deferred_ui_even_with_leftover_gradio(gradio_installed):
+    checks = [doctor.Check("gradio", gradio_installed, "python", "fixture", "legacy UI")]
+    ui = next(item for item in doctor.capability_status(checks) if item.name == "ui")
+
+    assert ui.ok is False
+    assert ui.required == ui.missing_required == []
+    assert "deferred" in ui.detail
+    assert "deferred ui" in doctor.render_text(checks)
+    assert all(name != "gradio" for name, _ in doctor.PYTHON_PACKAGES)
 
 
 def test_readiness_for_preflight_marks_missing_tools():

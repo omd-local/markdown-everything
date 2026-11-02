@@ -22,15 +22,25 @@ def _stable_public_dns(monkeypatch):
     )
 
 
+def require_optional_ui_module(name):
+    if importlib.util.find_spec(name) is None:
+        pytest.skip(f"Deferred browser UI dependency is not installed: {name}")
+    # An installed but broken dependency must still fail its historical tests.
+    return importlib.import_module(name)
+
+
+@pytest.fixture
+def gradio_runtime():
+    return require_optional_ui_module("gradio")
+
+
 def build_gradio_config_or_skip():
-    try:
-        import gradio  # noqa: F401
-    except (ImportError, OSError) as exc:
-        pytest.skip(f"Gradio UI dependencies unavailable: {exc}")
+    require_optional_ui_module("gradio")
     return ui.build_app().get_config_file()
 
 
 def load_hf_smoke_module():
+    require_optional_ui_module("gradio_client")
     smoke_path = Path(__file__).resolve().parents[1] / "demo" / "huggingface-space" / "smoke.py"
     spec = importlib.util.spec_from_file_location("omd_hf_smoke", smoke_path)
     assert spec and spec.loader
@@ -483,6 +493,7 @@ def test_vault_folder_keeps_long_paths_horizontally_scrollable(tmp_path, monkeyp
     assert vault_folder["props"]["elem_id"] == "omd-vault-folder"
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_source_file_add_button_has_a_readable_accessible_name():
     kwargs = ui.build_launch_kwargs()
 
@@ -498,7 +509,7 @@ def test_ui_help_does_not_build_or_launch_app(monkeypatch, capsys):
     )
 
     with pytest.raises(SystemExit) as exc:
-        ui.main(["--help"])
+        ui._browser_main(["--help"])
 
     assert exc.value.code == 0
     captured = capsys.readouterr()
@@ -508,6 +519,7 @@ def test_ui_help_does_not_build_or_launch_app(monkeypatch, capsys):
     assert captured.err == ""
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_ui_main_forwards_requested_port(monkeypatch):
     launched = {}
 
@@ -520,10 +532,11 @@ def test_ui_main_forwards_requested_port(monkeypatch):
 
     monkeypatch.setattr(ui, "build_app", FakeApp)
 
-    assert ui.main(["--port", "8123"]) == 0
+    assert ui._browser_main(["--port", "8123"]) == 0
     assert launched["server_port"] == 8123
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_ui_main_preserves_environment_port_override(monkeypatch):
     launched = {}
 
@@ -537,10 +550,11 @@ def test_ui_main_preserves_environment_port_override(monkeypatch):
     monkeypatch.setenv("OMD_UI_PORT", "8124")
     monkeypatch.setattr(ui, "build_app", FakeApp)
 
-    assert ui.main([]) == 0
+    assert ui._browser_main([]) == 0
     assert launched["server_port"] == 8124
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_ui_port_conflict_is_actionable_without_traceback(monkeypatch, capsys):
     class FakeApp:
         def queue(self):
@@ -551,7 +565,7 @@ def test_ui_port_conflict_is_actionable_without_traceback(monkeypatch, capsys):
 
     monkeypatch.setattr(ui, "build_app", FakeApp)
 
-    assert ui.main(["--port", "7860"]) == 1
+    assert ui._browser_main(["--port", "7860"]) == 1
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -562,6 +576,7 @@ def test_ui_port_conflict_is_actionable_without_traceback(monkeypatch, capsys):
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_ui_invalid_host_configuration_is_actionable_without_traceback(monkeypatch, capsys):
     class FakeApp:
         def queue(self):
@@ -571,7 +586,7 @@ def test_ui_invalid_host_configuration_is_actionable_without_traceback(monkeypat
     monkeypatch.setenv("OMD_UI_HOST", "0.0.0.0")
     monkeypatch.delenv("OMD_PUBLIC_DEMO", raising=False)
 
-    assert ui.main([]) == 1
+    assert ui._browser_main([]) == 1
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -581,6 +596,7 @@ def test_ui_invalid_host_configuration_is_actionable_without_traceback(monkeypat
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_local_ui_rejects_non_loopback_bind_address(monkeypatch):
     monkeypatch.delenv("OMD_PUBLIC_DEMO", raising=False)
 
@@ -588,6 +604,7 @@ def test_local_ui_rejects_non_loopback_bind_address(monkeypatch):
         ui.build_launch_kwargs(server_name="0.0.0.0")
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_local_ui_accepts_ipv6_loopback_bind_address(monkeypatch):
     monkeypatch.delenv("OMD_PUBLIC_DEMO", raising=False)
 
@@ -596,6 +613,7 @@ def test_local_ui_accepts_ipv6_loopback_bind_address(monkeypatch):
     assert kwargs["server_name"] == "::1"
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_public_demo_allows_non_loopback_bind_address(monkeypatch):
     monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
 
@@ -750,6 +768,7 @@ def test_top_menu_tabs_are_clickable_view_controls():
         assert label in labels
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_top_menu_view_updates_collapse_instead_of_hiding_panels():
     def open_flags(updates):
         return [update["open"] for update in updates[:7]]
@@ -827,6 +846,7 @@ def test_inbox_review_selection_loads_raw_source_and_provenance(tmp_path):
     assert raw_source == "Exact quoted source text."
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_switching_inbox_items_clears_item_specific_unsaved_context():
     (
         consent,
@@ -995,6 +1015,7 @@ def test_selected_vault_markdown_source_is_read_only_and_previewed(tmp_path):
     assert source.read_bytes() == before
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_inbox_final_action_returns_visible_success_and_failure_status(tmp_path):
     from omd.inbox import InboxItem
     from omd.inbox_workflow import save_inbox_item
@@ -1023,6 +1044,7 @@ def test_inbox_final_action_returns_visible_success_and_failure_status(tmp_path)
     assert "No vault files were changed" in failure
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_inbox_final_actions_confirm_ai_link_and_safe_not_needed_state(tmp_path):
     from omd.inbox import InboxItem
     from omd.inbox_workflow import save_inbox_item
@@ -1086,6 +1108,7 @@ def test_inbox_final_actions_confirm_ai_link_and_safe_not_needed_state(tmp_path)
         assert path.read_bytes() == before
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_inbox_final_actions_do_not_replay_or_reverse_completed_decisions(tmp_path):
     from omd.inbox import InboxItem
     from omd.inbox_workflow import save_inbox_item
@@ -1145,6 +1168,7 @@ def test_inbox_final_actions_do_not_replay_or_reverse_completed_decisions(tmp_pa
     ).read_text(encoding="utf-8")
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_local_ai_hides_cloud_review_controls():
     updates = ui._ai_provider_ui_updates("Local Ollama", "qwen3:4b-instruct")
 
@@ -1155,6 +1179,7 @@ def test_local_ai_hides_cloud_review_controls():
     assert ai_panel["visible"] is True
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_no_ai_hides_the_complete_inbox_ai_panel():
     updates = ui._ai_provider_ui_updates("No AI", "qwen3:4b-instruct")
 
@@ -1533,6 +1558,7 @@ def test_cloud_request_preview_for_ui_creates_source_bound_unchecked_grant(tmp_p
     assert consent is False
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_provider_connection_check_does_not_replace_unavailable_model(monkeypatch):
     from omd.provider_models import ProviderModelCatalog
 
@@ -1888,6 +1914,7 @@ def test_public_demo_exposes_only_the_bounded_conversion_api(monkeypatch):
     )
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_public_demo_rejects_direct_inbox_writes(tmp_path, monkeypatch):
     monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
 
@@ -3954,6 +3981,7 @@ def test_context_run_secures_local_file_before_processing(tmp_path, monkeypatch)
     assert context_run.receipts[0].state == "processing"
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_run_with_status_keeps_batch_receipt_outcomes_independent(tmp_path, monkeypatch):
     target = tmp_path / "partial.md"
     target.write_text("# Partial\n", encoding="utf-8")
@@ -3995,6 +4023,7 @@ def test_run_with_status_keeps_batch_receipt_outcomes_independent(tmp_path, monk
     assert [receipt.state for receipt in receipts] == ["complete", "needs_action"]
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_interrupted_batch_does_not_claim_unprocessed_item_has_partial_output(
     tmp_path, monkeypatch
 ):
@@ -4157,6 +4186,7 @@ def test_context_run_cancel_preserves_item_with_partial_output(tmp_path, monkeyp
     assert context_run.receipts[0].state == "partial_output"
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_run_with_status_exposes_and_completes_context_receipt(tmp_path, monkeypatch):
     target = tmp_path / "complete.md"
     target.write_text("# Complete\n", encoding="utf-8")
@@ -4199,6 +4229,7 @@ def test_public_demo_does_not_persist_local_context_receipts(tmp_path, monkeypat
     assert not (tmp_path / "omd-data").exists()
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_closing_running_ui_generator_cancels_context_receipt(tmp_path, monkeypatch):
     target = tmp_path / "pending.md"
     monkeypatch.setattr(ui, "OMD_DATA_DIR", tmp_path / "omd-data")
@@ -4227,6 +4258,7 @@ def test_closing_running_ui_generator_cancels_context_receipt(tmp_path, monkeypa
     assert [receipt.state for receipt in receipts] == ["cancelled"]
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_save_voice_attachment_uses_filename_when_title_is_blank(tmp_path):
     source = tmp_path / "walking-note.m4a"
     source.write_bytes(b"audio")
@@ -4406,6 +4438,7 @@ def test_huggingface_smoke_api_args_omit_gradio_state_inputs(monkeypatch):
     assert args[-2:] == ["OP only", ""]
 
 
+@pytest.mark.usefixtures("gradio_runtime")
 def test_public_demo_launch_caps_upload_before_conversion(monkeypatch):
     monkeypatch.setenv("OMD_PUBLIC_DEMO", "1")
     monkeypatch.setenv("OMD_PUBLIC_DEMO_MAX_UPLOAD_MB", "25")

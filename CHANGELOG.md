@@ -27,6 +27,14 @@ Versioning and Python's beta-version convention.
 
 ### Compatibility
 
+- This release ships the core backend for OMD Home, the CLI, and MCP, including
+  common document conversion in Homebrew. Browser UI dependencies are excluded
+  while the Pillow version required by the security audit is incompatible with
+  Gradio's dependency constraints. Browser UI support will return in a later
+  release after compatibility and security checks pass.
+- `omd-ui` remains a diagnostic command: `--help` succeeds and a launch exits
+  with status 2 explaining that the browser UI is deferred. The `ui` extra is
+  unavailable, and `all` now includes conversion extras without the browser UI.
 - Protocol v1 remains compatible through additive capability fields. OMD Home
   still needs separate readiness preflight and a clear "Nothing was sent" error.
   Capture and local AI behavior are unchanged by this release.

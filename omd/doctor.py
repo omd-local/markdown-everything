@@ -49,7 +49,7 @@ CAPABILITY_REQUIREMENTS: list[tuple[str, list[str], list[str], str]] = [
     ("audio_video_transcription", ["ffmpeg", "mlx_whisper"], ["ffprobe"], "Audio/video transcription"),
     ("douyin", ["f2", "ffmpeg", "mlx_whisper"], [], "Douyin downloads and transcription"),
     ("xhs", ["tesseract", "ffmpeg", "mlx_whisper"], [], "Xiaohongshu image OCR and video transcription"),
-    ("ui", ["gradio"], [], "Gradio UI"),
+    ("ui", [], [], "Browser UI deferred pending compatible security updates; use OMD Home or the CLI"),
     ("polish", ["ollama"], [], "Local Ollama polish"),
     ("mcp", [], [], "MCP stdio server"),
 ]
@@ -57,7 +57,6 @@ CAPABILITY_REQUIREMENTS: list[tuple[str, list[str], list[str], str]] = [
 PYTHON_PACKAGES = [
     ("markitdown", "document/web/data conversion"),
     ("pip_audit", "dependency audit"),
-    ("gradio", "omd-ui"),
 ]
 
 
@@ -141,7 +140,7 @@ def capability_status(checks: list[Check]) -> list[Capability]:
         capabilities.append(
             Capability(
                 name=name,
-                ok=not missing_required,
+                ok=name != "ui" and not missing_required,
                 required=list(required),
                 optional=list(optional),
                 missing_required=missing_required,
@@ -214,6 +213,9 @@ def render_text(checks: list[Check]) -> str:
     )
     lines.extend(["", "Capabilities"])
     for capability in capability_status(checks):
+        if capability.name == "ui":
+            lines.append(f"- deferred {capability.name:26} {capability.detail}")
+            continue
         mark = "ready" if capability.ok else "missing"
         missing_required = ", ".join(capability.missing_required) or "none"
         lines.append(f"- {mark:7} {capability.name:26} missing required: {missing_required}")

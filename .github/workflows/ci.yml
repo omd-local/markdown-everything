@@ -44,7 +44,7 @@ jobs:
       - name: Install test environment
         run: |
           python -m pip install --upgrade "pip==26.2.1" setuptools wheel
-          python -m pip install -e ".[ui,test]"
+          python -m pip install -e ".[test]"
           python -m pip check
       - name: Run tests
         run: python -m pytest -q
@@ -70,6 +70,10 @@ jobs:
           python -m venv "$RUNNER_TEMP/omd-wheel"
           "$RUNNER_TEMP/omd-wheel/bin/python" -m pip install --upgrade "pip==26.2.1"
           "$RUNNER_TEMP/omd-wheel/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/omd-wheel/bin/omd" --version
+          "$RUNNER_TEMP/omd-wheel/bin/omd" capabilities --json
+          env -u OMD_BUILD_REVISION "$RUNNER_TEMP/omd-wheel/bin/python" -I -c 'import importlib.util; from omd.capabilities import capabilities_payload; p = capabilities_payload(); assert p["build_revision"] == __import__("os").environ["GITHUB_SHA"]; assert p["browser_ui"]["supported"] is False; assert importlib.util.find_spec("gradio") is None'
+          "$RUNNER_TEMP/omd-wheel/bin/omd-ui" --help
           "$RUNNER_TEMP/omd-wheel/bin/omd" --help >/dev/null
           "$RUNNER_TEMP/omd-wheel/bin/omd-mcp" </dev/null
 
@@ -83,11 +87,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Audit resolved local UI environment
+      - name: Audit core and Homebrew conversion dependencies
         run: |
           python -m pip install --upgrade "pip==26.2.1" setuptools wheel
-          python -m pip install -e ".[ui,audit]"
+          python -m pip install -e ".[audit]" "markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.6,<0.2" "pillow>=13.0.0,<14"
+          python -c 'import importlib.util; assert importlib.util.find_spec("gradio") is None'
           python -m pip check
           python -m pip_audit --local --progress-spinner off
-      - name: Audit hosted demo requirements
-        run: python -m pip_audit -r demo/huggingface-space/requirements.txt --progress-spinner off

@@ -1,42 +1,73 @@
-# Homebrew tap setup
+# Homebrew core backend release
 
-Goal: end user installs `omd` with a single line:
+Install the backend used by OMD Home, the CLI, and MCP:
 
 ```bash
 brew install omd-local/omd/omd
 ```
 
-The installable formula lives in the separate public `homebrew-omd` repository
-(Homebrew's naming convention for taps). The copy in this directory is the
-release template; keep it aligned with the published tap after every release.
-
-## One-time release flow
-
-### 1. Build and publish a release asset
+For an existing installation:
 
 ```bash
-# from the omd repo root
-VERSION=0.3.0b3
-git add -A
-git commit -m "release: v${VERSION}"
-git tag -a "v${VERSION}" -m "OMD ${VERSION}"
-git push origin main "refs/tags/v${VERSION}"
-python -m build --sdist
-gh release create "v${VERSION}" "dist/omd-${VERSION}.tar.gz" \
-  --prerelease --verify-tag --title "OMD ${VERSION}"
+brew update
+brew upgrade omd-local/omd/omd
+omd capabilities --json
+```
+
+Set OMD Home's executable path to the result of
+`echo "$(brew --prefix omd-local/omd/omd)/bin/omd"`. Verify capabilities report
+package `0.3.0b4`, protocol `1`, and an `enrich_note` schema version of `1`.
+Refresh Home's backend check after upgrading. Home's readiness preflight and
+"Nothing was sent" error display require a separate client update.
+
+The `0.3.0b4` formula installs common PDF/Office/Web conversion dependencies,
+`yt-dlp`, FFmpeg, Tesseract, and Python 3.12. PDF conversion uses Pillow 13.
+It excludes Gradio and the browser UI while the UI dependency constraints
+conflict with the Pillow version required by the security audit. `omd-ui --help`
+explains the change; launching `omd-ui` exits with status 2 without starting a
+server. OMD Home does not require Gradio or the browser UI.
+
+Local transcription remains optional because the MLX model stack is large and
+Apple-Silicon-specific. The dependency-free core still supports Python 3.10;
+optional document converters require Python 3.11 or newer for Pillow 13.
+
+The installable formula lives in the separate public
+`omd-local/homebrew-omd` repository. This directory contains its release
+template; keep both copies aligned after every release.
+
+## Publish an immutable release asset
+
+Complete the release checks, dependency audit, and review first. Commit only
+release files with a Lore decision record. Do not recreate an existing version
+tag with different contents or include unrelated working changes.
+
+From a clean checkout of the reviewed release commit:
+
+```bash
+VERSION=0.3.0b4
+python -m omd.provider_disclosure
+python -m pytest -q
+python -m compileall -q omd tests
+python -m build --sdist --wheel
+```
+
+Verify the installed wheel's capabilities with `OMD_BUILD_REVISION` unset: its
+`build_revision` must be the 40-character release commit SHA. The source archive
+must preserve that identity when installed outside a Git checkout.
+
+After verification, tag the same commit and upload its artifacts:
+
+```bash
+git tag -a "v${VERSION}" -m "OMD ${VERSION} core backend"
+git push origin "refs/tags/v${VERSION}"
+gh release create "v${VERSION}" "dist/omd-${VERSION}.tar.gz" dist/*.whl \
+  --prerelease --verify-tag --title "OMD ${VERSION} core backend" \
+  --notes-file release-notes.md
 ```
 
 The formula uses the uploaded source distribution rather than GitHub's
-auto-generated repository archive:
-
-```
-https://github.com/omd-local/markdown-everything/releases/download/v${VERSION}/omd-${VERSION}.tar.gz
-```
-
-Do not recreate an existing version tag with different contents. Publish a new
-version so downstream checksums remain stable.
-
-### 2. Compute its sha256
+repository archive. Download it and confirm its SHA-256 matches the local
+artifact:
 
 ```bash
 shasum -a 256 "dist/omd-${VERSION}.tar.gz"
@@ -45,66 +76,13 @@ curl -fL "https://github.com/omd-local/markdown-everything/releases/download/v${
 shasum -a 256 "/tmp/omd-${VERSION}.tar.gz"
 ```
 
-The local and public-download digests must match. Copy that digest into the
-formula.
+Only then update the `url` and `sha256` fields in `packaging/homebrew/omd.rb`.
+Homebrew derives the version from the `omd-X.Y.Z.tar.gz` filename. Copy the same
+formula into `Formula/omd.rb` in `omd-local/homebrew-omd`.
 
-### 3. Clone the project tap
+## Verify and publish the tap
 
-The tap lives at `omd-local/homebrew-omd`. The repository name MUST remain
-`homebrew-omd` because Homebrew strips the `homebrew-` prefix and uses the rest
-as the tap name.
-
-```bash
-# locally — adjust the parent path as needed
-cd ~/code
-gh repo clone omd-local/homebrew-omd
-cd homebrew-omd
-mkdir -p Formula
-cp /path/to/omd/packaging/homebrew/omd.rb Formula/omd.rb
-```
-
-### 4. Patch sha256 + url in Formula/omd.rb
-
-Update the `url` and `sha256` fields with the new release asset and digest.
-Homebrew derives the version from the `omd-X.Y.Z.tar.gz` filename.
-
-### 5. Push the tap
-
-```bash
-git add Formula/omd.rb
-git commit -m "omd ${VERSION}"
-git push origin main
-```
-
-### 6. Verify install
-
-On any Mac:
-
-```bash
-brew tap omd-local/omd
-brew install omd
-omd --help
-omd-mcp < /dev/null    # exits 0
-brew test omd
-brew audit --strict omd-local/omd/omd
-```
-
-Or one-shot (no separate tap step):
-
-```bash
-brew install omd-local/omd/omd
-```
-
-The `v0.3.0b2` public beta includes `omd-ui`, and the formula treats that command
-as part of the published contract: installation and `brew test` fail if the UI
-or its dependencies are missing. The formula also installs the dependencies for
-common PDF/Office/Web conversion. It deliberately leaves `mlx-whisper` out of
-the default install because that large stack is Apple-Silicon-specific; OMD
-detects it as an optional runtime capability. The base formula still installs
-`yt-dlp` for supported public media downloads.
-
-Before publishing a formula change, verify a source reinstall, not only an
-already-populated development environment:
+Verify a fresh source installation, not only an existing development environment:
 
 ```bash
 brew reinstall --build-from-source omd-local/omd/omd
@@ -112,35 +90,33 @@ brew test omd-local/omd/omd
 brew audit --strict omd-local/omd/omd
 ```
 
-Also convert one generated or non-sensitive PDF and confirm the Markdown text.
-The formula uses `preserve_rpath` because several Python extension wheels carry
-valid short `@rpath` IDs; expanding those IDs to long Cellar paths can exceed
-their Mach-O load-command headers.
+`brew test` checks the package version, protocol v1, enrich-note schema v1,
+persistent release identity, disclosure schema v1, MCP shutdown, and local HTML
+and PDF conversion. It also checks that Gradio is absent, Pillow is version 13,
+and `omd-ui` explains its unavailability. No Hosted AI answer request or Vault
+content is involved.
 
-## Subsequent releases
+Run the dependency audit against a fresh environment with the exact runtime
+packages from the formula, including common document extras and the Pillow
+security floor. Deferring the UI does not exempt conversion dependencies from
+auditing.
 
-For each new version:
+After verification, commit the formula in each repository using a Lore decision
+record and push the tap's reviewed commit. Users receive it with:
 
-1. Bump version in `pyproject.toml`, commit, tag `vX.Y.Z` (or `vX.Y.ZbN` for a
-   beta), build the sdist, and upload it to the matching GitHub release.
-2. Download the public release asset and confirm its SHA-256 matches the local
-   sdist.
-3. In the `homebrew-omd` repo, edit `Formula/omd.rb` — bump `url` and
-   `sha256`. Commit. Push.
-4. Users update via `brew update && brew upgrade omd`.
+```bash
+brew update
+brew upgrade omd-local/omd/omd
+```
 
-## Why a separate repo
+The formula uses `preserve_rpath` because some document conversion wheels carry
+valid short `@rpath` IDs; expanding them to long Cellar paths can exceed their
+Mach-O load-command headers.
 
-Homebrew taps are a fixed convention: `<user>/homebrew-<name>` becomes
-`brew install <user>/<name>/<formula>`. The formula file lives there, not
-in the project repo. This `packaging/homebrew/omd.rb` is the authoritative
-release template you sync into the tap on each release. The tap copy is the
-authoritative formula users install.
+## Restore the browser UI in a later release
 
-## Optional: GitHub Action to auto-bump the tap
-
-Add `.github/workflows/release.yml` in this repo to push an updated formula
-to `homebrew-omd` whenever a tag is cut. See
-<https://docs.brew.sh/Formula-Cookbook> "Updating the formula" — wire
-`mislav/bump-homebrew-formula-action` for one-shot setup. Skip until manual
-release flow gets annoying.
+Restore UI dependencies only after Gradio accepts a supported Pillow version
+that passes the dependency audit. Restore the real `omd-ui` entry point and its
+installation smoke test together. Publish a new version and checksum rather
+than replacing `0.3.0b4` assets. Audit the hosted demo separately before deploying
+any demo update; the core backend release does not update that service.

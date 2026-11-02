@@ -18,6 +18,9 @@ def test_capabilities_reports_enrich_note_v1_without_runtime_probe(monkeypatch):
     assert payload["enrich_note"] == {"supported": True, "schema_versions": [1]}
     assert payload["package_version"] == __version__
     assert payload["protocol_version"] == 1
+    assert payload["browser_ui"] == {
+        "supported": False, "reason": "dependency_security_update_pending",
+    }
     assert json.loads(capabilities_json(as_of=REVIEW_DATE)) == capabilities_payload(as_of=REVIEW_DATE)
     assert capabilities_json(as_of=REVIEW_DATE).endswith("\n")
 
@@ -47,9 +50,12 @@ def test_hosted_disclosure_capabilities_exact_contract_is_offline(monkeypatch):
     as_of = date(2026, 11, 2)
     payload = capabilities_payload(as_of=as_of)
     assert set(payload) == {
-        "package_version", "protocol_version", "build_revision", "enrich_note", "hosted_ai_disclosure",
+        "package_version", "protocol_version", "build_revision", "browser_ui", "enrich_note", "hosted_ai_disclosure",
     }
     assert payload["protocol_version"] == 1
+    assert payload["browser_ui"] == {
+        "supported": False, "reason": "dependency_security_update_pending",
+    }
     assert payload["hosted_ai_disclosure"] == {
         "schema_version": 1,
         "checked_on": "2026-11-02",

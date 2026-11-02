@@ -27,6 +27,7 @@ def capabilities_payload(*, as_of: date | None = None) -> dict[str, object]:
         "package_version": __version__,
         "protocol_version": PROTOCOL_VERSION,
         "build_revision": _build_revision(),
+        "browser_ui": {"supported": False, "reason": "dependency_security_update_pending"},
         "enrich_note": {"supported": True, "schema_versions": [1]},
         "hosted_ai_disclosure": disclosure_readiness(as_of=as_of),
     }

@@ -15,13 +15,13 @@ class Omd < Formula
   depends_on "tesseract-lang"
   depends_on "yt-dlp"
 
-  # Several UI/document wheels ship extension dylibs with valid @rpath IDs.
+  # Several document wheels ship extension dylibs with valid @rpath IDs.
   # Preserve those IDs instead of expanding them to long Cellar paths that do
   # not fit in the wheels' Mach-O load-command headers.
   preserve_rpath
 
   # Runtime packages install into an isolated virtualenv. Keep the default
-  # desktop install focused on the UI and common document formats; local
+  # Home backend install focused on common document formats; local
   # transcription remains an optional, machine-specific capability.
   def install
     venv = virtualenv_create(libexec, "python3.12")
@@ -32,10 +32,10 @@ class Omd < Formula
     venv.pip_install_and_link buildpath
 
     # Virtualenv#pip_install deliberately uses --no-deps. Runtime extras need
-    # normal pip resolution or commands install without Gradio/requests/etc.
+    # normal pip resolution or document converters install without dependencies.
     runtime_packages = [
-      "#{buildpath}[ui]",
       "markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.6,<0.2",
+      "pillow>=13.0.0,<14",
     ]
     python = formula_opt_bin("python@3.12")/"python3.12"
     system python, "-m", "pip", "--python=#{venv.root}/bin/python",
@@ -47,13 +47,18 @@ class Omd < Formula
 
   def caveats
     <<~EOS
-      OMD is installed as a local Markdown context inbox.
+      OMD's core backend is installed for OMD Home, the CLI, and MCP.
 
-      Start the local browser UI:
-          omd-ui
+      In OMD Home settings, set the OMD executable path to:
+          #{opt_bin}/omd
+
+      This release defers the browser UI until its Gradio/Pillow dependency
+      compatibility is resolved. omd-ui explains its unavailability; it does
+      not start a browser server. OMD Home does not require the browser UI.
 
       Verify the command-line and MCP entry points:
           omd --help
+          omd capabilities --json
           omd-mcp < /dev/null && echo OK
 
       Optional local Markdown polish:
@@ -75,9 +80,25 @@ class Omd < Formula
   test do
     assert_match "omd", shell_output("#{bin}/omd --help")
 
-    # Smoke the browser UI without opening a server.
+    # Check the installed Home protocol and persistent release identity without
+    # reading a vault, loading credentials, or contacting an AI provider.
+    capabilities = JSON.parse(shell_output("env -u OMD_BUILD_REVISION #{bin}/omd capabilities --json"))
+    assert_equal version.to_s, capabilities.fetch("package_version")
+    assert_equal 1, capabilities.fetch("protocol_version")
+    assert_equal true, capabilities.fetch("enrich_note").fetch("supported")
+    assert_equal [1], capabilities.fetch("enrich_note").fetch("schema_versions")
+    assert_match(/\A[0-9a-f]{40}\z/, capabilities.fetch("build_revision"))
+    disclosure = capabilities.fetch("hosted_ai_disclosure")
+    assert_equal 1, disclosure.fetch("schema_version")
+    assert_equal %w[anthropic deepseek openai], disclosure.fetch("providers").keys.sort
+
+    # Browser UI dependencies are deliberately absent from this core release.
     system libexec/"bin/python", "-c",
-           "import gradio; from omd.ui import build_app; assert build_app()"
+           "import importlib.util; assert importlib.util.find_spec('gradio') is None"
+    system libexec/"bin/python", "-c",
+           "from PIL import __version__; assert __version__.startswith('13.')"
+    assert_match "browser UI", shell_output("#{bin}/omd-ui --help")
+    assert_match "unavailable", shell_output("#{bin}/omd-ui 2>&1", 2)
 
     # Local HTML conversion exercises the resolved MarkItDown dependency.
     (testpath/"hi.html").write("<h1>hello</h1><p>world</p>")
