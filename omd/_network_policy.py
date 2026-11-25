@@ -1,6 +1,7 @@
 """Network trust-boundary checks for hosted and agent-facing entrypoints."""
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import os
 import socket
@@ -11,6 +12,8 @@ from urllib.parse import urlsplit
 
 PUBLIC_NETWORK_POLICY_ENV = "OMD_NETWORK_POLICY"
 PUBLIC_NETWORK_POLICY_VALUE = "public"
+# Bridge clients use this version to require connection-time loopback pinning.
+LOCAL_OLLAMA_TRANSPORT_VERSION = 1
 
 Resolver = Callable[..., list[tuple]]
 _SYSTEM_GETADDRINFO = socket.getaddrinfo
@@ -145,6 +148,98 @@ def build_no_redirect_opener():
     return urllib.request.build_opener(NoRedirectHandler())
 
 
+def _is_loopback_host(hostname: str) -> bool:
+    hostname = hostname.rstrip(".").lower()
+    try:
+        return ipaddress.ip_address(hostname.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return hostname == "localhost" or hostname.endswith(".localhost")
+
+
+def _is_loopback_socket_address(family: int, address: str) -> bool:
+    if family not in {socket.AF_INET, socket.AF_INET6}:
+        return False
+    try:
+        ip = ipaddress.ip_address(socket.inet_pton(family, address))
+    except OSError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def _create_loopback_connection(destination, timeout, source_address):
+    if public_network_policy_enabled():
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            "Hosted and agent-facing connections must resolve to the public internet.",
+        )
+
+    host, port = destination
+    answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not answers or any(
+        socktype != socket.SOCK_STREAM
+        or not sockaddr
+        or not _is_loopback_socket_address(family, sockaddr[0])
+        for family, socktype, _, _, sockaddr in answers
+    ):
+        raise socket.gaierror(socket.EAI_NONAME, "Local Ollama must resolve only to loopback addresses.")
+
+    last_error: OSError
+    for family, socktype, protocol, _, sockaddr in answers:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, protocol)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    raise last_error
+
+
+class _LoopbackConnectionMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Keep the original authority for HTTP Host and TLS hostname verification.
+        self._create_connection = _create_loopback_connection
+
+
+class _LoopbackHTTPConnection(_LoopbackConnectionMixin, http.client.HTTPConnection):
+    pass
+
+
+class _LoopbackHTTPSConnection(_LoopbackConnectionMixin, http.client.HTTPSConnection):
+    pass
+
+
+class _LoopbackHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(_LoopbackHTTPConnection, request)
+
+
+class _LoopbackHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(_LoopbackHTTPSConnection, request, context=self._context)
+
+
+def build_ollama_opener(endpoint: str):
+    """Use a loopback-only transport for local URLs and no redirects for any Ollama URL."""
+    if not _is_loopback_host(urlsplit(endpoint).hostname or ""):
+        return build_no_redirect_opener()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirectHandler(),
+        _LoopbackHTTPHandler(),
+        _LoopbackHTTPSHandler(),
+    )
+
+
 def build_public_network_opener(*, resolver: Resolver | None = None):
     return urllib.request.build_opener(
         _PublicOnlyHTTPHandler(resolver=resolver),
@@ -185,17 +280,13 @@ def validate_ollama_host(host: str, *, allow_remote: bool = False) -> None:
     if not raw:
         raise ValueError("Ollama host must not be empty.")
     parsed = urlsplit(raw if "://" in raw else f"//{raw}")
-    hostname = (parsed.hostname or "").rstrip(".").lower()
+    hostname = (parsed.hostname or "").rstrip(".")
     if not hostname or parsed.username is not None or parsed.password is not None:
         raise ValueError("Ollama host must be a URL without embedded credentials.")
-    try:
-        address = ipaddress.ip_address(hostname.split("%", 1)[0])
-    except ValueError:
-        address = None
-    is_loopback = hostname == "localhost" or hostname.endswith(".localhost")
-    if address is not None:
-        is_loopback = address.is_loopback
-    if is_loopback:
+    # Accessing port rejects non-numeric and out-of-range values before any request.
+    if parsed.port == 0 or parsed.netloc.endswith(":"):
+        raise ValueError("Ollama port must be between 1 and 65535.")
+    if _is_loopback_host(hostname):
         if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
             raise ValueError("Local Ollama host must use HTTP or HTTPS.")
         return

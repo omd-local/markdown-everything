@@ -16,6 +16,14 @@ from omd import cli
 from omd._models import GIB
 
 
+@pytest.fixture
+def ocr_packs_available(monkeypatch):
+    monkeypatch.setattr(
+        "omd._language.probe_tesseract_languages",
+        lambda *_args, **_kwargs: frozenset({"eng", "chi_sim", "chi_tra"}),
+    )
+
+
 def test_root_help_lists_discoverable_commands(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--help"])
@@ -27,25 +35,76 @@ def test_root_help_lists_discoverable_commands(capsys):
     assert "vault Sources tree" in captured.out
     assert "vault Inbox" not in captured.out
     assert "omd capabilities --json" in captured.out
+    assert "omd config show --json" in captured.out
     assert "omd enrich-note" in captured.out
     assert "omd-ui --help" in captured.out
     assert captured.err == ""
 
 
-def test_capabilities_command_emits_exact_machine_json(capsys, monkeypatch):
-    from datetime import date
-    from omd import capabilities
-    from omd.provider_disclosure import disclosure_readiness
+def test_capabilities_command_emits_exact_static_json(capsys):
+    from omd.capabilities import capabilities_payload
 
-    monkeypatch.setattr(
-        capabilities, "disclosure_readiness",
-        lambda **kwargs: disclosure_readiness(as_of=date(2026, 11, 2)),
-    )
     assert cli.main(["capabilities", "--json"]) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == capabilities.capabilities_json(as_of=date(2026, 11, 2))
+    assert json.loads(captured.out) == capabilities_payload()
     assert captured.err == ""
+
+
+def test_cli_version_is_stable_for_release_smoke(capsys):
+    from omd import __version__
+
+    with pytest.raises(SystemExit) as result:
+        cli.main(["--version"])
+    assert result.value.code == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == f"omd {__version__}\n"
+    assert captured.err == ""
+
+
+def test_config_path_and_show_are_machine_readable(tmp_path, monkeypatch, capsys):
+    config_file = tmp_path / "omd-config.json"
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+
+    assert cli.main(["config", "path"]) == 0
+    assert capsys.readouterr().out == f"{config_file}\n"
+
+    assert cli.main(["config", "show", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["path"] == str(config_file)
+    assert payload["capture"]["ocr_language"]["configured"] == "eng"
+    assert payload["capture"]["ocr_language"]["effective"] == "eng"
+
+
+def test_config_show_json_reports_invalid_config_as_clean_json(tmp_path, monkeypatch, capsys):
+    config_file = tmp_path / "omd-config.json"
+    config_file.write_text("not json", encoding="utf-8")
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+
+    assert cli.main(["config", "show", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    error = json.loads(captured.err)
+    assert error["error"]["kind"] == "config_invalid"
+    assert str(config_file) in error["error"]["message"]
+
+
+def test_config_show_json_reports_invalid_ocr_environment_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("OMD_CONFIG", str(tmp_path / "missing.json"))
+    monkeypatch.setenv("OMD_OCR_LANGUAGE", "bad;value")
+
+    assert cli.main(["config", "show", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    error = json.loads(captured.err)
+    assert error["error"]["kind"] == "config_invalid"
+    assert "invalid OCR language" in error["error"]["message"]
+    assert "Traceback" not in captured.err
 
 
 def test_enrich_note_request_mode_keeps_success_json_on_stdout(monkeypatch, capsys, tmp_path):
@@ -155,70 +214,7 @@ def test_enrich_note_failure_has_empty_stdout_and_terminal_error(monkeypatch, ca
     assert events[-1]["event"] == "error"
     assert events[-1]["kind"] == "generation_timeout"
     assert events[-1]["request_id"] == "cli-request-2"
-    assert "validation" not in events[-1]
     assert content not in captured.err
-
-
-@pytest.mark.parametrize("evidence", [None, "x" * 401, "private-candidate\x00secret"])
-@pytest.mark.parametrize("json_events", [False, True])
-def test_enrich_note_evidence_error_is_actionable_and_private(
-    evidence, json_events, monkeypatch, capsys
-):
-    from omd import enrich_note
-
-    content = "private note body\n"
-    payload = {
-        "schema_version": 1,
-        "request_id": "evidence-error-1",
-        "action": "enrich_note_preview",
-        "vault_path": "/private-vault",
-        "note": {
-            "path": "Inbox/private-note.md",
-            "content": content,
-            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-        },
-        "candidates": [{
-            "id": "candidate-1",
-            "path": "Notes/private-candidate.md",
-            "title": "Private candidate",
-            "aliases": [],
-            "tags": [],
-            "evidence": evidence,
-        }],
-        "vault_tags": [],
-        "model": "qwen3:test",
-        "host": "http://localhost:11434",
-    }
-
-    def unexpected_run(*args, **kwargs):
-        pytest.fail("invalid evidence must fail before filesystem or model work")
-
-    monkeypatch.setattr(enrich_note, "run_enrich_note", unexpected_run)
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-    argv = ["enrich-note", "--request-json", "-"]
-    if json_events:
-        argv.append("--json-events")
-
-    assert cli.main(argv) == 2
-
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "candidate.evidence" in captured.err
-    assert "link/tag suggestions were not generated" in captured.err
-    assert "400 Unicode code points" in captured.err
-    for private_text in ("private-vault", "private-note", "private-candidate", "secret", content):
-        assert private_text not in captured.err
-    if json_events:
-        events = _parse_events(captured.err)
-        assert len(events) == 1
-        assert events[0]["kind"] == "invalid_request"
-        assert events[0]["request_id"] == "evidence-error-1"
-        assert events[0]["validation"] == {
-            "field": "candidate.evidence", "reason": "incompatible_text"
-        }
-    else:
-        assert "no vault files were changed" in captured.err
-        assert "next: normalize candidate snippets" in captured.err
 
 
 def test_enrich_note_request_mode_rejects_cli_contract_overrides(monkeypatch, capsys):
@@ -410,6 +406,70 @@ def test_is_xhs_url_excludes_reels():
 def test_extract_url_from_xhs_share_blob():
     blob = "32 复制本条信息，打开【小红书】App查看精彩内容！http://xhslink.com/a/abcDEF/ 8@s"
     assert cli.extract_url_from_blob(blob) == "http://xhslink.com/a/abcDEF"
+
+
+def test_shared_url_extraction_preserves_bare_url_and_rejects_multiple():
+    from omd._source_url import SourceURLCountError, extract_single_http_url
+
+    bare = "https://www.reddit.com/r/test/comments/abc/demo/"
+    assert extract_single_http_url(bare) == bare
+    assert extract_single_http_url(f"open {bare} now") == bare.rstrip("/")
+    assert extract_single_http_url("/tmp/local-file.pdf") is None
+    with pytest.raises(SourceURLCountError, match="exactly one") as exc_info:
+        extract_single_http_url(
+            "https://v.douyin.com/first/ https://xhslink.com/a/second/"
+        )
+    assert "douyin.com" not in str(exc_info.value)
+    assert "xhslink.com" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("adapter", ["reel", "xhs"])
+def test_share_adapters_reject_multiple_urls_as_structured_error(adapter, capsys):
+    from omd import _events
+
+    module = __import__(f"omd.{adapter}", fromlist=[adapter])
+    _events.configure(True)
+    try:
+        with pytest.raises(SystemExit):
+            module.extract_url(
+                "https://v.douyin.com/first/ https://xhslink.com/a/second/"
+            )
+        event = json.loads(capsys.readouterr().err)
+        assert event["kind"] == "source_url_count_invalid"
+        assert "douyin.com" not in event["message"]
+        assert "xhslink.com" not in event["message"]
+    finally:
+        _events.configure(False)
+
+
+def test_cli_inspect_rejects_multiple_urls_as_json_without_traceback(capsys):
+    rc = cli.main(
+        [
+            "inspect",
+            "https://v.douyin.com/first/ https://xhslink.com/a/second/",
+            "--json",
+        ]
+    )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["error"]["kind"] == "source_url_count_invalid"
+    assert "Traceback" not in captured.err
+    assert "douyin.com" not in payload["error"]["message"]
+
+
+def test_capture_rejects_multiple_urls_before_creating_vault(tmp_path):
+    from omd import capture
+    from omd._source_url import SourceURLCountError
+
+    vault = tmp_path / "vault"
+    with pytest.raises(SourceURLCountError, match="exactly one"):
+        capture.capture_one(
+            "https://v.douyin.com/first/ https://xhslink.com/a/second/",
+            vault,
+        )
+    assert not vault.exists()
 
 
 def test_xhs_note_id_parser():
@@ -674,7 +734,7 @@ def test_route_one_scopes_ui_reddit_comments_flag_to_reddit(monkeypatch, tmp_pat
     )
 
     assert rc == 0
-    assert seen["extra"] == []
+    assert seen["extra"] == ["--ocr-lang", "eng"]
 
 
 def test_route_one_manifest_records_selected_reddit_comment_scope(monkeypatch, tmp_path):
@@ -1377,8 +1437,10 @@ def test_copy_with_progress_emits_byte_units_in_events_mode(capsys):
     assert progress[-1]["total"] == 8
 
 
-def test_image_ocr_emits_real_pixel_work_units(tmp_path, monkeypatch, capsys):
-    Image = pytest.importorskip("PIL.Image", reason="Optional Pillow 13 requires Python 3.11+")
+def test_image_ocr_emits_real_pixel_work_units(
+    tmp_path, monkeypatch, capsys, ocr_packs_available
+):
+    from PIL import Image
     from omd import _events, _progress, cli
 
     source = tmp_path / "scan.png"
@@ -1404,11 +1466,6 @@ def test_image_ocr_emits_real_pixel_work_units(tmp_path, monkeypatch, capsys):
     assert work[0]["total"] == 12
     assert work[-1]["state"] == "completed"
     assert work[-1]["completed"] == 12
-
-
-def test_image_pixel_count_is_optional_without_pillow(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "PIL", None)
-    assert cli._image_pixel_count(tmp_path / "scan.png") is None
 
 
 def test_local_file_conversion_emits_real_byte_work_units(tmp_path, monkeypatch, capsys):
@@ -1789,6 +1846,44 @@ def test_route_audio_uses_preferred_language_when_no_explicit_hint(tmp_path, mon
     assert called["lang"] == "zh"
 
 
+def test_local_audio_cli_inherit_mode_suppresses_environment_and_config_hint(
+    tmp_path,
+    monkeypatch,
+):
+    from omd import cli, reel
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "schema_version": 1,
+        "capture": {
+            "spoken_language_mode": "explicit",
+            "spoken_language_hint": "zh",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_MODE", "explicit")
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_HINT", "zh")
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"not real audio")
+    output = tmp_path / "voice.md"
+    seen = {}
+
+    def fake_transcribe(_audio_path, _workdir, _model, language, backend=None):
+        seen["language"] = language
+        return {"text": "Hello", "language": "en", "segments": []}
+
+    monkeypatch.setattr(reel, "transcribe", fake_transcribe)
+
+    assert cli.main([
+        str(audio),
+        "-o",
+        str(output),
+        "--spoken-language-mode",
+        "inherit-adapter-default",
+    ]) == 0
+    assert seen["language"] is None
+
+
 def test_route_audio_threads_faster_whisper_backend(tmp_path, monkeypatch):
     from omd import cli, reel
 
@@ -1820,9 +1915,63 @@ def test_reel_language_hint_prefers_user_common_languages():
     assert reel.detect_language_hint("https://youtube.com/shorts/abc", None, "ja,en") == "ja"
     assert reel.detect_language_hint("https://v.douyin.com/abc", None, None) == "zh"
     assert reel.detect_language_hint("https://v.douyin.com/abc", "ko", "zh,en") == "ko"
+    assert reel.detect_language_hint("https://v.douyin.com/abc", "auto", "zh,en") is None
 
 
-def test_route_one_writes_manifest_for_file_output(tmp_path, monkeypatch):
+def test_reel_legacy_lang_is_asr_only_and_rejects_ocr_composites():
+    from omd import reel
+
+    assert reel._resolve_whisper_cli_language("zh", None) == ("zh", True)
+    assert reel._resolve_whisper_cli_language("zh", "zh") == ("zh", True)
+    assert reel._resolve_whisper_cli_language(None, "auto") == ("auto", False)
+
+    with pytest.raises(ValueError, match="single Whisper language"):
+        reel._resolve_whisper_cli_language("chi_sim+eng", None)
+    with pytest.raises(ValueError, match="conflicting Whisper language values"):
+        reel._resolve_whisper_cli_language("zh", "en")
+
+
+def test_reel_ocr_validates_packs_before_download_and_preserves_output(
+    tmp_path, monkeypatch
+):
+    from omd import reel
+
+    output = tmp_path / "reel.md"
+    output.write_text("previous valid capture\n", encoding="utf-8")
+    monkeypatch.setenv("OMD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.setattr(
+        cli,
+        "_prepare_ocr_execution",
+        lambda _language: (_ for _ in ()).throw(SystemExit("missing chi_sim")),
+    )
+    monkeypatch.setattr(
+        reel,
+        "download",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("download must not start before OCR pack validation")
+        ),
+    )
+    monkeypatch.setattr(
+        reel.sys,
+        "argv",
+        [
+            "omd-reel",
+            "https://youtube.com/shorts/abc",
+            "-o",
+            str(output),
+            "--ocr",
+            "--ocr-language",
+            "chi_sim+eng",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="missing chi_sim"):
+        reel.main()
+
+    assert output.read_text(encoding="utf-8") == "previous valid capture\n"
+
+
+def test_route_one_writes_manifest_for_file_output(tmp_path, monkeypatch, ocr_packs_available):
     from omd import cli
 
     src = tmp_path / "image.png"
@@ -1847,7 +1996,9 @@ def test_route_one_writes_manifest_for_file_output(tmp_path, monkeypatch):
     assert '"backend": "tesseract"' in manifest.read_text(encoding="utf-8")
 
 
-def test_route_one_warns_but_succeeds_when_manifest_sidecar_is_blocked(tmp_path, monkeypatch, capsys):
+def test_route_one_warns_but_succeeds_when_manifest_sidecar_is_blocked(
+    tmp_path, monkeypatch, capsys, ocr_packs_available
+):
     from omd import cli
 
     src = tmp_path / "image.png"
@@ -1872,7 +2023,9 @@ def test_route_one_warns_but_succeeds_when_manifest_sidecar_is_blocked(tmp_path,
     assert "could not write manifest" in captured.err
 
 
-def test_route_one_manifest_write_warning_uses_json_event(tmp_path, monkeypatch, capsys):
+def test_route_one_manifest_write_warning_uses_json_event(
+    tmp_path, monkeypatch, capsys, ocr_packs_available
+):
     from omd import cli, _events
 
     src = tmp_path / "image.png"
@@ -2167,7 +2320,7 @@ def test_cli_directory_output_error_uses_json_event(tmp_path, capsys):
     assert event["kind"] == "output_path_invalid"
 
 
-def test_route_one_rmarkdown_wraps_file_output(tmp_path, monkeypatch):
+def test_route_one_rmarkdown_wraps_file_output(tmp_path, monkeypatch, ocr_packs_available):
     from omd import cli
 
     src = tmp_path / "image.png"
@@ -2192,7 +2345,9 @@ def test_route_one_rmarkdown_wraps_file_output(tmp_path, monkeypatch):
     assert out.with_name(out.name + ".omd.json").exists()
 
 
-def test_route_one_agent_safe_prepends_untrusted_preamble(tmp_path, monkeypatch):
+def test_route_one_agent_safe_prepends_untrusted_preamble(
+    tmp_path, monkeypatch, ocr_packs_available
+):
     from omd import cli
 
     src = tmp_path / "image.png"
@@ -2213,7 +2368,9 @@ def test_route_one_agent_safe_prepends_untrusted_preamble(tmp_path, monkeypatch)
     assert out.read_text(encoding="utf-8").startswith("<!-- OMD_SECURITY:UNTRUSTED_CONTENT")
 
 
-def test_route_one_rmarkdown_agent_safe_keeps_yaml_first(tmp_path, monkeypatch):
+def test_route_one_rmarkdown_agent_safe_keeps_yaml_first(
+    tmp_path, monkeypatch, ocr_packs_available
+):
     from omd import cli
 
     src = tmp_path / "image.png"
@@ -2236,11 +2393,22 @@ def test_route_one_rmarkdown_agent_safe_keeps_yaml_first(tmp_path, monkeypatch):
     assert "\n---\n\n<!-- OMD_SECURITY:UNTRUSTED_CONTENT" in text
 
 
-def test_cli_agent_safe_rejects_cookies_flag(tmp_path):
+@pytest.mark.parametrize(
+    "flag",
+    ["--cookies", "--douyin-cookies", "--instagram-cookies", "--xhs-cookies"],
+)
+def test_cli_agent_safe_rejects_cookies_flag(tmp_path, flag):
     from omd import cli
 
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["--agent-safe", "https://v.douyin.com/abc", "-o", str(tmp_path / "out.md"), "--cookies", "cookies.txt"])
+        cli.main([
+            "--agent-safe",
+            "https://v.douyin.com/abc",
+            "-o",
+            str(tmp_path / "out.md"),
+            flag,
+            "cookies.txt",
+        ])
 
     assert exc_info.value.code == 1
 
@@ -2262,10 +2430,15 @@ def test_cli_inspect_with_readiness_prints_local_status(monkeypatch, capsys):
     from omd import cli, doctor
 
     monkeypatch.setattr(doctor, "run_checks", lambda: [
-        doctor.Check("f2", False, "tool", "not on PATH", "Douyin downloads"),
+        doctor.Check("yt-dlp", False, "tool", "not on PATH", "Douyin downloads"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
         doctor.Check("mlx_whisper", True, "tool", "/bin/mlx_whisper", "Apple Silicon transcription"),
     ])
+    monkeypatch.setattr(
+        doctor,
+        "ytdlp_douyin_readiness",
+        lambda executable=None: {"ready": True, "available": True},
+    )
 
     rc = cli.main(["inspect", "https://v.douyin.com/abc", "--json", "--with-readiness"])
 
@@ -2273,7 +2446,260 @@ def test_cli_inspect_with_readiness_prints_local_status(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["detected_type"] == "douyin_url"
     assert payload["readiness"]["ready"] is False
-    assert payload["readiness"]["missing_tools"] == ["f2"]
+    assert payload["readiness"]["missing_tools"] == ["yt-dlp"]
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_asr"),
+    [
+        (
+            "https://podcasts.apple.com/demo/id123?i=456",
+            {
+                "requested": None,
+                "detected": None,
+                "mode": "inherit-adapter-default",
+                "effective": "en",
+                "source": "default",
+            },
+        ),
+        (
+            "https://www.xiaohongshu.com/explore/abcdef",
+            {
+                "requested": None,
+                "detected": None,
+                "mode": "inherit-adapter-default",
+                "effective": "zh",
+                "source": "default",
+            },
+        ),
+        (
+            "https://v.douyin.com/abc",
+            {
+                "requested": None,
+                "detected": None,
+                "mode": "inherit-adapter-default",
+                "effective": "zh",
+                "source": "default",
+            },
+        ),
+        (
+            "https://www.youtube.com/shorts/abc123",
+            {
+                "requested": None,
+                "detected": None,
+                "mode": "inherit-adapter-default",
+                "effective": None,
+                "source": "default",
+            },
+        ),
+        (
+            "https://example.com/article",
+            {
+                "requested": None,
+                "detected": None,
+                "mode": None,
+                "effective": None,
+                "source": "unknown",
+            },
+        ),
+    ],
+)
+def test_cli_inspect_reports_source_aware_asr_defaults(
+    target,
+    expected_asr,
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    from omd import cli, doctor
+
+    monkeypatch.setenv("OMD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.delenv("OMD_SPOKEN_LANGUAGE_MODE", raising=False)
+    monkeypatch.delenv("OMD_SPOKEN_LANGUAGE_HINT", raising=False)
+    monkeypatch.delenv("OMD_PREFERRED_LANGUAGES", raising=False)
+    monkeypatch.setattr(doctor, "tesseract_readiness", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        doctor,
+        "readiness_for_preflight",
+        lambda *_args, **_kwargs: {"ready": True},
+    )
+
+    assert cli.main(["inspect", target, "--json", "--with-readiness"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recognition"]["asr"] == expected_asr
+
+
+def test_cli_inspect_reports_local_audio_as_auto_detect(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    from omd import cli, doctor
+
+    audio = tmp_path / "recording.mp3"
+    audio.write_bytes(b"audio")
+    monkeypatch.setenv("OMD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.delenv("OMD_SPOKEN_LANGUAGE_MODE", raising=False)
+    monkeypatch.delenv("OMD_SPOKEN_LANGUAGE_HINT", raising=False)
+    monkeypatch.delenv("OMD_PREFERRED_LANGUAGES", raising=False)
+    monkeypatch.setattr(doctor, "tesseract_readiness", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        doctor,
+        "readiness_for_preflight",
+        lambda *_args, **_kwargs: {"ready": True},
+    )
+
+    assert cli.main(["inspect", str(audio), "--json", "--with-readiness"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recognition"]["asr"] == {
+        "requested": None,
+        "detected": None,
+        "mode": "auto-detect",
+        "effective": None,
+        "source": "default",
+    }
+
+
+def test_cli_inspect_explicit_asr_overrides_adapter_default(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    from omd import cli, doctor
+
+    monkeypatch.setenv("OMD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_MODE", "explicit")
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_HINT", "de")
+    monkeypatch.setattr(doctor, "tesseract_readiness", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        doctor,
+        "readiness_for_preflight",
+        lambda *_args, **_kwargs: {"ready": True},
+    )
+
+    assert cli.main(
+        [
+            "inspect",
+            "https://podcasts.apple.com/demo/id123?i=456",
+            "--json",
+            "--with-readiness",
+            "--whisper-lang",
+            "fr",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recognition"]["asr"] == {
+        "requested": "fr",
+        "detected": None,
+        "mode": "explicit",
+        "effective": "fr",
+        "source": "explicit",
+    }
+
+
+def test_cli_inspect_asr_preserves_config_and_environment_sources(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    from omd import cli, doctor
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "capture": {
+                    "spoken_language_mode": "explicit",
+                    "spoken_language_hint": "ja",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+    monkeypatch.delenv("OMD_SPOKEN_LANGUAGE_MODE", raising=False)
+    monkeypatch.delenv("OMD_SPOKEN_LANGUAGE_HINT", raising=False)
+    monkeypatch.setattr(doctor, "tesseract_readiness", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        doctor,
+        "readiness_for_preflight",
+        lambda *_args, **_kwargs: {"ready": True},
+    )
+    command = [
+        "inspect",
+        "https://podcasts.apple.com/demo/id123?i=456",
+        "--json",
+        "--with-readiness",
+    ]
+
+    assert cli.main(command) == 0
+    configured = json.loads(capsys.readouterr().out)["recognition"]["asr"]
+    assert (configured["effective"], configured["source"]) == ("ja", "config")
+
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_MODE", "explicit")
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_HINT", "de")
+    assert cli.main(command) == 0
+    environment = json.loads(capsys.readouterr().out)["recognition"]["asr"]
+    assert (environment["effective"], environment["source"]) == (
+        "de",
+        "environment",
+    )
+
+
+@pytest.mark.parametrize("invalid_source", ["environment", "config"])
+def test_cli_inspect_json_reports_invalid_language_configuration_cleanly(
+    invalid_source,
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    from omd import cli
+
+    config_file = tmp_path / "config.json"
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+    if invalid_source == "environment":
+        monkeypatch.setenv("OMD_OCR_LANGUAGE", "bad;value")
+    else:
+        config_file.write_text("not json", encoding="utf-8")
+        monkeypatch.delenv("OMD_OCR_LANGUAGE", raising=False)
+
+    assert cli.main(
+        ["inspect", "https://example.com/article", "--json", "--with-readiness"]
+    ) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    error = json.loads(captured.err)
+    assert error["error"]["kind"] == "language_config_invalid"
+    assert error["error"]["message"]
+    assert "Traceback" not in captured.err
+
+
+def test_cli_inspect_json_bounds_language_configuration_errors(
+    monkeypatch,
+    capsys,
+):
+    from omd import cli
+
+    def fail_language_resolution(*_args):
+        raise SystemExit("error: " + "x" * 4096)
+
+    monkeypatch.setattr(
+        cli,
+        "_resolve_ocr_aliases_or_fatal",
+        fail_language_resolution,
+    )
+
+    assert cli.main(["inspect", "https://example.com", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    message = json.loads(captured.err)["error"]["message"]
+    assert len(message) == cli._INSPECT_ERROR_MESSAGE_MAX_CHARS
+    assert message.endswith("...")
 
 
 def test_cli_inspect_with_readiness_accepts_cookie_context(monkeypatch, capsys, tmp_path):
@@ -2282,12 +2708,21 @@ def test_cli_inspect_with_readiness_accepts_cookie_context(monkeypatch, capsys, 
     from omd import cli, doctor
 
     cookies = tmp_path / "cookies.txt"
-    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".douyin.com\tTRUE\t/\tTRUE\t0\tsessionid\tdemo\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(doctor, "run_checks", lambda: [
-        doctor.Check("f2", True, "tool", "/bin/f2", "Douyin downloads"),
+        doctor.Check("yt-dlp", True, "tool", "/bin/yt-dlp", "Douyin downloads"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
         doctor.Check("mlx_whisper", True, "tool", "/bin/mlx_whisper", "Apple Silicon transcription"),
     ])
+    monkeypatch.setattr(
+        doctor,
+        "ytdlp_douyin_readiness",
+        lambda executable=None: {"ready": True, "available": True},
+    )
 
     rc = cli.main([
         "inspect", "https://v.douyin.com/abc", "--json", "--with-readiness",
@@ -2299,6 +2734,132 @@ def test_cli_inspect_with_readiness_accepts_cookie_context(monkeypatch, capsys, 
     assert payload["readiness"]["ready"] is True
     assert payload["readiness"]["missing_auth"] == []
     assert payload["readiness"]["cookies_file"]["status"] == "found"
+
+
+def test_cli_inspect_reports_resolved_recognition_and_ocr_pack_readiness(
+    monkeypatch, capsys, tmp_path
+):
+    from omd import cli, doctor
+
+    image = tmp_path / "scan.png"
+    image.write_bytes(b"png")
+    captured = {}
+    monkeypatch.setattr(
+        doctor,
+        "run_checks",
+        lambda: [
+            doctor.Check(
+                "tesseract",
+                True,
+                "tool",
+                "/managed/bin/tesseract",
+                "image OCR",
+            )
+        ],
+    )
+
+    def fake_tesseract_readiness(requested_language=None, **kwargs):
+        captured["requested_language"] = requested_language
+        captured["language_source"] = kwargs.get("language_source")
+        return {
+            "ready": False,
+            "available": True,
+            "executable": "/managed/bin/tesseract",
+            "languages": ["eng"],
+            "requested_language": requested_language,
+            "effective_language": "chi_sim+eng",
+            "language_source": kwargs.get("language_source"),
+            "missing_languages": ["chi_sim"],
+            "error": "missing chi_sim; available OCR language packs: eng",
+        }
+
+    monkeypatch.setattr(doctor, "tesseract_readiness", fake_tesseract_readiness)
+
+    rc = cli.main(
+        [
+            "inspect",
+            str(image),
+            "--json",
+            "--with-readiness",
+            "--ocr-lang",
+            "chi_sim+eng",
+            "--whisper-lang",
+            "auto",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recognition"] == {
+        "ocr": {
+            "requested": "chi_sim+eng",
+            "effective": "chi_sim+eng",
+            "source": "explicit",
+        },
+        "asr": {
+            "requested": "auto",
+            "detected": None,
+            "mode": None,
+            "effective": None,
+            "source": "unknown",
+        },
+        "generation": {"language_policy": "same-as-source"},
+    }
+    assert captured == {
+        "requested_language": "chi_sim+eng",
+        "language_source": "explicit",
+    }
+    assert payload["readiness"]["ready"] is False
+    assert payload["readiness"]["tesseract"]["missing_languages"] == ["chi_sim"]
+
+
+def test_cli_inspect_article_image_ocr_adds_tesseract_pack_readiness(
+    monkeypatch, capsys
+):
+    from omd import cli, doctor
+
+    monkeypatch.setattr(
+        doctor,
+        "run_checks",
+        lambda: [
+            doctor.Check("markitdown", True, "tool", "/bin/markitdown", "web conversion"),
+            doctor.Check("tesseract", True, "tool", "/managed/bin/tesseract", "image OCR"),
+        ],
+    )
+    monkeypatch.setattr(
+        doctor,
+        "tesseract_readiness",
+        lambda **_kwargs: {
+            "ready": False,
+            "available": True,
+            "executable": "/managed/bin/tesseract",
+            "languages": ["eng"],
+            "requested_language": "chi_sim+eng",
+            "effective_language": "chi_sim+eng",
+            "language_source": "explicit",
+            "missing_languages": ["chi_sim"],
+            "error": "missing chi_sim",
+        },
+    )
+
+    rc = cli.main(
+        [
+            "inspect",
+            "https://example.com/article",
+            "--json",
+            "--with-readiness",
+            "--ocr-article-images",
+            "--ocr-language",
+            "chi_sim+eng",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["needs_tools"] == ["markitdown", "tesseract"]
+    assert payload["readiness"]["ready"] is False
+    assert payload["readiness"]["missing_tools"] == []
+    assert payload["readiness"]["tesseract"]["missing_languages"] == ["chi_sim"]
 
 
 def test_cli_convert_alias_routes_like_default_command(tmp_path, monkeypatch):
@@ -2666,7 +3227,8 @@ def test_cli_batch_polish_md_refreshes_manifest_checksum(tmp_path, monkeypatch):
     assert rc == 0
     assert output.read_text(encoding="utf-8") == "polished\n"
     assert manifest["checksum"] == hashlib.sha256(b"polished\n").hexdigest()
-    assert manifest["source"] == "ok"
+    assert manifest["source"] == str(Path("ok").resolve(strict=False))
+    assert manifest["raw_source"] == "ok"
 
 
 def test_cli_batch_polish_rmd_refreshes_manifest_after_rmarkdown(tmp_path, monkeypatch):
@@ -2696,6 +3258,32 @@ def test_cli_batch_polish_rmd_refreshes_manifest_after_rmarkdown(tmp_path, monke
     assert rc == 0
     assert body.startswith(b"---\n")
     assert manifest["checksum"] == hashlib.sha256(body).hexdigest()
+
+
+def test_cli_batch_polish_rmd_keeps_raw_as_markdown(tmp_path, monkeypatch):
+    from omd import _polish_md, cli
+
+    items = tmp_path / "urls.txt"
+    items.write_text("ok\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    def fake_route_one(target, output, _lang, _extra, *, agent_safe=False, output_format="md"):
+        assert output_format == "md"
+        output.write_text("# Raw\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+    monkeypatch.setattr(
+        _polish_md,
+        "polish_markdown",
+        lambda markdown, **_kwargs: markdown.replace("Raw", "Polished"),
+    )
+
+    rc = cli.main(["batch", str(items), "-o", str(out_dir), "--polish-md", "--rmd"])
+
+    assert rc == 0
+    assert (out_dir / "ok.raw.md").read_text(encoding="utf-8").endswith("# Raw\n")
+    assert not (out_dir / "ok.raw.Rmd").exists()
 
 
 def test_cli_batch_overlaps_next_conversion_with_single_polish_worker(tmp_path, monkeypatch):
@@ -2989,6 +3577,31 @@ def test_cli_file_polish_md_without_output_polishes_default_output(tmp_path, mon
     assert polished == [tmp_path / "page.md"]
 
 
+def test_cli_file_polish_rmd_keeps_raw_as_markdown(tmp_path, monkeypatch):
+    from omd import _polish_md, cli
+
+    source = tmp_path / "page.html"
+    source.write_text("<h1>Page</h1>", encoding="utf-8")
+    output = tmp_path / "page.Rmd"
+
+    def fake_route_markitdown(_target, out):
+        out.write_text("# Raw\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_markitdown", fake_route_markitdown)
+    monkeypatch.setattr(
+        _polish_md,
+        "polish_markdown",
+        lambda markdown, **_kwargs: markdown.replace("Raw", "Polished"),
+    )
+
+    rc = cli.main([str(source), "-o", str(output), "--polish-md", "--rmd"])
+
+    assert rc == 0
+    assert (tmp_path / "page.raw.md").read_text(encoding="utf-8") == "# Raw\n"
+    assert not (tmp_path / "page.raw.Rmd").exists()
+
+
 def test_cli_file_polish_md_refreshes_manifest_checksum(tmp_path, monkeypatch):
     from omd import _polish_md, cli
     from omd._manifest import manifest_path_for_output
@@ -3102,7 +3715,8 @@ def test_cli_existing_markdown_polish_md_polishes_input_in_place(tmp_path, monke
     def fake_polish_file(path, *, model, host, force=False, keep_raw=False, _polish_fn=None):
         polished.append(Path(path))
         assert force is True
-        assert keep_raw is False
+        assert keep_raw is True
+        Path(path).with_suffix(".raw.md").write_bytes(Path(path).read_bytes())
         Path(path).write_text("# Doc\n\npolished\n", encoding="utf-8")
 
     monkeypatch.setattr(cli, "route_one", fail_route_one)
@@ -3113,10 +3727,64 @@ def test_cli_existing_markdown_polish_md_polishes_input_in_place(tmp_path, monke
     assert rc == 0
     assert polished == [source]
     assert source.read_text(encoding="utf-8") == "# Doc\n\npolished\n"
+    assert (tmp_path / "huge.raw.md").read_text(encoding="utf-8") == "# Doc\n\nhello world\n"
+
+
+def test_cli_existing_markdown_polish_preserves_manifest_source_and_recognition(
+    tmp_path, monkeypatch
+):
+    from omd import _polish_md, cli
+    from omd._manifest import manifest_path_for_output, write_manifest_for_output
+
+    note = tmp_path / "captured.md"
+    note.write_text("# Captured\n\nraw\n", encoding="utf-8")
+    raw_source = "Shared text https://example.com/original"
+    recognition = {
+        "ocr": {
+            "requested": "chi_sim+eng",
+            "effective": "chi_sim+eng",
+            "source": "explicit",
+        },
+        "asr": {"requested": "auto", "detected": "zh"},
+    }
+    before = write_manifest_for_output(
+        note,
+        source=raw_source,
+        backend="original-adapter",
+        transcript_language="zh",
+        recognition=recognition,
+    )
+
+    def fail_route_one(*_args, **_kwargs):
+        raise AssertionError("existing Markdown polish should not run conversion routing")
+
+    def fake_polish_file(path, **_kwargs):
+        Path(path).with_suffix(".raw.md").write_bytes(Path(path).read_bytes())
+        Path(path).write_text("# Captured\n\npolished\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "route_one", fail_route_one)
+    monkeypatch.setattr(_polish_md, "polish_file", fake_polish_file)
+
+    assert cli.main([str(note), "--polish-md"]) == 0
+
+    after = json.loads(manifest_path_for_output(note).read_text(encoding="utf-8"))
+    assert after["source"] == "https://example.com/original"
+    assert after["raw_source"] == raw_source
+    assert after["backend"] == "original-adapter"
+    assert after["capture_id"] == before["capture_id"]
+    assert after["created_at"] == before["created_at"]
+    assert after["transcript_language"] == "zh"
+    assert after["recognition"] == before["recognition"]
 
 
 def test_cli_existing_markdown_polish_md_copies_to_output_before_polishing(tmp_path, monkeypatch):
     from omd import _polish_md, cli
+
+    examples = (Path(__file__).resolve().parents[1] / "examples" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "omd notes.md -o clean.md --polish-md" in examples
+    assert "not first-class ingest inputs yet" not in examples
 
     source = tmp_path / "notes.md"
     source.write_text("# Notes\n\nraw\n", encoding="utf-8")
@@ -3197,7 +3865,370 @@ def test_cli_defaults_image_ocr_to_english(tmp_path, monkeypatch):
     rc = cli.main(["scan.png", "-o", str(tmp_path / "scan.md")])
 
     assert rc == 0
-    assert captured["lang"] == "eng"
+    assert captured["lang"] is None
+
+
+@pytest.mark.parametrize("flag", ["--ocr-lang", "--ocr-language"])
+def test_cli_accepts_explicit_ocr_aliases(flag, tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_route_one(target, output, lang, extra, *, agent_safe=False, output_format="md"):
+        captured["lang"] = lang
+        output.write_text("ok\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    assert cli.main(["scan.png", "-o", str(tmp_path / "scan.md"), flag, "chi_sim+eng"]) == 0
+    assert captured["lang"] == "chi_sim+eng"
+
+
+def test_cli_allows_matching_legacy_and_explicit_ocr_flags(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_route_one(target, output, lang, extra, *, agent_safe=False, output_format="md"):
+        captured["lang"] = lang
+        output.write_text("ok\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    assert cli.main([
+        "scan.png", "-o", str(tmp_path / "scan.md"),
+        "--lang", "chi_sim+eng", "--ocr-language", "chi_sim+eng",
+    ]) == 0
+    assert captured["lang"] == "chi_sim+eng"
+
+
+def test_cli_rejects_conflicting_legacy_and_explicit_ocr_flags(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([
+            "scan.png", "-o", str(tmp_path / "scan.md"),
+            "--lang", "eng", "--ocr-language", "chi_sim+eng",
+        ])
+
+    assert "conflicting OCR language values" in str(exc_info.value)
+
+
+def test_route_recognition_resolves_config_and_keeps_ocr_asr_separate(monkeypatch):
+    monkeypatch.setenv("OMD_OCR_LANGUAGE", "chi_sim+eng")
+
+    ocr_language, routed_extra, recognition = cli._resolve_route_recognition(
+        None,
+        ["--whisper-lang", "auto", "--polish", "qwen3:4b"],
+    )
+
+    assert ocr_language == "chi_sim+eng"
+    assert routed_extra == ["--polish", "qwen3:4b", "--whisper-lang", "auto"]
+    assert recognition == {
+        "ocr": {
+            "requested": None,
+            "effective": "chi_sim+eng",
+            "source": "environment",
+        },
+        "asr": {"requested": "auto", "detected": None},
+        "generation": {"language_policy": "same-as-source"},
+    }
+
+
+def test_cli_preferred_language_overrides_configured_asr_hint(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "capture": {
+                    "spoken_language_mode": "explicit",
+                    "spoken_language_hint": "ja",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+
+    _, routed_extra, recognition = cli._resolve_route_recognition(
+        None,
+        ["--preferred-languages", "zh,en"],
+    )
+
+    assert routed_extra == [
+        "--preferred-languages",
+        "zh,en",
+        "--whisper-lang",
+        "zh",
+    ]
+    assert recognition["asr"] == {"requested": "zh", "detected": None}
+
+
+def test_explicit_inherit_mode_suppresses_configured_asr_hint(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "capture": {
+                    "spoken_language_mode": "explicit",
+                    "spoken_language_hint": "zh",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_MODE", "explicit")
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_HINT", "ja")
+
+    _, routed_extra, recognition = cli._resolve_route_recognition(
+        None,
+        ["--spoken-language-mode", "inherit-adapter-default"],
+    )
+
+    assert routed_extra == ["--spoken-language-mode", "inherit-adapter-default"]
+    assert recognition["asr"] == {
+        "requested": "inherit-adapter-default",
+        "detected": None,
+    }
+
+
+def test_recognition_resolved_event_reports_language_provenance(
+    tmp_path, monkeypatch, capsys
+):
+    from omd import _events
+
+    output = tmp_path / "article.md"
+    monkeypatch.setenv("OMD_OCR_LANGUAGE", "chi_sim+eng")
+    monkeypatch.setattr(
+        cli,
+        "route_markitdown",
+        lambda _target, out: (out.write_text("# Article\n", encoding="utf-8"), 0)[1],
+    )
+    _events.configure(True)
+    try:
+        assert cli.route_one(
+            "https://example.com/article",
+            output,
+            None,
+            ["--whisper-lang", "auto"],
+        ) == 0
+    finally:
+        _events.configure(False)
+
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    resolved = next(event for event in events if event["event"] == "recognition_resolved")
+    assert resolved["recognition"]["ocr"] == {
+        "requested": None,
+        "effective": "chi_sim+eng",
+        "source": "environment",
+    }
+    assert resolved["recognition"]["asr"] == {
+        "requested": "auto",
+        "mode": "auto-detect",
+        "effective": None,
+        "source": "explicit",
+    }
+
+
+def test_route_one_forwards_ocr_only_to_ocr_capable_adapters(monkeypatch):
+    seen = {}
+
+    def record(name):
+        def routed(_url, _output, extra):
+            seen[name] = extra
+            return 0
+
+        return routed
+
+    monkeypatch.setattr(cli, "route_reel", record("reel"))
+    monkeypatch.setattr(cli, "route_xhs", record("xhs"))
+    monkeypatch.setattr(cli, "route_podcast", record("podcast"))
+
+    assert cli.route_one(
+        "https://v.douyin.com/abc/", None, "chi_sim+eng", ["--whisper-lang", "zh"]
+    ) == 0
+    assert cli.route_one(
+        "https://xhslink.com/a/abc/", None, "chi_sim+eng", ["--whisper-lang", "zh"]
+    ) == 0
+    assert cli.route_one(
+        "https://podcasts.apple.com/us/podcast/show/id123?i=456",
+        None,
+        "chi_sim+eng",
+        ["--whisper-lang", "en"],
+    ) == 0
+
+    assert seen["reel"][-4:] == ["--whisper-lang", "zh", "--ocr-lang", "chi_sim+eng"]
+    assert seen["xhs"][-4:] == ["--whisper-lang", "zh", "--ocr-lang", "chi_sim+eng"]
+    assert seen["podcast"][-2:] == ["--whisper-lang", "en"]
+    assert "--ocr-lang" not in seen["podcast"]
+
+
+def test_route_one_preserves_adapter_local_legacy_lang_semantics(monkeypatch):
+    seen = {}
+
+    def record(name):
+        def routed(_url, _output, extra):
+            seen[name] = extra
+            return 0
+
+        return routed
+
+    monkeypatch.setattr(cli, "route_reel", record("reel"))
+    monkeypatch.setattr(cli, "route_xhs", record("xhs"))
+
+    assert cli.route_one(
+        "https://youtube.com/shorts/abc", None, None, ["--lang", "zh"]
+    ) == 0
+    assert cli.route_one(
+        "https://xhslink.com/a/abc", None, None, ["--lang", "chi_sim+eng"]
+    ) == 0
+
+    assert seen["reel"][-4:] == ["--whisper-lang", "zh", "--ocr-lang", "eng"]
+    assert "--lang" not in seen["reel"]
+    assert seen["xhs"][-2:] == ["--ocr-lang", "chi_sim+eng"]
+    assert "--whisper-lang" not in seen["xhs"]
+
+
+def test_route_image_validates_language_packs_before_starting_ocr(tmp_path, monkeypatch):
+    source = tmp_path / "scan.png"
+    source.write_bytes(b"png")
+    output = tmp_path / "scan.md"
+    called = []
+
+    monkeypatch.setattr(cli, "require", lambda _name: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        cli,
+        "_validate_ocr_language_for_execution",
+        lambda language, *, executable: (
+            called.append((language, executable))
+            or (_ for _ in ()).throw(SystemExit("missing chi_sim"))
+        ),
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("OCR must not start")),
+    )
+
+    with pytest.raises(SystemExit, match="missing chi_sim"):
+        cli.route_image(source, output, "chi_sim+eng")
+
+    assert called == [("chi_sim+eng", "/usr/bin/tesseract")]
+    assert not output.exists()
+
+
+def test_route_image_executes_the_same_tesseract_path_that_was_validated(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "scan.png"
+    source.write_bytes(b"png")
+    output = tmp_path / "scan.md"
+    validated = []
+    invoked = []
+
+    monkeypatch.setattr(cli, "require", lambda _name: "/managed/bin/tesseract")
+    monkeypatch.setattr(
+        cli,
+        "_validate_ocr_language_for_execution",
+        lambda language, *, executable: validated.append((language, executable)) or language,
+    )
+
+    def fake_run(argv, **_kwargs):
+        invoked.append(argv)
+        return cli.subprocess.CompletedProcess(argv, 0, "recognized text\n", "")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli.route_image(source, output, "chi_sim+eng") == 0
+
+    assert validated == [("chi_sim+eng", "/managed/bin/tesseract")]
+    assert invoked == [
+        [
+            "/managed/bin/tesseract",
+            str(source),
+            "-",
+            "-l",
+            "chi_sim+eng",
+        ]
+    ]
+    assert "recognized text" in output.read_text(encoding="utf-8")
+
+
+def test_route_image_missing_pack_error_lists_requested_and_available(
+    tmp_path, monkeypatch, capsys
+):
+    from omd import _events, _language
+
+    source = tmp_path / "scan.png"
+    source.write_bytes(b"png")
+    output = tmp_path / "scan.md"
+    monkeypatch.setattr(cli, "require", lambda _name: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        _language,
+        "probe_tesseract_languages",
+        lambda *_args, **_kwargs: frozenset({"eng"}),
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("OCR must not start")),
+    )
+    _events.configure(True)
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            cli.route_image(source, output, "chi_sim+eng")
+    finally:
+        _events.configure(False)
+
+    assert exc_info.value.code == 1
+    event = json.loads(capsys.readouterr().err)
+    assert event["kind"] == "ocr_language_pack_missing"
+    assert "Requested OCR language: chi_sim+eng" in event["message"]
+    assert "Available language packs: eng" in event["message"]
+    assert not output.exists()
+
+
+def test_batch_command_forwards_separate_ocr_and_whisper_languages(tmp_path, monkeypatch):
+    items = tmp_path / "items.txt"
+    items.write_text("https://example.com/post\n", encoding="utf-8")
+    seen = {}
+
+    def fake_route_one(target, output, lang, extra, *, agent_safe=False, output_format="md"):
+        seen["lang"] = lang
+        seen["extra"] = extra
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Post\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    assert cli.main([
+        "batch", str(items), "-o", str(tmp_path / "out"),
+        "--ocr-lang", "chi_sim+eng", "--whisper-lang", "auto",
+    ]) == 0
+    assert seen == {"lang": "chi_sim+eng", "extra": ["--whisper-lang", "auto"]}
+
+
+def test_watch_command_forwards_separate_ocr_and_whisper_languages(tmp_path, monkeypatch):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "scan.png").write_bytes(b"png")
+    seen = {}
+
+    def fake_route_one(target, output, lang, extra, *, agent_safe=False, output_format="md"):
+        seen["lang"] = lang
+        seen["extra"] = extra
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Scan\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    assert cli.main([
+        "watch", str(inbox), "-o", str(tmp_path / "out"),
+        "--stable-polls", "1", "--poll-interval", "0", "--max-polls", "1",
+        "--ocr-language", "chi_sim+eng", "--whisper-lang", "zh",
+    ]) == 0
+    assert seen == {"lang": "chi_sim+eng", "extra": ["--whisper-lang", "zh"]}
 
 
 def test_cli_passes_reel_polish_without_ambiguous_option(tmp_path, monkeypatch):
@@ -3744,7 +4775,9 @@ def test_route_one_does_not_pass_platform_cookie_flags_to_x_or_threads(monkeypat
     assert seen["threads"][0] == "https://www.threads.com/@alice/post/abc123"
 
 
-def test_route_one_article_image_ocr_appends_sections(tmp_path, monkeypatch):
+def test_route_one_article_image_ocr_appends_sections(
+    tmp_path, monkeypatch, ocr_packs_available
+):
     from omd import cli
     import urllib.request
 
@@ -3781,6 +4814,82 @@ def test_route_one_article_image_ocr_appends_sections(tmp_path, monkeypatch):
     body = output.read_text(encoding="utf-8")
     assert "## Article Image OCR" in body
     assert "image words" in body
+
+
+def test_article_image_ocr_validates_packs_before_primary_conversion_and_preserves_output(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "article.md"
+    output.write_text("previous valid conversion\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "_prepare_ocr_execution",
+        lambda _language: (_ for _ in ()).throw(SystemExit("missing chi_sim")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "route_markitdown",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("primary conversion must not start before OCR pack validation")
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="missing chi_sim"):
+        cli.route_one(
+            "https://example.com/article",
+            output,
+            "chi_sim+eng",
+            ["--ocr-article-images"],
+        )
+
+    assert output.read_text(encoding="utf-8") == "previous valid conversion\n"
+
+
+def test_article_image_ocr_emits_recognition_before_missing_pack_error(
+    tmp_path, monkeypatch, capsys
+):
+    from omd import _events, _language, cli
+
+    output = tmp_path / "article.md"
+    monkeypatch.setattr(cli, "require", lambda _name: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        _language,
+        "probe_tesseract_languages",
+        lambda *_args, **_kwargs: frozenset({"eng"}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "route_markitdown",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("primary conversion must not start before OCR pack validation")
+        ),
+    )
+
+    _events.configure(True)
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            cli.route_one(
+                "https://example.com/article",
+                output,
+                "chi_sim+eng",
+                ["--ocr-article-images"],
+            )
+    finally:
+        _events.configure(False)
+
+    assert exc_info.value.code == 1
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert [event["event"] for event in events] == [
+        "recognition_resolved",
+        "error",
+    ]
+    assert events[0]["recognition"]["ocr"] == {
+        "requested": "chi_sim+eng",
+        "effective": "chi_sim+eng",
+        "source": "explicit",
+    }
+    assert events[1]["kind"] == "ocr_language_pack_missing"
+    assert not output.exists()
 
 
 def test_route_one_article_image_ocr_is_off_by_default(tmp_path, monkeypatch):
@@ -3961,11 +5070,11 @@ def test_polish_md_size_warning_reports_actual_model_call_count(capsys):
 
 
 def test_polish_md_size_guard_refuses(tmp_path):
-    """>100k chars → fatal unless force=True."""
+    """>100k chars → typed refusal unless force=True."""
     import pytest
     from omd import _polish_md
     big = "# Doc\n\n## Body\n\n" + ("hello world. " * 10_000)  # ~130k chars
-    with pytest.raises(SystemExit):
+    with pytest.raises(_polish_md.PolishTooLargeError):
         _polish_md.polish_markdown(big, _polish_fn=_fake_polish_uppercase)
 
 
@@ -4176,3 +5285,126 @@ def test_polish_md_keep_raw_requires_polish_md_flag():
     assert proc.returncode != 0
     combined = proc.stderr + proc.stdout
     assert "requires --polish-md" in combined
+
+
+def test_capabilities_command_emits_exact_machine_json(capsys, monkeypatch):
+    from datetime import date
+    from omd import capabilities
+    from omd.provider_disclosure import disclosure_readiness
+
+    monkeypatch.setattr(
+        capabilities, "disclosure_readiness",
+        lambda **kwargs: disclosure_readiness(as_of=date(2026, 11, 2)),
+    )
+    assert cli.main(["capabilities", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == capabilities.capabilities_json(as_of=date(2026, 11, 2))
+    assert captured.err == ""
+
+
+
+@pytest.mark.parametrize("evidence", [None, "x" * 401, "private-candidate\x00secret"])
+@pytest.mark.parametrize("json_events", [False, True])
+def test_enrich_note_evidence_error_is_actionable_and_private(
+    evidence, json_events, monkeypatch, capsys
+):
+    from omd import enrich_note
+
+    content = "private note body\n"
+    payload = {
+        "schema_version": 1,
+        "request_id": "evidence-error-1",
+        "action": "enrich_note_preview",
+        "vault_path": "/private-vault",
+        "note": {
+            "path": "Inbox/private-note.md",
+            "content": content,
+            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        },
+        "candidates": [{
+            "id": "candidate-1",
+            "path": "Notes/private-candidate.md",
+            "title": "Private candidate",
+            "aliases": [],
+            "tags": [],
+            "evidence": evidence,
+        }],
+        "vault_tags": [],
+        "model": "qwen3:test",
+        "host": "http://localhost:11434",
+    }
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail("invalid evidence must fail before filesystem or model work")
+
+    monkeypatch.setattr(enrich_note, "run_enrich_note", unexpected_run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    argv = ["enrich-note", "--request-json", "-"]
+    if json_events:
+        argv.append("--json-events")
+
+    assert cli.main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "candidate.evidence" in captured.err
+    assert "link/tag suggestions were not generated" in captured.err
+    assert "400 Unicode code points" in captured.err
+    for private_text in ("private-vault", "private-note", "private-candidate", "secret", content):
+        assert private_text not in captured.err
+    if json_events:
+        events = _parse_events(captured.err)
+        assert len(events) == 1
+        assert events[0]["kind"] == "invalid_request"
+        assert events[0]["request_id"] == "evidence-error-1"
+        assert events[0]["validation"] == {
+            "field": "candidate.evidence", "reason": "incompatible_text"
+        }
+    else:
+        assert "no vault files were changed" in captured.err
+        assert "next: normalize candidate snippets" in captured.err
+
+
+
+def test_image_pixel_count_is_optional_without_pillow(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    assert cli._image_pixel_count(tmp_path / "scan.png") is None
+
+
+
+def test_xhs_state_parser_accepts_rednote_set_without_rewriting_note_text():
+    from omd import xhs
+
+    html = (
+        "<html><script>window.__INITIAL_STATE__="
+        '{"commentIds": new Set([]), "items": [undefined, NaN], '
+        '"body": "keep new Set([]), undefined, and NaN unchanged"}'
+        "</script></html>"
+    )
+
+    state = xhs.parse_initial_state(html)
+
+    assert state == {
+        "commentIds": [],
+        "items": [None, None],
+        "body": "keep new Set([]), undefined, and NaN unchanged",
+    }
+
+
+
+def test_xhs_state_parser_preserves_internal_placeholder_like_text():
+    from omd import xhs
+
+    html = (
+        "<script>window.__INITIAL_STATE__="
+        '{"body":"__OMD_XHS_STRING_0__", "commentIds":new Set([])}'
+        "</script>"
+    )
+
+    state = xhs.parse_initial_state(html)
+
+    assert state == {
+        "body": "__OMD_XHS_STRING_0__",
+        "commentIds": [],
+    }

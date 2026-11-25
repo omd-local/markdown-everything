@@ -1,6 +1,6 @@
 <div align="center">
 
-<sub>OMD.EXE // PUBLIC BETA 0.3.0b4</sub>
+<sub>OMD.EXE // PUBLIC BETA 0.3.0b5</sub>
 
 # OMD.EXE
 
@@ -20,7 +20,7 @@ URLs into traceable Markdown that stays in folders you control.
 
 </div>
 
-**Beta 0.3.0b4 provides the core backend for OMD Home, the command line, and
+**Beta 0.3.0b5 provides the core backend for OMD Home, the command line, and
 MCP.** The browser UI is deferred until its Gradio/Pillow dependencies have a
 compatible, audited installation. OMD Home does not require that browser UI.
 
@@ -60,10 +60,11 @@ echo "$(brew --prefix omd-local/omd/omd)/bin/omd"
 ```
 
 Run `omd capabilities --json` with that executable to confirm `package_version`
-is `0.3.0b4` and `protocol_version` is `1`, then refresh Home's backend check.
-Home still needs a separate client update for disclosure readiness preflight
-and the explicit **"Nothing was sent"** error. Updating this backend does not
-change Home's error display.
+is `0.3.0b5` and `protocol_version` is `1`, then refresh Home's backend check.
+Use OMD Home **0.2.2** with this backend for the matched Mac workflow, including
+recognition preferences, review-first enrichment, safe Markdown formatting,
+and cited vault answers. The plugin and backend are installed separately.
+Full setup: [中文指南](https://github.com/omd-local/obsidian-omd-home/blob/main/docs/getting-started-mac.md) · [English guide](https://github.com/omd-local/obsidian-omd-home/blob/main/docs/getting-started-mac.en.md).
 
 The command line can also convert directly or capture into an Obsidian folder:
 
@@ -277,7 +278,7 @@ folders you intend the client to access.
 | Symptom | What to check |
 |---|---|
 | `markitdown` missing | Reinstall the Homebrew package or install the common document converters shown above. |
-| `omd-ui` reports unavailable | Beta 0.3.0b4 ships the core backend. Use OMD Home or the CLI while the browser UI is deferred. |
+| `omd-ui` reports unavailable | Beta 0.3.0b5 ships the core backend. Use OMD Home or the CLI while the browser UI is deferred. |
 | OCR language unavailable | Install `tesseract-lang`; use `eng` or `chi_sim+eng`. |
 | Local model warning | Start Ollama and run the displayed `ollama pull <model>` command. Raw Markdown is retained. |
 | Web or Reddit HTTP 403 | The source rejected automated access. Save an authorised copy as HTML or PDF and convert the local file. |

@@ -3,6 +3,42 @@
 All notable changes are documented here. Version numbers follow Semantic
 Versioning and Python's beta-version convention.
 
+## 0.3.0b5 - 2026-11-25
+
+### Added
+
+- Publish the Mac backend interfaces used by OMD Home 0.2.2: OCR and speech
+  recognition preferences, capture progress and actual saved-note identity,
+  safe Markdown formatting and transcript repair, review-first multilingual
+  enrichment, and cited vault answers with local retrieval.
+- Support explicit custom ports on loopback Ollama endpoints while rejecting
+  remote hosts, URL credentials, non-root paths, queries, fragments, proxies,
+  and redirects for local-model operations.
+- Keep hosted answers provider-scoped, bounded, and gated by per-request
+  consent and current disclosure readiness.
+
+### Fixed
+
+- Preserve the requested Rednote/Xiaohongshu post identity when parsing page
+  state, tolerate supported JavaScript state literals, and refuse unrelated
+  feed entries instead of saving them as the requested source.
+- Preserve the public multiline candidate-evidence validation and safe error
+  metadata while integrating newer enrichment and capture behavior.
+
+### Compatibility
+
+- Pair this backend with OMD Home 0.2.2. The older beta-4 recognition/enrichment
+  workaround is unnecessary after both components have been updated.
+- The CLI and MCP remain protocol v1, with additive capabilities. Existing
+  source notes remain ordinary Markdown; model suggestions still require
+  explicit review before Apply.
+- Browser UI remains deferred and the audited Pillow 13 core distribution is
+  retained. Optional transcription, Ollama models, and the Calendar helper
+  are installed separately; capture does not require AI.
+- DeepSeek remains unavailable under the reviewed disclosure policy. iPhone
+  direct capture and experimental answer-verifier/benchmark prototypes are
+  outside this coordinated Mac release.
+
 ## 0.3.0b4 - 2026-11-02
 
 ### Fixed

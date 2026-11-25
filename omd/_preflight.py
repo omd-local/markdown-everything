@@ -10,7 +10,7 @@ from omd import cli
 DOUYIN_HOSTS = {"douyin.com", "v.douyin.com", "iesdouyin.com"}
 INSTAGRAM_HOSTS = {"instagram.com"}
 REEL_NEEDS_TOOLS = ["yt-dlp", "ffmpeg", "mlx_whisper"]
-DOUYIN_NEEDS_TOOLS = ["f2", "ffmpeg", "mlx_whisper"]
+DOUYIN_NEEDS_TOOLS = ["yt-dlp", "ffmpeg", "mlx_whisper"]
 PODCAST_NEEDS_TOOLS = ["ffmpeg", "mlx_whisper"]
 XHS_NEEDS_TOOLS = ["tesseract", "ffmpeg", "mlx_whisper"]
 WECHAT_NEEDS_TOOLS: list[str] = []
@@ -39,7 +39,7 @@ def inspect_target(target: str | Path) -> dict[str, object]:
 
 def inspect_url(url: str, *, raw_input: str | None = None) -> dict[str, object]:
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
     info = _base_result(
         input_value=raw_input or url,
         target_kind="url",
@@ -69,7 +69,16 @@ def inspect_url(url: str, *, raw_input: str | None = None) -> dict[str, object]:
         )
         info["metadata"].update(
             cookie_strategy="cookies_txt_required",
-            cookie_domains=["xiaohongshu.com", "xhslink.com"],
+            cookie_domains=[
+                "xiaohongshu.com",
+                "rednote.com",
+            ],
+            allowed_url_domains=[
+                "xiaohongshu.com",
+                "xhslink.com",
+                "rednote.com",
+                "xhscdn.com",
+            ],
             cookie_browser_supported=False,
         )
         _append_unique(info["risks"], "auth_required")
@@ -82,11 +91,34 @@ def inspect_url(url: str, *, raw_input: str | None = None) -> dict[str, object]:
             "Xiaohongshu/Rednote is an advanced local-only route: keep cookies on your own machine, hosted demo auth is disabled, and use may be constrained by platform terms or content rights.",
         )
         if host == "xhslink.com" or host.endswith(".xhslink.com"):
+            info["metadata"].update(
+                cookie_validation_scope="platform_until_redirect",
+                cookie_runtime_recheck=True,
+            )
             _append_unique(info["risks"], "redirect_resolution")
             _append_unique(
                 info["warnings"],
                 "Shortlink input will be expanded before note inspection.",
             )
+            _append_unique(
+                info["warnings"],
+                "Cookie setup can only be checked at platform level before this shortlink is expanded. Capture rechecks the resolved destination and may ask for matching cookies before sending any.",
+            )
+            if not _provider_url_transport_safe(parsed, allow_http=True):
+                _mark_unsafe_provider_url(
+                    info,
+                    "XHS shortlinks allow only HTTP port 80 or HTTPS port 443 without user information.",
+                )
+        else:
+            info["metadata"].update(
+                cookie_validation_scope="request_url",
+                cookie_runtime_recheck=False,
+            )
+            if not _provider_url_transport_safe(parsed, allow_http=False):
+                _mark_unsafe_provider_url(
+                    info,
+                    "XHS / Rednote authenticated page URLs require HTTPS port 443 without user information.",
+                )
         return info
     if cli.is_podcast_url(url):
         info.update(
@@ -250,16 +282,32 @@ def inspect_url(url: str, *, raw_input: str | None = None) -> dict[str, object]:
                 cookie_strategy="cookies_txt_required",
                 cookie_domains=["douyin.com", "v.douyin.com", "iesdouyin.com"],
                 cookie_browser_supported=False,
+                cookie_validation_scope="platform_cookie_jar",
+                cookie_runtime_recheck=False,
             )
             _append_unique(info["risks"], "auth_required")
             _append_unique(
                 info["warnings"],
-                "Douyin routes through the f2 downloader and requires a valid cookies.txt file.",
+                "Douyin routes through yt-dlp with a scoped cookies.txt jar and requires a current yt-dlp Douyin extractor.",
             )
+            if host == "v.douyin.com" or host.endswith(".v.douyin.com"):
+                _append_unique(info["risks"], "redirect_resolution")
+                info["metadata"]["redirect_cookie_policy"] = (
+                    "anonymous_bounded_then_scoped_cookie_jar"
+                )
+                _append_unique(
+                    info["warnings"],
+                    "Douyin shortlinks are expanded anonymously through a bounded approved-host redirect chain before the scoped cookie jar reaches yt-dlp.",
+                )
             _append_unique(
                 info["warnings"],
                 "Douyin is an advanced local-only route: keep cookies on your own machine, hosted demo auth is disabled, and use may be constrained by platform terms or content rights.",
             )
+            if not _provider_url_transport_safe(parsed, allow_http=False):
+                _mark_unsafe_provider_url(
+                    info,
+                    "Douyin URLs require HTTPS port 443 without user information.",
+                )
             return info
         info.update(
             probable_backend="reel",
@@ -429,6 +477,23 @@ def _base_result(
 def _append_unique(items: object, value: str) -> None:
     if isinstance(items, list) and value not in items:
         items.append(value)
+
+
+def _provider_url_transport_safe(parsed: ParseResult, *, allow_http: bool) -> bool:
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.scheme == "https":
+        return port in {None, 443}
+    return bool(allow_http and parsed.scheme == "http" and port in {None, 80})
+
+
+def _mark_unsafe_provider_url(info: dict[str, object], warning: str) -> None:
+    _append_unique(info["risks"], "unsafe_url")
+    _append_unique(info["warnings"], warning)
 
 
 def _mark_unsupported_post_shape(info: dict[str, object], warning: str) -> None:

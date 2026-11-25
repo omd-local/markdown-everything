@@ -3284,7 +3284,7 @@ def test_inspect_source_reports_missing_douyin_tool(monkeypatch):
     from omd import doctor
 
     monkeypatch.setattr(doctor, "run_checks", lambda: [
-        doctor.Check("f2", False, "tool", "not on PATH", "Douyin downloads"),
+        doctor.Check("yt-dlp", False, "tool", "not on PATH", "Douyin downloads"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
         doctor.Check("mlx_whisper", True, "tool", "/bin/mlx_whisper", "Apple Silicon transcription"),
     ])
@@ -3294,28 +3294,40 @@ def test_inspect_source_reports_missing_douyin_tool(monkeypatch):
     assert "Backend: `reel`" in report
     assert "Type: `douyin_url`" in report
     assert "Ready: `False`" in report
-    assert "Missing tools: `f2`" in report
+    assert "Missing tools: `yt-dlp`" in report
     assert "Cookies needed: `True`" in report
     assert "Missing auth: `cookies_file`" in report
     assert "Default / Douyin cookies.txt path is empty" in report
+
 
 
 def test_inspect_source_reports_cookie_file_ready_for_required_auth(monkeypatch, tmp_path):
     from omd import doctor
 
     cookies = tmp_path / "cookies.txt"
-    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".douyin.com\tTRUE\t/\tTRUE\t0\tsessionid\tdemo\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(doctor, "run_checks", lambda: [
-        doctor.Check("f2", True, "tool", "/bin/f2", "Douyin downloads"),
+        doctor.Check("yt-dlp", True, "tool", "/bin/yt-dlp", "Douyin downloads"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
         doctor.Check("mlx_whisper", True, "tool", "/bin/mlx_whisper", "Apple Silicon transcription"),
     ])
+    monkeypatch.setattr(
+        doctor,
+        "ytdlp_douyin_readiness",
+        lambda executable=None: {"ready": True, "available": True},
+    )
 
     report = ui._inspect_source("https://v.douyin.com/abc123/", None, None, str(cookies), "(none)")
 
     assert "Ready: `True`" in report
-    assert "Cookie file: `found:" in report
+    assert "Cookie file: `found`" in report
+    assert str(cookies) not in report
     assert "Missing auth: `none`" in report
+
 
 
 def test_inspect_source_uses_xhs_cookie_file_for_xhs_items(monkeypatch, tmp_path):
@@ -3323,8 +3335,16 @@ def test_inspect_source_uses_xhs_cookie_file_for_xhs_items(monkeypatch, tmp_path
 
     douyin = tmp_path / "douyin_cookies.txt"
     xhs = tmp_path / "xhs_cookies.txt"
-    douyin.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
-    xhs.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    douyin.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".douyin.com\tTRUE\t/\tTRUE\t0\tsessionid\tdemo\n",
+        encoding="utf-8",
+    )
+    xhs.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".xiaohongshu.com\tTRUE\t/\tTRUE\t0\tweb_session\tdemo\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(doctor, "run_checks", lambda: [
         doctor.Check("tesseract", True, "tool", "/bin/tesseract", "OCR"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
@@ -3341,9 +3361,11 @@ def test_inspect_source_uses_xhs_cookie_file_for_xhs_items(monkeypatch, tmp_path
     )
 
     assert "Type: `xhs_url`" in report
-    assert f"Cookie file: `found: {xhs}`" in report
+    assert "Cookie file: `found`" in report
+    assert str(xhs) not in report
     assert str(douyin) not in report
     assert "XHS / Rednote cookies.txt path is empty" not in report
+
 
 
 def test_inspect_source_warns_when_xhs_cookie_file_is_missing(monkeypatch):

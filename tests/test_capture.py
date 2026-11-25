@@ -115,12 +115,134 @@ def test_capture_polishes_only_after_structural_cleanup(tmp_path, monkeypatch):
     assert result.return_code == 0
     text = result.output_path.read_text(encoding="utf-8")
     assert "Polished locally." in text
+    raw_path = result.output_path.with_name(
+        result.output_path.stem + ".raw" + result.output_path.suffix
+    )
+    assert raw_path.is_file()
+    raw_text = raw_path.read_text(encoding="utf-8")
+    assert "# Tutorial\n" in raw_text
+    assert "Polished locally." not in raw_text
+    assert '<!DOCTYPE html>' not in raw_text
     manifest = json.loads(result.output_path.with_suffix(".omd.json").read_text(encoding="utf-8"))
     capture_meta = manifest["metadata"]["capture"]
     assert capture_meta["markdown_polish_requested"] is True
     assert capture_meta["markdown_polish_model"] == "qwen3:4b-instruct"
     assert capture_meta["llm_used"] == "qwen3:4b-instruct"
     assert capture_meta["model_endpoint"] == "local_ollama"
+
+
+def test_capture_polish_failure_keeps_raw_capture_without_a_stale_backup(
+    tmp_path, monkeypatch
+):
+    from omd import _polish_md, capture, cli
+
+    source = tmp_path / "tutorial.html"
+    source.write_text("<h1>Tutorial</h1>", encoding="utf-8")
+    vault = tmp_path / "vault"
+
+    def fake_route_one(_target, output, *_args, **_kwargs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Tutorial\n\nraw body\n", encoding="utf-8")
+        return 0
+
+    def fail_polish(*_args, **_kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+    monkeypatch.setattr(_polish_md, "polish_markdown", fail_polish)
+
+    result = capture.capture_one(str(source), vault, polish_md=True)
+
+    assert result.return_code == 0
+    assert "raw body" in result.output_path.read_text(encoding="utf-8")
+    raw_path = result.output_path.with_name(
+        result.output_path.stem + ".raw" + result.output_path.suffix
+    )
+    assert not raw_path.exists()
+
+
+def test_capture_polish_size_refusal_keeps_valid_capture_manifest_and_index(
+    tmp_path, monkeypatch
+):
+    from omd import _polish_md, capture, cli
+
+    source = tmp_path / "oversized.html"
+    source.write_text("<h1>Oversized</h1>", encoding="utf-8")
+    vault = tmp_path / "vault"
+    oversized_body = "x" * (_polish_md.HARD_REFUSE_CHARS + 1)
+
+    def fake_route_one(_target, output, *_args, **_kwargs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(f"# Oversized\n\n{oversized_body}\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    result = capture.capture_one(str(source), vault, polish_md=True)
+
+    assert result.return_code == 0
+    assert oversized_body in result.output_path.read_text(encoding="utf-8")
+    assert result.output_path.with_suffix(".omd.json").is_file()
+    assert result.index_path.is_file()
+    raw_path = result.output_path.with_name(
+        result.output_path.stem + ".raw" + result.output_path.suffix
+    )
+    assert not raw_path.exists()
+
+
+def test_cli_capture_json_events_treats_polish_size_refusal_as_warning(
+    tmp_path, monkeypatch, capsys
+):
+    from omd import _events, _polish_md, cli
+
+    source = tmp_path / "oversized.html"
+    source.write_text("<h1>Oversized</h1>", encoding="utf-8")
+    vault = tmp_path / "vault"
+    oversized_body = "x" * (_polish_md.HARD_REFUSE_CHARS + 1)
+
+    def fake_route_one(_target, output, *_args, **_kwargs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(f"# Oversized\n\n{oversized_body}\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    try:
+        rc = cli.main(
+            [
+                "capture",
+                str(source),
+                "--vault",
+                str(vault),
+                "--polish-md",
+                "--json-events",
+            ]
+        )
+    finally:
+        _events.configure(False)
+
+    assert rc == 0
+    events = _parse_events(capsys.readouterr().err)
+    assert not [event for event in events if event["event"] == "error"]
+    refusal_warnings = [
+        event
+        for event in events
+        if event["event"] == "warn"
+        and "pass --force to override" in event.get("message", "")
+    ]
+    assert len(refusal_warnings) == 1
+    assert "file is" in refusal_warnings[0]["message"]
+
+    captures = [
+        path
+        for path in (vault / "Sources").rglob("*.md")
+        if not path.name.endswith(".raw.md")
+    ]
+    assert len(captures) == 1
+    assert oversized_body in captures[0].read_text(encoding="utf-8")
+    assert captures[0].with_suffix(".omd.json").is_file()
+    assert (vault / "Index" / "OMD Captures.md").is_file()
+    assert not captures[0].with_name(captures[0].stem + ".raw.md").exists()
 
 
 def test_cli_capture_uses_memory_sized_default_text_model(tmp_path, monkeypatch):
@@ -221,7 +343,7 @@ def test_cli_capture_writes_pdf_to_vault_with_frontmatter_index_and_manifest(tmp
 
     def fake_route_one(target, output, lang, reel_extra, *, agent_safe=False, output_format="md"):
         assert target == str(source)
-        assert lang == "eng"
+        assert lang is None
         assert reel_extra == []
         assert agent_safe is False
         assert output_format == "md"
@@ -280,6 +402,63 @@ def test_cli_capture_writes_pdf_to_vault_with_frontmatter_index_and_manifest(tmp
     assert manifest["metadata"]["capture"]["network_fetch"] is False
     assert manifest["metadata"]["capture"]["model_endpoint"] == "none"
     assert manifest["checksum"] == hashlib.sha256(outputs[0].read_bytes()).hexdigest()
+
+
+def test_cli_capture_forwards_separate_ocr_and_whisper_languages(tmp_path, monkeypatch):
+    from omd import capture, cli
+
+    source = tmp_path / "mixed.png"
+    source.write_bytes(b"fake image")
+    vault = tmp_path / "vault"
+    seen = {}
+
+    def fake_route_one(target, output, lang, reel_extra, *, agent_safe=False, output_format="md"):
+        seen["target"] = target
+        seen["lang"] = lang
+        seen["extra"] = reel_extra
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Mixed\n\n正文\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+    monkeypatch.setattr(capture, "_now_iso", lambda: "2026-07-04T00:00:00Z")
+
+    rc = cli.main([
+        "capture",
+        str(source),
+        "--vault", str(vault),
+        "--ocr-language", "chi_sim+eng",
+        "--whisper-lang", "auto",
+    ])
+
+    assert rc == 0
+    assert seen["lang"] == "chi_sim+eng"
+    assert seen["extra"] == ["--whisper-lang", "auto"]
+
+
+def test_capture_one_preserves_reel_local_legacy_asr_alias(tmp_path, monkeypatch):
+    from omd import capture, cli
+
+    vault = tmp_path / "vault"
+    seen = {}
+
+    def fake_route_one(target, output, lang, reel_extra, **_kwargs):
+        seen.update(target=target, lang=lang, reel_extra=reel_extra)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Reel\n\nTranscript\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+
+    result = capture.capture_one(
+        "https://youtube.com/shorts/abc",
+        vault,
+        reel_extra=["--lang", "zh"],
+    )
+
+    assert result.return_code == 0
+    assert seen["lang"] is None
+    assert seen["reel_extra"] == ["--lang", "zh"]
 
 
 def test_capture_repeated_same_input_creates_distinct_notes(tmp_path, monkeypatch):
@@ -412,6 +591,66 @@ def test_capture_metadata_records_memory_sized_model_for_bare_polish(monkeypatch
 
     assert metadata["llm_used"] == "qwen2.5:1.5b-instruct"
     assert metadata["model_endpoint"] == "local_ollama"
+
+
+def test_capture_metadata_strips_rednote_access_query_from_user_visible_source():
+    from omd import capture
+
+    private_url = (
+        "https://www.rednote.com/discovery/item/note123"
+        "?xsec_token=private-value&xsec_source=pc_search"
+    )
+    metadata = capture.capture_metadata(
+        source=private_url,
+        source_type="xiaohongshu",
+        title="Video",
+        tags=[],
+        captured_at="2026-10-04T00:00:00Z",
+        preflight={
+            "detected_type": "xhs_url",
+            "needs_network": True,
+            "metadata": {"url": private_url},
+        },
+        reel_extra=[],
+    )
+
+    assert metadata["source_url"] == "https://www.rednote.com/discovery/item/note123"
+    assert "xsec_token" not in capture.format_frontmatter(metadata)
+    assert "private-value" not in capture.format_capture_body(metadata, "Body")
+
+
+def test_capture_rednote_uses_private_url_for_fetch_but_never_persists_its_query(
+    tmp_path,
+    monkeypatch,
+):
+    from omd import capture, cli
+
+    private_url = (
+        "https://www.rednote.com/discovery/item/note123"
+        "?xsec_token=private-value&xsec_source=pc_search"
+    )
+    safe_url = "https://www.rednote.com/discovery/item/note123"
+    routed: list[str] = []
+
+    def fake_route_one(target, output, *_args, **_kwargs):
+        routed.append(target)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Rednote video\n\nBody and transcript.\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+    result = capture.capture_one(private_url, tmp_path / "vault")
+
+    assert routed == [private_url]
+    markdown = result.output_path.read_text(encoding="utf-8")
+    manifest = json.loads(result.output_path.with_suffix(".omd.json").read_text(encoding="utf-8"))
+    serialized = markdown + json.dumps(manifest)
+    assert f'source_url: "{safe_url}"' in markdown
+    assert manifest["source"] == safe_url
+    assert manifest["source_url"] == safe_url
+    assert manifest["metadata"]["capture"]["source_url"] == safe_url
+    assert "xsec_token" not in serialized
+    assert "private-value" not in serialized
 
 
 def test_cli_capture_memory_cards_append_generated_sections_and_preserve_raw(tmp_path, monkeypatch, capsys):
@@ -836,16 +1075,18 @@ def test_cli_capture_batch_list_captures_urls_and_continues_after_failure(tmp_pa
     assert capture_meta["model_endpoint"] == "none"
 
 
-def test_cli_capture_json_events_do_not_emit_wrapper_done_path(tmp_path, monkeypatch, capsys):
+def test_cli_capture_json_events_report_title_renamed_output(tmp_path, monkeypatch, capsys):
     from omd import _events, _progress, capture, cli
 
     source = tmp_path / "report.html"
     source.write_text("<h1>Report</h1>", encoding="utf-8")
     vault = tmp_path / "vault"
+    planned_outputs: list[Path] = []
 
     def fake_route_one(_target, output, *_args, **_kwargs):
+        planned_outputs.append(output)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("# Report\n\nBody\n", encoding="utf-8")
+        output.write_text("# Final Report Title\n\nBody\n", encoding="utf-8")
         _progress.done(f"wrote {output}")
         return 0
 
@@ -859,8 +1100,12 @@ def test_cli_capture_json_events_do_not_emit_wrapper_done_path(tmp_path, monkeyp
     assert rc == 0
     done_events = [event for event in events if event["event"] == "done"]
     assert len(done_events) == 1
-    assert done_events[0]["output"].endswith(".md")
-    assert "captured " not in done_events[0]["output"]
+    expected = vault / "Sources" / "Documents" / "Final Report Title.md"
+    assert done_events[0]["output"] == str(expected)
+    assert expected.is_file()
+    assert len(planned_outputs) == 1
+    assert str(planned_outputs[0]) != done_events[0]["output"]
+    assert not planned_outputs[0].exists()
 
 
 def test_cli_capture_batch_json_events_do_not_emit_summary_as_done(tmp_path, monkeypatch, capsys):
@@ -888,8 +1133,10 @@ def test_cli_capture_batch_json_events_do_not_emit_summary_as_done(tmp_path, mon
     assert rc == 0
     done_outputs = [event["output"] for event in events if event["event"] == "done"]
     assert len(done_outputs) == 2
-    assert all(output.endswith(".md") for output in done_outputs)
-    assert all("captured " not in output for output in done_outputs)
+    assert done_outputs == [
+        str(vault / "Sources" / "Documents" / "A.md"),
+        str(vault / "Sources" / "Documents" / "B.md"),
+    ]
 
 
 def test_capture_refreshes_manifest_but_preserves_created_at(tmp_path, monkeypatch):
@@ -923,3 +1170,30 @@ def test_capture_refreshes_manifest_but_preserves_created_at(tmp_path, monkeypat
     assert manifest["output"] == str(result.output_path)
     assert manifest["capture_id"] == manifest["metadata"]["capture"]["capture_id"]
     assert manifest["metadata"]["capture"]["source_type"] == "image"
+
+
+def test_cli_capture_json_events_do_not_emit_wrapper_done_path(tmp_path, monkeypatch, capsys):
+    from omd import _events, _progress, capture, cli
+
+    source = tmp_path / "report.html"
+    source.write_text("<h1>Report</h1>", encoding="utf-8")
+    vault = tmp_path / "vault"
+
+    def fake_route_one(_target, output, *_args, **_kwargs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Report\n\nBody\n", encoding="utf-8")
+        _progress.done(f"wrote {output}")
+        return 0
+
+    monkeypatch.setattr(cli, "route_one", fake_route_one)
+    monkeypatch.setattr(capture, "_now_iso", lambda: "2026-07-04T00:00:00Z")
+
+    rc = cli.main(["capture", str(source), "--vault", str(vault), "--json-events"])
+    events = _parse_events(capsys.readouterr().err)
+    _events.configure(False)
+
+    assert rc == 0
+    done_events = [event for event in events if event["event"] == "done"]
+    assert len(done_events) == 1
+    assert done_events[0]["output"].endswith(".md")
+    assert "captured " not in done_events[0]["output"]

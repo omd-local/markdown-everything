@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 
 def test_preflight_xhs_share_blob_is_serializable():
     from omd._preflight import inspect_target
@@ -17,14 +19,27 @@ def test_preflight_xhs_share_blob_is_serializable():
     assert result["needs_cookies"] is True
     assert result["needs_tools"] == ["tesseract", "ffmpeg", "mlx_whisper"]
     assert result["metadata"]["cookie_strategy"] == "cookies_txt_required"
+    assert result["metadata"]["cookie_domains"] == [
+        "xiaohongshu.com",
+        "rednote.com",
+    ]
+    assert result["metadata"]["allowed_url_domains"] == [
+        "xiaohongshu.com",
+        "xhslink.com",
+        "rednote.com",
+        "xhscdn.com",
+    ]
     assert result["metadata"]["cookie_browser_supported"] is False
+    assert result["metadata"]["cookie_validation_scope"] == "platform_until_redirect"
+    assert result["metadata"]["cookie_runtime_recheck"] is True
     assert "redirect_resolution" in result["risks"]
     assert any("Shortlink input" in warning for warning in result["warnings"])
+    assert any("rechecks the resolved destination" in warning for warning in result["warnings"])
     assert any("advanced local-only route" in warning for warning in result["warnings"])
     assert any("hosted demo auth is disabled" in warning for warning in result["warnings"])
 
 
-def test_preflight_douyin_uses_f2_and_cookies():
+def test_preflight_douyin_uses_ytdlp_cookie_jar():
     from omd._preflight import inspect_target
 
     result = inspect_target("https://v.douyin.com/abc123/")
@@ -32,12 +47,91 @@ def test_preflight_douyin_uses_f2_and_cookies():
     assert result["probable_backend"] == "reel"
     assert result["detected_type"] == "douyin_url"
     assert result["needs_cookies"] is True
-    assert result["needs_tools"] == ["f2", "ffmpeg", "mlx_whisper"]
+    assert result["needs_tools"] == ["yt-dlp", "ffmpeg", "mlx_whisper"]
     assert result["metadata"]["cookie_strategy"] == "cookies_txt_required"
     assert result["metadata"]["cookie_browser_supported"] is False
+    assert result["metadata"]["cookie_validation_scope"] == "platform_cookie_jar"
+    assert result["metadata"]["cookie_runtime_recheck"] is False
+    assert result["metadata"]["redirect_cookie_policy"] == (
+        "anonymous_bounded_then_scoped_cookie_jar"
+    )
     assert "auth_required" in result["risks"]
+    assert "redirect_resolution" in result["risks"]
+    assert any("expanded anonymously" in warning for warning in result["warnings"])
     assert any("advanced local-only route" in warning for warning in result["warnings"])
     assert any("hosted demo auth is disabled" in warning for warning in result["warnings"])
+
+
+def test_preflight_douyin_with_nondefault_port_stays_on_guarded_route():
+    from omd._preflight import inspect_target
+
+    result = inspect_target("https://v.douyin.com:444/abc123/")
+
+    assert result["detected_type"] == "douyin_url"
+    assert result["probable_backend"] == "reel"
+    assert result["metadata"]["redirect_cookie_policy"] == (
+        "anonymous_bounded_then_scoped_cookie_jar"
+    )
+    assert "unsafe_url" in result["risks"]
+
+
+def test_preflight_blocks_unsafe_cookie_provider_transports():
+    from omd._preflight import inspect_target
+    from omd.doctor import readiness_for_preflight
+
+    targets = [
+        "http://www.douyin.com/video/123",
+        "https://v.douyin.com:444/abc123/",
+        "https://user:pass@www.douyin.com/video/123",
+        "http://www.xiaohongshu.com/explore/abc123",
+        "https://www.rednote.com:444/explore/abc123",
+        "https://user:pass@www.xiaohongshu.com/explore/abc123",
+    ]
+
+    for target in targets:
+        result = inspect_target(target)
+        assert "unsafe_url" in result["risks"], target
+        readiness = readiness_for_preflight(result, [])
+        assert "unsafe_url" in readiness["blocking_risks"], target
+        assert readiness["ready"] is False
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://xhslink.com/a/abc",
+        "http://xhslink.com:80/a/abc",
+        "https://xhslink.com/a/abc",
+        "https://xhslink.com:443/a/abc",
+    ],
+)
+def test_preflight_allows_anonymous_xhs_shortlink_default_transports(target):
+    from omd._preflight import inspect_target
+
+    assert "unsafe_url" not in inspect_target(target)["risks"]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://xhslink.com:8080/a/abc",
+        "https://xhslink.com:444/a/abc",
+        "https://user:pass@xhslink.com/a/abc",
+    ],
+)
+def test_preflight_blocks_unsafe_xhs_shortlink_transports(target):
+    from omd._preflight import inspect_target
+
+    assert "unsafe_url" in inspect_target(target)["risks"]
+
+
+def test_preflight_direct_xhs_uses_request_url_cookie_scope():
+    from omd._preflight import inspect_target
+
+    result = inspect_target("https://www.xiaohongshu.com/explore/abc123")
+
+    assert result["metadata"]["cookie_validation_scope"] == "request_url"
+    assert result["metadata"]["cookie_runtime_recheck"] is False
 
 
 def test_preflight_pdf_file_uses_markitdown(tmp_path):

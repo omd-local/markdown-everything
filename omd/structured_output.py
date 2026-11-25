@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PROPERTY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 _TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
-_KEYS = frozenset({"type", "properties", "required", "additionalProperties", "items", "enum"})
+_KEYS = frozenset(
+    {"type", "properties", "required", "additionalProperties", "items", "enum", "minItems"}
+)
 _MAX_SCHEMA_BYTES = 64 * 1024
 _MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _MAX_DEPTH = 8
@@ -84,6 +86,8 @@ def _validate_schema(schema: object, *, path: str, depth: int) -> None:
     kind = schema.get("type")
     if kind not in _TYPES:
         raise ValueError(f"unsupported schema type at {path}")
+    if kind != "array" and "minItems" in schema:
+        raise ValueError(f"minItems is only supported for arrays at {path}")
     enum = schema.get("enum")
     if enum is not None:
         if not isinstance(enum, list) or not enum or any(
@@ -106,6 +110,9 @@ def _validate_schema(schema: object, *, path: str, depth: int) -> None:
     elif kind == "array":
         if "items" not in schema:
             raise ValueError(f"array schema requires items at {path}")
+        min_items = schema.get("minItems", 0)
+        if type(min_items) is not int or min_items not in {0, 1}:
+            raise ValueError(f"array minItems must be 0 or 1 at {path}")
         _validate_schema(schema["items"], path=f"{path}[]", depth=depth + 1)
     elif set(schema) - {"type", "enum"}:
         raise ValueError(f"unsupported schema keyword for {kind} at {path}")
@@ -133,6 +140,9 @@ def _validate_value(value: object, schema: dict[str, object], *, path: str, dept
             _validate_value(value[name], child_schema, path=f"{path}.{name}", depth=depth + 1)
     elif kind == "array":
         assert isinstance(value, list)
+        min_items = schema.get("minItems", 0)
+        if len(value) < min_items:
+            raise StructuredOutputError(f"{path} must contain at least {min_items} item")
         for index, item in enumerate(value):
             _validate_value(item, schema["items"], path=f"{path}[{index}]", depth=depth + 1)
 

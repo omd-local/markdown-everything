@@ -245,6 +245,7 @@ def compose_markdown(
     segments: list[dict] | None,
     transcript_source: str = "",
     transcript_warnings: list[str] | None = None,
+    transcript_language: str = "",
 ) -> str:
     title = item["title"] or "Podcast Episode"
     lines = [f"# {title}\n", "## Metadata\n"]
@@ -257,6 +258,7 @@ def compose_markdown(
         ("Duration", item.get("duration")),
         ("Audio", item.get("audio_url")),
         ("Transcript source", transcript_source),
+        ("Language", transcript_language),
     ]
     for k, v in meta:
         if v:
@@ -295,10 +297,22 @@ def compose_markdown(
 
 
 def main() -> int:
+    from omd.config import SPOKEN_LANGUAGE_MODES
+
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("url", help="Apple Podcasts episode or show URL.")
     p.add_argument("-o", "--output", help="Write markdown here (default: stdout).")
-    p.add_argument("--whisper-lang", default="en", help="Whisper language hint (default en).")
+    p.add_argument(
+        "--whisper-lang",
+        default=None,
+        help="Whisper language hint such as en/zh, or auto; omit to inherit the podcast/config default.",
+    )
+    p.add_argument(
+        "--spoken-language-mode",
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Spoken-language policy; explicit requires --whisper-lang.",
+    )
     p.add_argument("--preferred-languages", default=None,
                    help="Comma-separated common Whisper languages; first is used when --whisper-lang is omitted.")
     p.add_argument("--model", default="mlx-community/whisper-large-v3-turbo", help="Whisper model.")
@@ -334,12 +348,46 @@ def main() -> int:
             validate_ollama_host(args.ollama_host, allow_remote=args.allow_remote_ollama)
         except ValueError as exc:
             _events.fatal("ollama_host_blocked", str(exc))
-    from omd._language import choose_whisper_language
-    whisper_lang = choose_whisper_language(
-        None if args.whisper_lang == "en" else args.whisper_lang,
-        preferred=args.preferred_languages,
-        default="en",
-    )
+    try:
+        from omd.cli import _normalize_whisper_language
+        from omd._language import parse_preferred_languages
+        from omd.config import config_path, load_config, resolve_capture_config
+
+        runtime_config_path = config_path()
+        configured = load_config(runtime_config_path) if runtime_config_path.exists() else None
+        whisper_override = (
+            _normalize_whisper_language(args.whisper_lang)
+            if args.whisper_lang is not None
+            else None
+        )
+        spoken_mode = args.spoken_language_mode
+        spoken_hint = whisper_override
+        if spoken_mode is None:
+            if whisper_override == "auto":
+                spoken_mode = "auto-detect"
+                spoken_hint = None
+            elif whisper_override is not None:
+                spoken_mode = "explicit"
+            elif args.preferred_languages is not None:
+                preferred = parse_preferred_languages(args.preferred_languages)
+                spoken_mode = "explicit" if preferred else "inherit-adapter-default"
+                spoken_hint = preferred[0] if preferred else None
+        elif spoken_mode != "explicit" and whisper_override is not None:
+            raise ValueError("--whisper-lang may only accompany explicit spoken-language mode")
+
+        resolved = resolve_capture_config(
+            configured,
+            explicit_spoken_language_mode=spoken_mode,
+            explicit_spoken_language_hint=spoken_hint,
+        )
+        if resolved.spoken_language_mode == "explicit":
+            whisper_lang = resolved.spoken_language_hint
+        elif resolved.spoken_language_mode == "auto-detect":
+            whisper_lang = None
+        else:
+            whisper_lang = "en"
+    except ValueError as exc:
+        _events.fatal("language_config_invalid", str(exc))
 
     url = extract_url(args.url)
     if not is_apple_podcast_url(url):
@@ -375,6 +423,7 @@ def main() -> int:
     polished = ""
     segments: list[dict] = []
     transcript_warnings: list[str] = []
+    transcript_language = ""
     try:
         if not args.no_transcript and item["audio_url"]:
             audio = _episode_audio_path(workdir, item["audio_url"], item["audio_type"])
@@ -390,6 +439,7 @@ def main() -> int:
             tr = transcribe(audio, workdir, args.model, whisper_lang, args.whisper_backend)
             transcript_text = (tr.get("text") or "").strip()
             segments = tr.get("segments") or []
+            transcript_language = str(tr.get("language") or "").strip()
             from omd._transcript import apply_transcript_quality, report_transcript_quality
 
             transcript_warnings = apply_transcript_quality(
@@ -420,6 +470,7 @@ def main() -> int:
             segments,
             transcript_source,
             transcript_warnings=transcript_warnings,
+            transcript_language=transcript_language,
         )
         if args.output:
             from omd._io import write_atomic

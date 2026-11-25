@@ -128,7 +128,12 @@ def test_xhs_shortlink_expansion_does_not_send_cookies(monkeypatch):
 
     calls = []
 
-    def fake_http_get(url: str, cookie_str: str = "", redirect: bool = True):
+    def fake_http_get(
+        url: str,
+        cookie_str: str = "",
+        redirect: bool = True,
+        **_kwargs,
+    ):
         calls.append((url, cookie_str, redirect))
         return 302, {"Location": "https://www.xiaohongshu.com/explore/abc123"}, b"", url
 
@@ -176,93 +181,6 @@ def test_write_atomic_bytes_uses_restrictive_permissions(tmp_path):
     assert oct(os.stat(target).st_mode & 0o777) == "0o600"
 
 
-def test_f2_cookie_value_is_written_to_private_temp_config_not_argv(tmp_path):
-    from omd.reel import _build_f2_douyin_command, _write_f2_cookie_config
-
-    cfg = _write_f2_cookie_config(tmp_path, "sid_guard=secret")
-    cmd = _build_f2_douyin_command(
-        "f2",
-        cfg,
-        "https://v.douyin.com/abc/",
-        tmp_path,
-    )
-
-    assert "-k" not in cmd
-    assert "sid_guard=secret" not in cmd
-    assert str(cfg) in cmd
-    assert cfg.read_text(encoding="utf-8").count("sid_guard=secret") == 1
-    assert oct(cfg.stat().st_mode & 0o777) == "0o600"
-
-
-def test_download_f2_does_not_leave_cookie_config_in_keep_dir(tmp_path, monkeypatch):
-    from omd import reel
-
-    seen_cmd = {}
-
-    def fake_run(cmd, input, text, capture_output=False):
-        seen_cmd["cmd"] = cmd
-        user_dir = tmp_path / "creator"
-        user_dir.mkdir()
-        (user_dir / "clip_music.mp3").write_bytes(b"audio")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(reel, "require", lambda cmd: cmd)
-    monkeypatch.setattr(reel, "cookies_txt_to_string", lambda *_a, **_kw: "sid_guard=secret")
-    monkeypatch.setattr(reel.subprocess, "run", fake_run)
-
-    audio, info, cover = reel.download_f2(
-        "https://v.douyin.com/abc/",
-        tmp_path,
-        str(tmp_path / "uploaded-cookies.txt"),
-    )
-
-    assert audio.name == "clip_music.mp3"
-    assert info["extractor_key"] == "Douyin"
-    assert cover is None
-    assert "sid_guard=secret" not in seen_cmd["cmd"]
-    assert not list(tmp_path.rglob("f2-dy-cookie.yaml"))
-
-
-def test_download_f2_ignores_macos_appledouble_video_sidecars(tmp_path, monkeypatch):
-    from omd import reel
-
-    seen_ffmpeg = {}
-
-    def fake_subprocess_run(cmd, input=None, text=None, capture_output=False, **_kw):
-        if cmd[0] == "f2":
-            user_dir = tmp_path / "creator"
-            user_dir.mkdir()
-            (user_dir / "._clip_video.mp4").write_bytes(b"sidecar")
-            (user_dir / "clip_video.mp4").write_bytes(b"video")
-            (user_dir / "._clip_desc.txt").write_text("sidecar desc", encoding="utf-8")
-            (user_dir / "clip_desc.txt").write_text("real desc", encoding="utf-8")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(f"unexpected subprocess.run: {cmd}")
-
-    def fake_run(cmd, **_kw):
-        seen_ffmpeg["cmd"] = cmd
-        Path(cmd[-1]).write_bytes(b"audio")
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(reel, "require", lambda cmd: cmd)
-    monkeypatch.setattr(reel, "cookies_txt_to_string", lambda *_a, **_kw: "sid_guard=secret")
-    monkeypatch.setattr(reel.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(reel, "run", fake_run)
-
-    audio, info, cover = reel.download_f2(
-        "https://v.douyin.com/abc/",
-        tmp_path,
-        str(tmp_path / "uploaded-cookies.txt"),
-    )
-
-    assert seen_ffmpeg["cmd"][3].endswith("clip_video.mp4")
-    assert not Path(seen_ffmpeg["cmd"][3]).name.startswith("._")
-    assert audio.name == "clip_audio.mp3"
-    assert info["extractor_key"] == "Douyin"
-    assert info["description"] == "real desc"
-    assert cover is None
-
-
 class FakeResponse:
     def __init__(self, chunks: list[bytes], content_length: int | None = None):
         self._chunks = list(chunks)
@@ -308,20 +226,27 @@ def test_xhs_download_rejects_stream_that_exceeds_limit(tmp_path, monkeypatch):
 
     monkeypatch.setenv("OMD_MAX_DOWNLOAD_MB", "1")
     chunks = [b"x" * (700 * 1024), b"y" * (700 * 1024)]
-    monkeypatch.setattr(
-        xhs.urllib.request,
-        "urlopen",
-        lambda *_a, **_kw: FakeResponse(chunks, content_length=None),
-    )
+    captured = {}
+
+    class FakeOpener:
+        def open(self, request, *, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse(chunks, content_length=None)
+
+    monkeypatch.setattr(xhs.urllib.request, "build_opener", lambda *_a: FakeOpener())
     dest = tmp_path / "image.jpg"
 
     try:
-        xhs.download_to("https://cdn.example.com/image.jpg", dest)
+        xhs.download_to("https://cdn.xhscdn.com/image.jpg", dest)
     except ValueError as e:
         assert "exceeded limit" in str(e)
     else:
         raise AssertionError("oversized XHS download stream was not rejected")
 
+    assert captured["request"].get_header("Cookie") is None
+    assert captured["request"].full_url == "https://cdn.xhscdn.com/image.jpg"
+    assert captured["timeout"] == 60
     assert not dest.exists()
 
 

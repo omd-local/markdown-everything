@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from time import monotonic
 from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
-from ._network_policy import build_no_redirect_opener, validate_ollama_base_url
+from ._network_policy import build_no_redirect_opener, build_ollama_opener, validate_ollama_base_url
 
 
 _MAX_CATALOG_BYTES = 1024 * 1024
@@ -37,6 +38,17 @@ class ModelAvailability:
     destination_domain: str
     alternative_models: tuple[str, ...]
     elapsed_seconds: float
+    answer_compatibility: str
+    answer_compatibility_reason: str
+    answer_contract: str | None
+    catalog_models: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AnswerModelCompatibility:
+    status: str
+    reason: str
+    contract: str | None
 
 
 class ProviderCatalogError(RuntimeError):
@@ -68,7 +80,12 @@ def discover_provider_models(
         endpoint=endpoint,
         allow_remote_ollama=allow_remote_ollama,
     )
-    open_call = opener or build_no_redirect_opener().open
+    open_call = opener
+    if open_call is None:
+        if normalized_provider == "ollama":
+            open_call = build_ollama_opener(request.full_url).open
+        else:
+            open_call = build_no_redirect_opener().open
     now = clock or monotonic
     started_at = now()
     try:
@@ -145,6 +162,7 @@ def validate_selected_model(
         allow_remote_ollama=allow_remote_ollama,
     )
     available = normalized_model in catalog.models
+    compatibility = answer_model_compatibility(catalog.provider, normalized_model)
     return ModelAvailability(
         provider=catalog.provider,
         selected_model=normalized_model,
@@ -152,6 +170,211 @@ def validate_selected_model(
         destination_domain=catalog.destination_domain,
         alternative_models=() if available else catalog.models[:20],
         elapsed_seconds=catalog.elapsed_seconds,
+        answer_compatibility=compatibility.status,
+        answer_compatibility_reason=compatibility.reason,
+        answer_contract=compatibility.contract,
+        catalog_models=catalog.models,
+    )
+
+
+def answer_model_compatibility(provider: str, model: str) -> AnswerModelCompatibility:
+    """Return OMD's exact provider/model answer contract without probing user content.
+
+    Catalog membership proves availability only. This deliberately uses a conservative
+    provider-specific allowlist so new or renamed models remain unverified until OMD's
+    request shape has been checked against the provider contract.
+    """
+    normalized_provider = _provider(provider)
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model must not be empty")
+    selected = model.strip()
+    normalized_model = selected.lower()
+
+    if normalized_provider == "ollama":
+        return AnswerModelCompatibility(
+            status="supported",
+            reason=(
+                f"{selected} uses Ollama's local JSON schema output with OMD validation."
+            ),
+            contract="local_json_schema",
+        )
+    if normalized_provider == "openai":
+        return _openai_answer_compatibility(selected, normalized_model)
+    if normalized_provider == "anthropic":
+        return _anthropic_answer_compatibility(selected, normalized_model)
+    return _deepseek_answer_compatibility(selected, normalized_model)
+
+
+def _openai_answer_compatibility(
+    selected: str, normalized_model: str
+) -> AnswerModelCompatibility:
+    # This is deliberately a model-family registry rather than a broad gpt-* match.
+    # OpenAI's catalog proves that an ID exists, but does not publish capability
+    # flags; notably, some Pro variants do not support Structured Outputs even
+    # when the base model does.
+    supported_families = (
+        "gpt-6-astra",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.2",
+        "gpt-5.2-chat-latest",
+        "gpt-5.1",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-5-pro",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o-mini",
+        "o1",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+    )
+    no_strict_schema_families = ("gpt-5.2-pro", "gpt-5.4-pro")
+    no_streaming_families = ("gpt-5.5-pro", "o1-pro", "o3-pro")
+    if normalized_model == "gpt-4o":
+        return _supported_strict(selected, "OpenAI")
+    if normalized_model.startswith("gpt-4o-"):
+        snapshot = normalized_model.removeprefix("gpt-4o-")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", snapshot):
+            if snapshot >= "2024-08-06":
+                return _supported_strict(selected, "OpenAI")
+            return AnswerModelCompatibility(
+                status="unsupported",
+                reason=(
+                    f"{selected} predates OpenAI strict JSON schema output support "
+                    "required by OMD answers."
+                ),
+                contract=None,
+            )
+    if any(_model_family_match(normalized_model, family) for family in supported_families):
+        return _supported_strict(selected, "OpenAI")
+    if any(
+        _model_family_match(normalized_model, family)
+        for family in no_strict_schema_families
+    ):
+        return AnswerModelCompatibility(
+            status="unsupported",
+            reason=(
+                f"{selected} does not support the OpenAI strict JSON schema output "
+                "required by OMD answers."
+            ),
+            contract=None,
+        )
+    if any(
+        _model_family_match(normalized_model, family)
+        for family in no_streaming_families
+    ):
+        return AnswerModelCompatibility(
+            status="unsupported",
+            reason=(
+                f"{selected} does not support streaming, which is required by "
+                "OMD's hosted answer request contract."
+            ),
+            contract=None,
+        )
+    if re.match(r"^gpt-(?:3(?:\.5)?|4)(?:-|$)", normalized_model):
+        return AnswerModelCompatibility(
+            status="unsupported",
+            reason=(
+                f"{selected} does not support the OpenAI strict JSON schema output "
+                "required by OMD answers."
+            ),
+            contract=None,
+        )
+    return _unverified(selected, "OpenAI")
+
+
+def _anthropic_answer_compatibility(
+    selected: str, normalized_model: str
+) -> AnswerModelCompatibility:
+    supported = re.fullmatch(
+        r"claude-(?:(?:opus|sonnet)-4-5(?:-\d{8})?|haiku-4-5(?:-\d{8})?"
+        r"|opus-(?:4-6|4-7|4-8|5|5-5)|sonnet-(?:4-6|5|5-5)"
+        r"|fable-(?:5|5-1)|mythos-(?:preview|5|5-1))",
+        normalized_model,
+    )
+    if supported:
+        return _supported_strict(selected, "Anthropic")
+    if normalized_model.startswith("claude-3-") or re.fullmatch(
+        r"claude-(?:opus|sonnet)-4(?:-\d{8})?", normalized_model
+    ):
+        return AnswerModelCompatibility(
+            status="unsupported",
+            reason=(
+                f"{selected} is not supported by Anthropic JSON schema outputs "
+                "required by OMD answers."
+            ),
+            contract=None,
+        )
+    return _unverified(selected, "Anthropic")
+
+
+def _deepseek_answer_compatibility(
+    selected: str, normalized_model: str
+) -> AnswerModelCompatibility:
+    if normalized_model in {
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro",
+    }:
+        return AnswerModelCompatibility(
+            status="supported",
+            reason=(
+                f"{selected} uses DeepSeek JSON mode followed by OMD's local schema "
+                "validation; DeepSeek does not enforce OMD's schema as a strict provider contract."
+            ),
+            contract="json_mode_local_validation",
+        )
+    if normalized_model in {"deepseek-chat", "deepseek-reasoner"}:
+        return AnswerModelCompatibility(
+            status="unsupported",
+            reason=(
+                f"{selected} is a discontinued DeepSeek model ID. Choose an exact "
+                "model returned by the current provider catalog."
+            ),
+            contract=None,
+        )
+    return _unverified(selected, "DeepSeek")
+
+
+def _supported_strict(selected: str, provider_label: str) -> AnswerModelCompatibility:
+    return AnswerModelCompatibility(
+        status="supported",
+        reason=(
+            f"{selected} supports the {provider_label} JSON schema output contract "
+            "required by OMD answers."
+        ),
+        contract="strict_json_schema",
+    )
+
+
+def _unverified(selected: str, provider_label: str) -> AnswerModelCompatibility:
+    return AnswerModelCompatibility(
+        status="unverified",
+        reason=(
+            f"OMD has not verified {selected} against the {provider_label} structured "
+            "answer contract. Catalog availability alone does not prove compatibility."
+        ),
+        contract=None,
+    )
+
+
+def _model_family_match(model: str, family: str) -> bool:
+    if model == family:
+        return True
+    suffix = model.removeprefix(f"{family}-")
+    return model.startswith(f"{family}-") and bool(
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}", suffix)
     )
 
 

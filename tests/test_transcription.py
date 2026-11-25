@@ -332,6 +332,7 @@ def test_xhs_video_applies_source_duration_quality_check(
         "video_url": "https://cdn.example.com/video.mp4",
     }
     monkeypatch.setattr(sys, "argv", ["omd.xhs", url, "-o", str(output), "--keep", str(keep_dir)])
+    monkeypatch.setattr(xhs, "require_cookie_header", lambda *_args, **_kwargs: "session=demo")
     monkeypatch.setattr(xhs, "_http_get", lambda *_args, **_kwargs: (200, {}, b"html", url))
     monkeypatch.setattr(xhs, "parse_initial_state", lambda _html: {})
     monkeypatch.setattr(xhs, "extract_note", lambda *_args: note)
