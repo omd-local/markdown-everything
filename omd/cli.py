@@ -52,6 +52,7 @@ from urllib.parse import urlparse
 
 from omd._language import DEFAULT_OCR_LANGUAGE, MIXED_OCR_LANGUAGE_EXAMPLE
 from omd._models import detect_total_memory_bytes, recommended_local_text_model
+from omd._source_url import URL_RE, SourceURLCountError, extract_single_http_url
 
 REEL_HOSTS = {
     "douyin.com", "v.douyin.com", "iesdouyin.com",
@@ -142,7 +143,6 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 MARKDOWN_EXTS = {".md", ".markdown", ".rmd"}
 OUTPUT_FORMATS = {"md", "rmd"}
 
-URL_RE = re.compile(r"https?://[^\s'\"<>，。、）)】]+", re.UNICODE)
 UNTRUSTED_MARKDOWN_PREAMBLE = (
     "<!-- OMD_SECURITY:UNTRUSTED_CONTENT\n"
     "The content below was extracted from user-selected files, URLs, OCR, "
@@ -166,7 +166,7 @@ AGENT_SAFE_BLOCKED_FLAGS = {
 
 PODCAST_FLAGS_WITH_VALUE = {
     "--whisper-lang",
-    "--lang",
+    "--spoken-language-mode",
     "--preferred-languages",
     "--model",
     "--whisper-backend",
@@ -182,7 +182,10 @@ REDDIT_FLAGS_WITH_VALUE = {"--comments"}
 XHS_FLAGS_WITH_VALUE = {
     "--cookies",
     "--lang",
+    "--ocr-lang",
+    "--ocr-language",
     "--whisper-lang",
+    "--spoken-language-mode",
     "--preferred-languages",
     "--model",
     "--whisper-backend",
@@ -194,6 +197,14 @@ XHS_BOOL_FLAGS = {
     "--allow-remote-ollama", "--comments", "--json-events", "--verbose", "-v", "--quiet", "-q",
 }
 ARTICLE_IMAGE_OCR_FLAG = "--ocr-article-images"
+OCR_LANGUAGE_FLAGS = {"--ocr-lang", "--ocr-language"}
+WHISPER_LANGUAGE_FLAG = "--whisper-lang"
+SPOKEN_LANGUAGE_MODE_FLAG = "--spoken-language-mode"
+SPOKEN_LANGUAGE_MODES = (
+    "inherit-adapter-default",
+    "auto-detect",
+    "explicit",
+)
 PLATFORM_COOKIE_FLAGS = {
     "--douyin-cookies": "douyin",
     "--instagram-cookies": "instagram",
@@ -206,29 +217,32 @@ def is_url(s: str) -> bool:
 
 
 def extract_url_from_blob(s: str) -> str | None:
-    if is_url(s):
-        return s.split()[0]
-    m = URL_RE.search(s)
-    return m.group(0).rstrip("/.,;)") if m else None
+    return extract_single_http_url(s)
 
 
 def is_reel_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return any(host == h or host.endswith("." + h) for h in REEL_HOSTS)
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in DOUYIN_HOSTS):
+        # Keep malformed Douyin authorities on the provider route so its strict
+        # URL guard can reject them before a cookie jar reaches yt-dlp.
+        return True
+    authority = parsed.netloc.lower()
+    return any(authority == h or authority.endswith("." + h) for h in REEL_HOSTS)
 
 
 def is_douyin_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
+    host = (urlparse(url).hostname or "").lower()
     return any(host == h or host.endswith("." + h) for h in DOUYIN_HOSTS)
 
 
 def is_instagram_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return any(host == h or host.endswith("." + h) for h in INSTAGRAM_HOSTS)
+    authority = urlparse(url).netloc.lower()
+    return any(authority == h or authority.endswith("." + h) for h in INSTAGRAM_HOSTS)
 
 
 def is_xhs_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
+    host = (urlparse(url).hostname or "").lower()
     return any(host == h or host.endswith("." + h) for h in XHS_HOSTS)
 
 
@@ -291,6 +305,310 @@ def _normalize_output_format(value: str | None) -> str:
 
         _events.fatal("format_invalid", f"unsupported output format: {value}")
     return fmt
+
+
+def _coalesce_ocr_language_values(
+    legacy: str | None,
+    explicit: str | None,
+) -> str | None:
+    """Normalize compatible OCR aliases and reject contradictory values."""
+    from omd._language import normalize_ocr_language_set
+
+    normalized_legacy = normalize_ocr_language_set(legacy) if legacy is not None else None
+    normalized_explicit = normalize_ocr_language_set(explicit) if explicit is not None else None
+    if (
+        normalized_legacy is not None
+        and normalized_explicit is not None
+        and normalized_legacy != normalized_explicit
+    ):
+        raise ValueError(
+            "conflicting OCR language values: "
+            f"--lang={normalized_legacy} and --ocr-language={normalized_explicit}"
+        )
+    return normalized_explicit or normalized_legacy
+
+
+def _normalize_whisper_language(value: str) -> str:
+    from omd._language import normalize_spoken_language_hint
+
+    return normalize_spoken_language_hint(value, allow_auto=True)
+
+
+def _coalesce_whisper_language_values(*values: str | None) -> str | None:
+    normalized = [_normalize_whisper_language(value) for value in values if value is not None]
+    if not normalized:
+        return None
+    if any(value != normalized[0] for value in normalized[1:]):
+        raise ValueError(f"conflicting Whisper language values: {', '.join(normalized)}")
+    return normalized[0]
+
+
+def _coalesce_spoken_language_modes(*values: str | None) -> str | None:
+    normalized = [str(value).strip().lower() for value in values if value is not None]
+    if not normalized:
+        return None
+    allowed = {"inherit-adapter-default", "auto-detect", "explicit"}
+    if any(value not in allowed for value in normalized):
+        raise ValueError(
+            "--spoken-language-mode must be one of: " + ", ".join(sorted(allowed))
+        )
+    if any(value != normalized[0] for value in normalized[1:]):
+        raise ValueError(f"conflicting spoken language modes: {', '.join(normalized)}")
+    return normalized[0]
+
+
+def _adapter_local_language_options(
+    target: str,
+    ocr_language: str | None,
+    extra: list[str],
+) -> tuple[str | None, list[str]]:
+    """Resolve deprecated adapter ``--lang`` without crossing OCR and ASR."""
+    legacy_values = _option_values(extra, "--lang")
+    if not legacy_values:
+        return ocr_language, extra
+    clean = _strip_extra_flags_with_value(extra, {"--lang"})
+    url = extract_url_from_blob(target)
+    if url and is_xhs_url(url):
+        requested_ocr = ocr_language
+        for value in legacy_values:
+            requested_ocr = _coalesce_ocr_language_values(requested_ocr, value)
+        return requested_ocr, clean
+    if url and is_reel_url(url):
+        requested_asr = _coalesce_whisper_language_values(
+            *_option_values(clean, WHISPER_LANGUAGE_FLAG),
+            *legacy_values,
+        )
+        clean = _strip_extra_flags_with_value(clean, {WHISPER_LANGUAGE_FLAG})
+        if requested_asr is not None:
+            clean += [WHISPER_LANGUAGE_FLAG, requested_asr]
+        return ocr_language, clean
+    raise ValueError(
+        "adapter-local --lang is supported only for reel ASR or XHS OCR; "
+        "use --ocr-language or --whisper-lang explicitly"
+    )
+
+
+def _resolve_ocr_aliases_or_fatal(
+    legacy: str | None,
+    explicit: str | None,
+) -> str | None:
+    from omd import _events
+
+    try:
+        return _coalesce_ocr_language_values(legacy, explicit)
+    except ValueError as exc:
+        _events.fatal("ocr_language_invalid", str(exc))
+
+
+def _resolve_route_recognition_details(
+    ocr_language: str | None,
+    extra: list[str],
+) -> tuple[str, list[str], dict[str, object], dict[str, object]]:
+    """Resolve config-aware OCR/ASR values without crossing their semantics."""
+    from omd import _events
+    from omd._language import parse_preferred_languages
+    from omd.config import ConfigError, config_path, load_config, resolve_capture_config
+
+    try:
+        whisper_language = _coalesce_whisper_language_values(
+            *_option_values(extra, WHISPER_LANGUAGE_FLAG)
+        )
+        spoken_mode_override = _coalesce_spoken_language_modes(
+            *_option_values(extra, SPOKEN_LANGUAGE_MODE_FLAG)
+        )
+        preferred_values = _option_values(extra, "--preferred-languages")
+        asr_requested: str | None = None
+        if spoken_mode_override == "inherit-adapter-default":
+            if whisper_language is not None or preferred_values:
+                raise ValueError(
+                    "--spoken-language-mode inherit-adapter-default conflicts with "
+                    "--whisper-lang/--preferred-languages"
+                )
+            spoken_mode = "inherit-adapter-default"
+            spoken_hint = None
+            asr_requested = "inherit-adapter-default"
+        elif spoken_mode_override == "auto-detect":
+            if whisper_language not in {None, "auto"} or preferred_values:
+                raise ValueError(
+                    "--spoken-language-mode auto-detect conflicts with an explicit language hint"
+                )
+            spoken_mode = "auto-detect"
+            spoken_hint = None
+            asr_requested = "auto"
+        elif spoken_mode_override == "explicit":
+            if whisper_language == "auto":
+                raise ValueError(
+                    "--spoken-language-mode explicit requires one language code, not auto"
+                )
+            preferred_languages = (
+                parse_preferred_languages(preferred_values[-1]) if preferred_values else []
+            )
+            spoken_hint = whisper_language or (
+                preferred_languages[0] if preferred_languages else None
+            )
+            if spoken_hint is None:
+                raise ValueError(
+                    "--spoken-language-mode explicit requires --whisper-lang LANGUAGE"
+                )
+            spoken_mode = "explicit"
+            asr_requested = spoken_hint
+        elif whisper_language == "auto":
+            spoken_mode = "auto-detect"
+            spoken_hint = None
+            asr_requested = "auto"
+        elif whisper_language is not None:
+            spoken_mode = "explicit"
+            spoken_hint = whisper_language
+            asr_requested = whisper_language
+        elif preferred_values:
+            preferred_languages = parse_preferred_languages(preferred_values[-1])
+            if preferred_languages:
+                spoken_mode = "explicit"
+                spoken_hint = preferred_languages[0]
+                asr_requested = spoken_hint
+            else:
+                # Suppress environment/config ASR hints just as adapter-local
+                # ``--preferred-languages`` historically did when it was empty/invalid.
+                spoken_mode = "inherit-adapter-default"
+                spoken_hint = None
+        else:
+            spoken_mode = None
+            spoken_hint = None
+        runtime_config_path = config_path()
+        configured = load_config(runtime_config_path) if runtime_config_path.exists() else None
+        resolved = resolve_capture_config(
+            configured,
+            explicit_ocr_language=ocr_language,
+            explicit_spoken_language_mode=spoken_mode,
+            explicit_spoken_language_hint=spoken_hint,
+        )
+    except (ConfigError, ValueError) as exc:
+        _events.fatal("language_config_invalid", str(exc))
+
+    routed_extra = _strip_extra_flags_with_value(
+        extra,
+        {WHISPER_LANGUAGE_FLAG, SPOKEN_LANGUAGE_MODE_FLAG},
+    )
+    if resolved.spoken_language_mode == "auto-detect":
+        asr_requested = "auto"
+        routed_extra += [WHISPER_LANGUAGE_FLAG, "auto"]
+    elif resolved.spoken_language_mode == "explicit":
+        asr_requested = resolved.spoken_language_hint
+        routed_extra += [WHISPER_LANGUAGE_FLAG, str(resolved.spoken_language_hint)]
+    elif resolved.spoken_language_source == "explicit":
+        asr_requested = "inherit-adapter-default"
+        routed_extra += [SPOKEN_LANGUAGE_MODE_FLAG, "inherit-adapter-default"]
+
+    recognition: dict[str, object] = {
+        "ocr": {
+            "requested": ocr_language,
+            "effective": resolved.ocr_language,
+            "source": resolved.ocr_language_source,
+        },
+        "asr": {"requested": asr_requested, "detected": None},
+        "generation": {"language_policy": "same-as-source"},
+    }
+    event_recognition: dict[str, object] = {
+        "ocr": dict(recognition["ocr"]),
+        "asr": {
+            "requested": asr_requested,
+            "mode": resolved.spoken_language_mode,
+            "effective": (
+                resolved.spoken_language_hint
+                if resolved.spoken_language_mode == "explicit"
+                else None
+            ),
+            "source": resolved.spoken_language_source,
+        },
+    }
+    return resolved.ocr_language, routed_extra, recognition, event_recognition
+
+
+def _resolve_route_recognition(
+    ocr_language: str | None,
+    extra: list[str],
+) -> tuple[str, list[str], dict[str, object]]:
+    """Resolve language policy and emit its machine-readable explanation."""
+    from omd import _events
+
+    effective, routed_extra, recognition, event_recognition = (
+        _resolve_route_recognition_details(ocr_language, extra)
+    )
+    _events.recognition_resolved(event_recognition)
+    return effective, routed_extra, recognition
+
+
+_INSPECT_ASR_ADAPTER_DEFAULTS: dict[str, tuple[str, str | None]] = {
+    "podcast_url": ("inherit-adapter-default", "en"),
+    "xhs_url": ("inherit-adapter-default", "zh"),
+    "douyin_url": ("inherit-adapter-default", "zh"),
+    "reel_url": ("inherit-adapter-default", None),
+    "audio_file": ("auto-detect", None),
+}
+_INSPECT_ASR_TYPES = frozenset(_INSPECT_ASR_ADAPTER_DEFAULTS)
+_INSPECT_ERROR_MESSAGE_MAX_CHARS = 1024
+
+
+def _inspect_asr_explanation(
+    preflight: dict[str, object],
+    resolved: dict[str, object],
+) -> dict[str, object]:
+    """Explain the ASR policy only when the inspected route can use ASR."""
+    detected_type = str(preflight.get("detected_type") or "")
+    if detected_type not in _INSPECT_ASR_TYPES:
+        return {"mode": None, "effective": None, "source": "unknown"}
+
+    mode = resolved.get("mode")
+    if mode != "inherit-adapter-default":
+        return {
+            "mode": mode,
+            "effective": resolved.get("effective"),
+            "source": resolved.get("source"),
+        }
+
+    adapter_default = _INSPECT_ASR_ADAPTER_DEFAULTS.get(detected_type)
+    if adapter_default is None:
+        return {"mode": None, "effective": None, "source": "unknown"}
+    default_mode, effective = adapter_default
+    return {
+        "mode": default_mode,
+        "effective": effective,
+        "source": resolved.get("source"),
+    }
+
+
+def _validate_ocr_language_for_execution(
+    language: str,
+    *,
+    executable: str = "tesseract",
+) -> str:
+    from omd import _events
+    from omd._language import (
+        MissingOcrLanguagePacks,
+        OcrLanguageProbeError,
+        validate_ocr_language_packs,
+    )
+
+    try:
+        return validate_ocr_language_packs(language, executable=executable)
+    except MissingOcrLanguagePacks as exc:
+        _events.fatal("ocr_language_pack_missing", str(exc))
+    except OcrLanguageProbeError as exc:
+        _events.fatal("ocr_language_probe_failed", str(exc))
+
+
+def _prepare_ocr_execution(language: str) -> tuple[str, str]:
+    """Resolve, probe, and pin the Tesseract executable used for OCR."""
+    executable = require("tesseract")
+    return (
+        _validate_ocr_language_for_execution(language, executable=executable),
+        executable,
+    )
+
+
+def _ocr_adapter_extra(extra: list[str], language: str) -> list[str]:
+    clean = _strip_extra_flags_with_value(extra, OCR_LANGUAGE_FLAGS)
+    return clean + ["--ocr-lang", language]
 
 
 def _output_suffix(output_format: str) -> str:
@@ -384,7 +702,9 @@ def _validate_output_directory(path_value: str, *, label: str = "Output path") -
 
 
 def require(cmd: str) -> str:
-    p = shutil.which(cmd)
+    from omd.doctor import resolve_tool_executable
+
+    p = resolve_tool_executable(cmd)
     if not p:
         from omd import _events
         _events.fatal("tool_missing", f"`{cmd}` not on PATH")
@@ -491,7 +811,7 @@ def _platform_cookie_extra(target: str, extra: list[str]) -> list[str]:
 def route_image(path: Path, output: Path | None, lang: str) -> int:
     from omd import _events, _progress
     from omd._io import write_atomic
-    require("tesseract")
+    lang, tesseract = _prepare_ocr_execution(lang)
     out_md = output or path.with_suffix(".md")
     started = time.monotonic()
     pixels = _image_pixel_count(path)
@@ -504,7 +824,7 @@ def route_image(path: Path, output: Path | None, lang: str) -> int:
             unit="pixels",
         )
     proc = subprocess.run(
-        ["tesseract", str(path), "-", "-l", lang],
+        [tesseract, str(path), "-", "-l", lang],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -552,7 +872,13 @@ def _markdown_image_urls(markdown: str) -> list[str]:
     return urls
 
 
-def _ocr_article_images_in_file(path: Path, lang: str, *, max_images: int = 20) -> None:
+def _ocr_article_images_in_file(
+    path: Path,
+    lang: str,
+    *,
+    max_images: int = 20,
+    executable: str | None = None,
+) -> None:
     from omd import _progress
     from omd._download import copy_response_bounded
     from omd._io import write_atomic
@@ -565,7 +891,8 @@ def _ocr_article_images_in_file(path: Path, lang: str, *, max_images: int = 20) 
     urls = _markdown_image_urls(markdown)[:max_images]
     if not urls:
         return
-    require("tesseract")
+    if executable is None:
+        lang, executable = _prepare_ocr_execution(lang)
     sections: list[str] = []
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_root = Path(tmp_dir)
@@ -587,7 +914,7 @@ def _ocr_article_images_in_file(path: Path, lang: str, *, max_images: int = 20) 
                 with urllib.request.urlopen(request, timeout=30) as response:
                     copy_response_bounded(response, img_path, label="Article image")
                 proc = subprocess.run(
-                    ["tesseract", str(img_path), "-", "-l", lang],
+                    [executable, str(img_path), "-", "-l", lang],
                     capture_output=True,
                     text=True,
                     timeout=60,
@@ -948,6 +1275,7 @@ def route_audio(path: Path, output: Path | None, extra: list[str]) -> int:
 
     Flags forwarded from the top-level CLI via `extra`:
       --whisper-lang LANG      (default: auto-detect)
+      --spoken-language-mode MODE
       --model MODEL            (default: mlx-community/whisper-large-v3-turbo)
       --whisper-backend NAME   (mlx by default; faster-whisper for Linux hosts)
       --polish [MODEL]         (default polish model is sized to local memory)
@@ -965,7 +1293,11 @@ def route_audio(path: Path, output: Path | None, extra: list[str]) -> int:
 
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--whisper-lang", dest="whisper_lang", default=None)
-    p.add_argument("--lang", dest="lang", default=None)  # alias (tesseract uses --lang)
+    p.add_argument(
+        SPOKEN_LANGUAGE_MODE_FLAG,
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+    )
     p.add_argument("--preferred-languages", default=None)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--whisper-backend", default=os.environ.get("OMD_WHISPER_BACKEND", "mlx"))
@@ -981,10 +1313,16 @@ def route_audio(path: Path, output: Path | None, extra: list[str]) -> int:
             allow_remote=audio_args.allow_remote_ollama,
         )
     from omd._language import choose_whisper_language
-    lang = choose_whisper_language(
-        audio_args.whisper_lang or audio_args.lang,
-        preferred=audio_args.preferred_languages,
-    )
+    if audio_args.spoken_language_mode in {
+        "inherit-adapter-default",
+        "auto-detect",
+    }:
+        lang = None
+    else:
+        lang = choose_whisper_language(
+            audio_args.whisper_lang,
+            preferred=audio_args.preferred_languages,
+        )
 
     workdir_ctx = tempfile.TemporaryDirectory() if not audio_args.keep else None
     workdir = Path(audio_args.keep) if audio_args.keep else Path(workdir_ctx.name)
@@ -1038,7 +1376,7 @@ def route_audio(path: Path, output: Path | None, extra: list[str]) -> int:
 def route_one(
     target: str,
     output: Path | None,
-    lang: str,
+    lang: str | None,
     reel_extra: list[str],
     *,
     agent_safe: bool = False,
@@ -1046,12 +1384,72 @@ def route_one(
     output_suffix_format: str | None = None,
 ) -> int:
     from omd._preflight import inspect_target
+    try:
+        extracted_url = extract_url_from_blob(target)
+    except SourceURLCountError as exc:
+        from omd import _events
+
+        _events.fatal("source_url_count_invalid", str(exc))
+    target_is_url = extracted_url is not None
+    if not target_is_url:
+        from omd import _events
+
+        input_path = Path(target)
+        if not input_path.exists():
+            _events.fatal("file_not_found", f"{target} not found")
+        if input_path.is_dir():
+            return route_dir(
+                input_path,
+                output,
+                lang,
+                reel_extra,
+                agent_safe=agent_safe,
+                output_format=output_format,
+                output_suffix_format=output_suffix_format,
+            )
+
     article_image_ocr = ARTICLE_IMAGE_OCR_FLAG in reel_extra
     if article_image_ocr:
         reel_extra = [item for item in reel_extra if item != ARTICLE_IMAGE_OCR_FLAG]
+    try:
+        lang, reel_extra = _adapter_local_language_options(target, lang, reel_extra)
+    except ValueError as exc:
+        from omd import _events
+
+        _events.fatal("language_config_invalid", str(exc))
+    (
+        effective_ocr_language,
+        reel_extra,
+        recognition,
+        event_recognition,
+    ) = _resolve_route_recognition_details(lang, reel_extra)
     output_format = _normalize_output_format(output_format)
     preflight = inspect_target(target)
     _validate_single_output_path(target, output)
+    if target_is_url and output_format == "rmd" and output is None:
+        from omd import _events
+
+        _events.fatal("flag_conflict", "--format rmd requires -o/--output for URL inputs")
+    if not target_is_url and Path(target).suffix.lower() not in {
+        *IMAGE_EXTS,
+        *AUDIO_EXTS,
+        *MARKITDOWN_EXTS,
+    }:
+        from omd import _events
+
+        _events.fatal(
+            "unsupported_extension",
+            f"unsupported extension {Path(target).suffix.lower()} for {Path(target)}",
+        )
+
+    from omd import _events
+
+    _events.recognition_resolved(event_recognition)
+    article_ocr_executable: str | None = None
+    if article_image_ocr:
+        effective_ocr_language, article_ocr_executable = _prepare_ocr_execution(
+            effective_ocr_language
+        )
 
     def finish(source: str, out: Path | None, call) -> int:
         output_signature_before = _output_signature(out)
@@ -1079,21 +1477,27 @@ def route_one(
             output_signature_before=output_signature_before,
             output_backup=output_backup,
             article_image_ocr=article_image_ocr,
-            lang=lang,
+            lang=effective_ocr_language,
+            ocr_executable=article_ocr_executable,
+            recognition=recognition,
         )
 
-    if is_url(target) or URL_RE.search(target):
-        url = extract_url_from_blob(target)
+    if target_is_url:
+        url = extracted_url
         routed_extra = _platform_cookie_extra(target, reel_extra)
         reddit_target = bool(url and is_reddit_url(url))
         if not reddit_target:
             routed_extra = _strip_scoped_reddit_comments(routed_extra)
-        if output_format == "rmd" and output is None:
-            from omd import _events
-
-            _events.fatal("flag_conflict", "--format rmd requires -o/--output for URL inputs")
         if url and is_xhs_url(url):
-            return finish(target, output, lambda: route_xhs(target, output, routed_extra))
+            return finish(
+                target,
+                output,
+                lambda: route_xhs(
+                    target,
+                    output,
+                    _ocr_adapter_extra(routed_extra, effective_ocr_language),
+                ),
+            )
         if url and is_podcast_url(url):
             return finish(target, output, lambda: route_podcast(target, output, routed_extra))
         if url and is_wechat_url(url):
@@ -1130,29 +1534,22 @@ def route_one(
         if url and is_telegram_url(url):
             return finish(url, output, lambda: route_telegram(url, output))
         if url and is_reel_url(url):
-            return finish(target, output, lambda: route_reel(target, output, routed_extra))
+            return finish(
+                target,
+                output,
+                lambda: route_reel(
+                    target,
+                    output,
+                    _ocr_adapter_extra(routed_extra, effective_ocr_language),
+                ),
+            )
         return finish(url or target, output, lambda: route_markitdown(url or target, output))
 
-    from omd import _events
     p = Path(target)
-    if not p.exists():
-        _events.fatal("file_not_found", f"{target} not found")
-
-    if p.is_dir():
-        return route_dir(
-            p,
-            output,
-            lang,
-            reel_extra,
-            agent_safe=agent_safe,
-            output_format=output_format,
-            output_suffix_format=output_suffix_format,
-        )
-
     ext = p.suffix.lower()
     if ext in IMAGE_EXTS:
         out = output or p.with_suffix(_output_suffix(output_format))
-        return finish(str(p), out, lambda: route_image(p, out, lang))
+        return finish(str(p), out, lambda: route_image(p, out, effective_ocr_language))
     if ext in AUDIO_EXTS:
         out = output or p.with_suffix(_output_suffix(output_format))
         return finish(str(p), out, lambda: route_audio(p, out, reel_extra))
@@ -1174,6 +1571,8 @@ def _finalize_output(
     output_backup: tuple[bytes, int] | None = None,
     article_image_ocr: bool = False,
     lang: str = DEFAULT_OCR_LANGUAGE,
+    ocr_executable: str | None = None,
+    recognition: dict[str, object] | None = None,
 ) -> int:
     if return_code != 0:
         _restore_failed_output(output, backup=output_backup)
@@ -1200,14 +1599,22 @@ def _finalize_output(
         _restore_failed_output(output, backup=output_backup)
         return 1
     if article_image_ocr and output is not None and Path(output).is_file():
-        _ocr_article_images_in_file(Path(output), lang)
+        try:
+            _ocr_article_images_in_file(
+                Path(output),
+                lang,
+                executable=ocr_executable,
+            )
+        except BaseException:
+            _restore_failed_output(output, backup=output_backup)
+            raise
     if output_format == "rmd" and output is not None and Path(output).is_file():
         from omd._rmarkdown import convert_file
 
         convert_file(output)
     if agent_safe and output is not None:
         _apply_untrusted_preamble(Path(output))
-    _write_manifest_if_possible(source, output, preflight)
+    _write_manifest_if_possible(source, output, preflight, recognition=recognition)
     return return_code
 
 
@@ -1270,7 +1677,14 @@ def _output_file_is_blank(path: Path | None) -> bool:
     return True
 
 
-def _write_manifest_if_possible(source: str, output: Path | None, preflight: dict[str, object]) -> None:
+def _write_manifest_if_possible(
+    source: str,
+    output: Path | None,
+    preflight: dict[str, object],
+    *,
+    recognition: dict[str, object] | None = None,
+    backend: str | None = None,
+) -> None:
     if output is None or not Path(output).is_file():
         return
     from omd._manifest import (
@@ -1315,11 +1729,18 @@ def _write_manifest_if_possible(source: str, output: Path | None, preflight: dic
                 warning_text = str(warning)
                 if warning_text not in warnings:
                     warnings.append(warning_text)
+        transcript_language = _extract_transcript_language(Path(output))
+        if recognition is not None and transcript_language is not None:
+            recognition = json.loads(json.dumps(recognition))
+            asr = recognition.get("asr")
+            if isinstance(asr, dict):
+                asr["detected"] = transcript_language
         write_manifest_for_output(
             output,
             source=source,
-            backend=str(preflight.get("probable_backend") or "unknown"),
-            transcript_language=_extract_transcript_language(Path(output)),
+            backend=backend or str(preflight.get("probable_backend") or "unknown"),
+            transcript_language=transcript_language,
+            recognition=recognition,
             untrusted=bool(preflight.get("untrusted", True)),
             warnings=warnings,
             metadata=metadata,
@@ -1367,7 +1788,7 @@ def _apply_untrusted_preamble(output: Path) -> None:
 def route_dir(
     folder: Path,
     out_dir: Path | None,
-    lang: str,
+    lang: str | None,
     reel_extra: list[str],
     *,
     agent_safe: bool = False,
@@ -1539,10 +1960,57 @@ def _manifest_sources_for_postprocess(
     return {path: input_target for path in generated}
 
 
-def _refresh_manifest_after_postprocess(source: str, output: Path) -> None:
+def _refresh_manifest_after_postprocess(
+    source: str,
+    output: Path,
+    *,
+    preserve_existing_provenance: bool = False,
+) -> None:
     from omd._preflight import inspect_target
 
-    _write_manifest_if_possible(source, output, inspect_target(source))
+    backend: str | None = None
+    if preserve_existing_provenance:
+        from omd._manifest import (
+            canonical_source_for,
+            manifest_path_for_output,
+            source_hash_for,
+        )
+
+        try:
+            existing = json.loads(
+                manifest_path_for_output(output).read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict):
+            existing_source = existing.get("source")
+            existing_hash = existing.get("source_hash")
+            existing_output = existing.get("output")
+            output_matches = (
+                not isinstance(existing_output, str)
+                or Path(existing_output).expanduser().resolve(strict=False)
+                == output.expanduser().resolve(strict=False)
+            )
+            source_matches_hash = (
+                isinstance(existing_source, str)
+                and bool(existing_source.strip())
+                and (
+                    not isinstance(existing_hash, str)
+                    or existing_hash == source_hash_for(existing_source)
+                )
+            )
+            if output_matches and source_matches_hash:
+                source = canonical_source_for(existing_source)
+                existing_backend = existing.get("backend")
+                if isinstance(existing_backend, str) and existing_backend.strip():
+                    backend = existing_backend
+
+    _write_manifest_if_possible(
+        source,
+        output,
+        inspect_target(source),
+        backend=backend,
+    )
 
 
 def _route_suffix_format_for_postprocess(
@@ -1700,10 +2168,11 @@ def _enrich_note_human_error(
     return "\n".join(lines) + "\n"
 
 
+
 def _run_capabilities(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="omd capabilities",
-        description="Report OMD's static machine-readable protocol capabilities.",
+        description="Report OMD's machine-readable protocol and local OCR readiness.",
         allow_abbrev=False,
     )
     parser.add_argument("--json", action="store_true", help="Emit compact JSON.")
@@ -1713,6 +2182,58 @@ def _run_capabilities(argv: list[str]) -> int:
     from omd.capabilities import capabilities_json
 
     sys.stdout.write(capabilities_json())
+    return 0
+
+
+def _run_config(argv: list[str]) -> int:
+    """Expose the resolved, read-only configuration contract."""
+    parser = argparse.ArgumentParser(
+        prog="omd config",
+        description="Inspect OMD's read-only runtime configuration.",
+        allow_abbrev=False,
+    )
+    subparsers = parser.add_subparsers(dest="config_command", required=True)
+    subparsers.add_parser(
+        "path",
+        help="Print the configuration file path.",
+        allow_abbrev=False,
+    )
+    show_parser = subparsers.add_parser(
+        "show",
+        help="Show configured and effective capture settings.",
+        allow_abbrev=False,
+    )
+    show_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    args = parser.parse_args(argv)
+
+    from omd.config import ConfigError, config_path, config_show_payload
+
+    try:
+        if args.config_command == "path":
+            sys.stdout.write(f"{config_path()}\n")
+            return 0
+        payload = config_show_payload()
+    except ConfigError as exc:
+        if getattr(args, "json", False):
+            sys.stderr.write(
+                json.dumps(
+                    {"error": {"kind": "config_invalid", "message": str(exc)}},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            return 2
+        parser.error(str(exc))
+
+    if args.json:
+        sys.stdout.write(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
+    else:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     return 0
 
 
@@ -1818,10 +2339,41 @@ def _run_enrich_note(argv: list[str]) -> int:
     return 2 if code == "invalid_request" else 1
 
 
+
 def _run_inspect(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Inspect how OMD would route an input without converting it.")
     parser.add_argument("target", help="URL, share blob, file path, or directory")
     parser.add_argument("--json", action="store_true", help="Emit JSON only.")
+    parser.add_argument(
+        "--lang",
+        dest="legacy_ocr_language",
+        default=None,
+        help="Deprecated OCR alias; prefer --ocr-language.",
+    )
+    parser.add_argument(
+        "--ocr-lang",
+        "--ocr-language",
+        dest="ocr_language",
+        default=None,
+        help="Tesseract OCR language set to resolve and check.",
+    )
+    parser.add_argument(
+        WHISPER_LANGUAGE_FLAG,
+        default=None,
+        help="Whisper language hint such as en/zh, or auto.",
+    )
+    parser.add_argument(
+        SPOKEN_LANGUAGE_MODE_FLAG,
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Explicit ASR policy; explicit requires --whisper-lang.",
+    )
+    parser.add_argument("--preferred-languages", default=None)
+    parser.add_argument(
+        "--ocr-article-images",
+        action="store_true",
+        help="Include Tesseract readiness required for article-image OCR.",
+    )
     parser.add_argument(
         "--with-readiness",
         action="store_true",
@@ -1835,16 +2387,88 @@ def _run_inspect(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
+    from omd import _events
     from omd._preflight import inspect_target
 
-    result = inspect_target(args.target)
+    try:
+        result = inspect_target(args.target)
+    except SourceURLCountError as exc:
+        if args.json:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "error": {
+                            "kind": "source_url_count_invalid",
+                            "message": str(exc),
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            return 2
+        _events.fatal("source_url_count_invalid", str(exc))
+    if args.ocr_article_images:
+        needs_tools = [str(item) for item in result.get("needs_tools", []) or []]
+        if "tesseract" not in needs_tools:
+            needs_tools.append("tesseract")
+        result["needs_tools"] = needs_tools
+    events_were_enabled = _events.is_enabled()
+    _events.configure(False)
+    error_kind = "ocr_language_invalid"
+    try:
+        ocr_language = _resolve_ocr_aliases_or_fatal(
+            args.legacy_ocr_language,
+            args.ocr_language,
+        )
+        language_extra: list[str] = []
+        if args.whisper_lang is not None:
+            language_extra += [WHISPER_LANGUAGE_FLAG, args.whisper_lang]
+        if args.spoken_language_mode is not None:
+            language_extra += [SPOKEN_LANGUAGE_MODE_FLAG, args.spoken_language_mode]
+        if args.preferred_languages is not None:
+            language_extra += ["--preferred-languages", args.preferred_languages]
+        error_kind = "language_config_invalid"
+        _, _, recognition, resolved_recognition = _resolve_route_recognition_details(
+            ocr_language,
+            language_extra,
+        )
+    except SystemExit as exc:
+        if not args.json:
+            raise
+        message = str(exc.code)
+        if message.startswith("error: "):
+            message = message.removeprefix("error: ")
+        if len(message) > _INSPECT_ERROR_MESSAGE_MAX_CHARS:
+            message = message[: _INSPECT_ERROR_MESSAGE_MAX_CHARS - 3] + "..."
+        sys.stderr.write(
+            json.dumps(
+                {"error": {"kind": error_kind, "message": message}},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        return 2
+    finally:
+        _events.configure(events_were_enabled)
+    recognition["asr"].update(
+        _inspect_asr_explanation(result, resolved_recognition["asr"])
+    )
+    result["recognition"] = recognition
     if args.with_readiness:
-        from omd.doctor import readiness_for_preflight
+        from omd.doctor import readiness_for_preflight, tesseract_readiness
 
+        tesseract = tesseract_readiness(
+            requested_language=ocr_language,
+            language_source=str(recognition["ocr"]["source"]),
+        )
         result["readiness"] = readiness_for_preflight(
             result,
             cookies_file=args.cookies_file,
             cookies_from_browser=args.cookies_browser,
+            tesseract=tesseract,
         )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1883,11 +2507,33 @@ def _run_batch_cmd(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--lang",
-        default=DEFAULT_OCR_LANGUAGE,
+        dest="legacy_ocr_language",
+        default=None,
         help=(
-            f"Tesseract OCR language (default {DEFAULT_OCR_LANGUAGE}; "
+            "Deprecated OCR alias retained for compatibility. "
+            "Prefer --ocr-language."
+        ),
+    )
+    parser.add_argument(
+        "--ocr-lang",
+        "--ocr-language",
+        dest="ocr_language",
+        default=None,
+        help=(
+            f"Tesseract OCR language set (configured default {DEFAULT_OCR_LANGUAGE}; "
             f"Chinese + English example: {MIXED_OCR_LANGUAGE_EXAMPLE})."
         ),
+    )
+    parser.add_argument(
+        "--whisper-lang",
+        default=None,
+        help="Whisper language hint such as en/zh, or auto; omit to inherit adapter/config defaults.",
+    )
+    parser.add_argument(
+        SPOKEN_LANGUAGE_MODE_FLAG,
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Explicit ASR policy; explicit requires --whisper-lang.",
     )
     parser.add_argument("--preferred-languages", default=None)
     parser.add_argument("--agent-safe", action="store_true", help="Use conservative agent-facing defaults.")
@@ -1895,9 +2541,12 @@ def _run_batch_cmd(argv: list[str]) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-q", "--quiet", action="store_true")
     parser.add_argument("--polish-md", dest="polish_md", action="store_true",
-                        help="After each successful item conversion, post-process the generated .md via Ollama.")
+                        help=(
+                            "After each successful item conversion, post-process the generated .md via Ollama "
+                            "and preserve the pre-polish Markdown as <name>.raw.md."
+                        ))
     parser.add_argument("--polish-md-keep-raw", dest="polish_md_keep_raw", action="store_true",
-                        help="With --polish-md, save each pre-polish .md as <name>.raw.md.")
+                        help="Deprecated compatibility flag; --polish-md now always saves <name>.raw.md.")
     parser.add_argument("--polish-md-model", dest="polish_md_model", default=recommended_text_model,
                         help=f"Ollama model for --polish-md (memory-sized default {recommended_text_model}).")
     parser.add_argument("--polish-md-host", dest="polish_md_host", default="http://localhost:11434",
@@ -1918,6 +2567,10 @@ def _run_batch_cmd(argv: list[str]) -> int:
 
     json_events = args.json_events or args.agent_safe
     _events.configure(json_events)
+    ocr_language = _resolve_ocr_aliases_or_fatal(
+        args.legacy_ocr_language,
+        args.ocr_language,
+    )
     if args.verbose and json_events:
         _events.fatal("flag_conflict", "--json-events/--agent-safe and --verbose are mutually exclusive")
     if args.quiet and json_events:
@@ -1943,6 +2596,17 @@ def _run_batch_cmd(argv: list[str]) -> int:
         reel_extra = list(reel_extra) + ["--json-events"]
     if args.preferred_languages and "--preferred-languages" not in reel_extra:
         reel_extra = list(reel_extra) + ["--preferred-languages", args.preferred_languages]
+    if args.whisper_lang is not None and WHISPER_LANGUAGE_FLAG not in reel_extra:
+        try:
+            whisper_language = _normalize_whisper_language(args.whisper_lang)
+        except ValueError as exc:
+            _events.fatal("whisper_language_invalid", str(exc))
+        reel_extra = list(reel_extra) + [WHISPER_LANGUAGE_FLAG, whisper_language]
+    if args.spoken_language_mode is not None:
+        reel_extra = list(reel_extra) + [
+            SPOKEN_LANGUAGE_MODE_FLAG,
+            args.spoken_language_mode,
+        ]
     if args.ocr_article_images and ARTICLE_IMAGE_OCR_FLAG not in reel_extra:
         reel_extra = list(reel_extra) + [ARTICLE_IMAGE_OCR_FLAG]
     _validate_existing_file(args.input_file, label="Batch list", kind="batch_list_invalid")
@@ -1989,7 +2653,7 @@ def _run_batch_cmd(argv: list[str]) -> int:
                 model=args.polish_md_model,
                 host=args.polish_md_host,
                 force=args.force,
-                keep_raw=args.polish_md_keep_raw,
+                keep_raw=True,
                 **({"allow_remote": True} if args.allow_remote_ollama else {}),
             )
             if polish_abort.is_set():
@@ -1999,7 +2663,7 @@ def _run_batch_cmd(argv: list[str]) -> int:
                 _progress.info(f"Polish kept Markdown unchanged: {output.name}")
             else:
                 _progress.done(f"polished {output}")
-        except (Exception, SystemExit) as exc:  # noqa: BLE001 - optional local AI must preserve raw output.
+        except Exception as exc:  # noqa: BLE001 - optional local AI must preserve raw output.
             _progress.warn(
                 f"Markdown polish failed for {output.name}; keeping the converted Markdown. {exc}"
             )
@@ -2075,7 +2739,7 @@ def _run_batch_cmd(argv: list[str]) -> int:
         rc = route_one(
             item,
             output,
-            args.lang,
+            ocr_language,
             reel_extra,
             agent_safe=args.agent_safe,
             output_format=route_output_format,
@@ -2123,7 +2787,17 @@ def _run_watch_cmd(argv: list[str]) -> int:
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--stable-polls", type=int, default=2)
     parser.add_argument("--max-polls", type=int, default=None, help="Testing/automation escape hatch; omit to watch forever.")
-    parser.add_argument("--lang", default=DEFAULT_OCR_LANGUAGE)
+    parser.add_argument("--lang", dest="legacy_ocr_language", default=None,
+                        help="Deprecated OCR alias; prefer --ocr-language.")
+    parser.add_argument("--ocr-lang", "--ocr-language", dest="ocr_language", default=None)
+    parser.add_argument("--whisper-lang", default=None,
+                        help="Whisper language hint such as en/zh, or auto.")
+    parser.add_argument(
+        SPOKEN_LANGUAGE_MODE_FLAG,
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Explicit ASR policy; explicit requires --whisper-lang.",
+    )
     parser.add_argument("--preferred-languages", default=None)
     parser.add_argument("--agent-safe", action="store_true")
     parser.add_argument("--json-events", action="store_true")
@@ -2136,6 +2810,10 @@ def _run_watch_cmd(argv: list[str]) -> int:
 
     json_events = args.json_events or args.agent_safe
     _events.configure(json_events)
+    ocr_language = _resolve_ocr_aliases_or_fatal(
+        args.legacy_ocr_language,
+        args.ocr_language,
+    )
     if args.verbose and json_events:
         _events.fatal("flag_conflict", "--json-events/--agent-safe and --verbose are mutually exclusive")
     if args.quiet and json_events:
@@ -2147,6 +2825,17 @@ def _run_watch_cmd(argv: list[str]) -> int:
         reel_extra = list(reel_extra) + ["--json-events"]
     if args.preferred_languages and "--preferred-languages" not in reel_extra:
         reel_extra = list(reel_extra) + ["--preferred-languages", args.preferred_languages]
+    if args.whisper_lang is not None and WHISPER_LANGUAGE_FLAG not in reel_extra:
+        try:
+            whisper_language = _normalize_whisper_language(args.whisper_lang)
+        except ValueError as exc:
+            _events.fatal("whisper_language_invalid", str(exc))
+        reel_extra = list(reel_extra) + [WHISPER_LANGUAGE_FLAG, whisper_language]
+    if args.spoken_language_mode is not None:
+        reel_extra = list(reel_extra) + [
+            SPOKEN_LANGUAGE_MODE_FLAG,
+            args.spoken_language_mode,
+        ]
     _validate_existing_directory(args.inbox, label="Watch inbox", kind="watch_inbox_invalid")
     _validate_output_directory(args.output)
 
@@ -2158,7 +2847,7 @@ def _run_watch_cmd(argv: list[str]) -> int:
         return route_one(
             str(path),
             output,
-            args.lang,
+            ocr_language,
             reel_extra,
             agent_safe=args.agent_safe,
             output_format=output_format,
@@ -2201,7 +2890,10 @@ def _run_capture_cmd(argv: list[str]) -> int:
     )
     parser.add_argument("--memory-timeout", type=float, default=180, help="Seconds to wait for each local memory-card model request.")
     parser.add_argument("--polish-md", action="store_true",
-                        help="Polish the structurally cleaned capture with a local Ollama model.")
+                        help=(
+                            "Polish the structurally cleaned capture with a local Ollama model and "
+                            "preserve the pre-polish Markdown as <name>.raw.md."
+                        ))
     parser.add_argument("--polish-md-model", default=recommended_text_model,
                         help=f"Ollama model for capture Markdown polish (memory-sized default {recommended_text_model}).")
     parser.add_argument("--polish-md-host", default="http://localhost:11434",
@@ -2210,11 +2902,33 @@ def _run_capture_cmd(argv: list[str]) -> int:
                         help="After conversion, OCR remote images referenced by article/webpage Markdown.")
     parser.add_argument(
         "--lang",
-        default=DEFAULT_OCR_LANGUAGE,
+        dest="legacy_ocr_language",
+        default=None,
         help=(
-            f"Tesseract OCR language (default {DEFAULT_OCR_LANGUAGE}; "
+            "Deprecated OCR alias retained for compatibility. "
+            "Prefer --ocr-language."
+        ),
+    )
+    parser.add_argument(
+        "--ocr-lang",
+        "--ocr-language",
+        dest="ocr_language",
+        default=None,
+        help=(
+            f"Tesseract OCR language set (configured default {DEFAULT_OCR_LANGUAGE}; "
             f"Chinese + English example: {MIXED_OCR_LANGUAGE_EXAMPLE})."
         ),
+    )
+    parser.add_argument(
+        "--whisper-lang",
+        default=None,
+        help="Whisper language hint such as en/zh, or auto; omit to inherit adapter/config defaults.",
+    )
+    parser.add_argument(
+        SPOKEN_LANGUAGE_MODE_FLAG,
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Explicit ASR policy; explicit requires --whisper-lang.",
     )
     parser.add_argument("--preferred-languages", default=None)
     parser.add_argument("--agent-safe", action="store_true", help="Use conservative agent-facing conversion defaults.")
@@ -2227,6 +2941,10 @@ def _run_capture_cmd(argv: list[str]) -> int:
 
     json_events = args.json_events or args.agent_safe
     _events.configure(json_events)
+    ocr_language = _resolve_ocr_aliases_or_fatal(
+        args.legacy_ocr_language,
+        args.ocr_language,
+    )
     if args.verbose and args.quiet:
         _events.fatal("flag_conflict", "--verbose and --quiet are mutually exclusive")
     if args.verbose and json_events:
@@ -2254,6 +2972,11 @@ def _run_capture_cmd(argv: list[str]) -> int:
             "capture_directory_unsupported",
             "capture accepts directories only with --batch; use `omd capture <folder> --vault <path> --batch`",
         )
+    if not args.batch:
+        try:
+            extract_url_from_blob(args.input)
+        except SourceURLCountError as exc:
+            _events.fatal("source_url_count_invalid", str(exc))
     _validate_directory_output_path(args.vault, label="Vault path")
     _progress.configure(verbose=args.verbose, quiet=args.quiet)
     if args.agent_safe:
@@ -2262,6 +2985,17 @@ def _run_capture_cmd(argv: list[str]) -> int:
         reel_extra = list(reel_extra) + ["--json-events"]
     if args.preferred_languages and "--preferred-languages" not in reel_extra:
         reel_extra = list(reel_extra) + ["--preferred-languages", args.preferred_languages]
+    if args.whisper_lang is not None and WHISPER_LANGUAGE_FLAG not in reel_extra:
+        try:
+            whisper_language = _normalize_whisper_language(args.whisper_lang)
+        except ValueError as exc:
+            _events.fatal("whisper_language_invalid", str(exc))
+        reel_extra = list(reel_extra) + [WHISPER_LANGUAGE_FLAG, whisper_language]
+    if args.spoken_language_mode is not None:
+        reel_extra = list(reel_extra) + [
+            SPOKEN_LANGUAGE_MODE_FLAG,
+            args.spoken_language_mode,
+        ]
     if args.verbose and not any(f in reel_extra for f in ("--verbose", "-v")):
         reel_extra = list(reel_extra) + ["--verbose"]
     if args.quiet and not any(f in reel_extra for f in ("--quiet", "-q")):
@@ -2277,7 +3011,7 @@ def _run_capture_cmd(argv: list[str]) -> int:
             summary = capture_batch(
                 args.input,
                 args.vault,
-                lang=args.lang,
+                lang=ocr_language,
                 reel_extra=reel_extra,
                 tags=tags,
                 agent_safe=args.agent_safe,
@@ -2299,7 +3033,7 @@ def _run_capture_cmd(argv: list[str]) -> int:
         result = capture_one(
             args.input,
             args.vault,
-            lang=args.lang,
+            lang=ocr_language,
             reel_extra=reel_extra,
             tags=tags,
             agent_safe=args.agent_safe,
@@ -2347,6 +3081,7 @@ def main(argv: list[str] | None = None) -> int:
         "batch",
         "watch",
         "capture",
+        "config",
         "capabilities",
         "enrich-note",
     }:
@@ -2361,6 +3096,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_watch_cmd(argv)
         if command == "capture":
             return _run_capture_cmd(argv)
+        if command == "config":
+            return _run_config(argv)
         if command == "capabilities":
             return _run_capabilities(argv)
         if command == "enrich-note":
@@ -2378,6 +3115,8 @@ def main(argv: list[str] | None = None) -> int:
   omd capture INPUT --vault VAULT     Convert into the vault Sources tree without overwriting notes.
   omd batch FILE                      Convert inputs listed in a file.
   omd watch FOLDER                    Watch a drop folder for stable new files.
+  omd config path                     Print the runtime configuration path.
+  omd config show --json              Explain configured and effective settings.
   omd capabilities --json             Report machine-readable protocol support.
   omd enrich-note NOTE --vault VAULT  Return a read-only local-AI proposal.
 
@@ -2396,11 +3135,33 @@ Browser UI:
     p.add_argument("--rmd", action="store_true", help="Shortcut for --format rmd.")
     p.add_argument(
         "--lang",
-        default=DEFAULT_OCR_LANGUAGE,
+        dest="legacy_ocr_language",
+        default=None,
         help=(
-            f"Tesseract OCR language (default {DEFAULT_OCR_LANGUAGE}; "
-            f"Chinese + English example: {MIXED_OCR_LANGUAGE_EXAMPLE})"
+            "Deprecated OCR alias retained for compatibility. "
+            "Prefer --ocr-language."
         ),
+    )
+    p.add_argument(
+        "--ocr-lang",
+        "--ocr-language",
+        dest="ocr_language",
+        default=None,
+        help=(
+            f"Tesseract OCR language set (configured default {DEFAULT_OCR_LANGUAGE}; "
+            f"Chinese + English example: {MIXED_OCR_LANGUAGE_EXAMPLE})."
+        ),
+    )
+    p.add_argument(
+        "--whisper-lang",
+        default=None,
+        help="Whisper language hint such as en/zh, or auto; omit to inherit adapter/config defaults.",
+    )
+    p.add_argument(
+        SPOKEN_LANGUAGE_MODE_FLAG,
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Explicit ASR policy; explicit requires --whisper-lang.",
     )
     p.add_argument("--preferred-languages", default=None,
                    help="Comma-separated common Whisper languages for audio/video when --whisper-lang is omitted "
@@ -2419,19 +3180,23 @@ Browser UI:
                    help="After conversion, post-process the .md via Ollama "
                         "(fix typos / OCR artifacts / whitespace). Skips "
                         "already-polished transcript sections and fenced code "
-                        "blocks. Replaces the .md in place; pass "
-                        "--polish-md-keep-raw to preserve the original at "
-                        "<name>.raw.md.")
+                        "blocks. Replaces the .md in place and preserves the "
+                        "original at <name>.raw.md.")
     p.add_argument("--polish-md-keep-raw", dest="polish_md_keep_raw",
                    action="store_true",
-                   help="With --polish-md, save the pre-polish .md as "
-                        "<name>.raw.md alongside the polished output.")
+                   help="Deprecated compatibility flag; --polish-md now always "
+                        "saves <name>.raw.md alongside the polished output.")
     p.add_argument("--polish-md-model", dest="polish_md_model",
                    default=recommended_text_model,
                    help=f"Ollama model for --polish-md (memory-sized default {recommended_text_model}).")
     p.add_argument("--polish-md-host", dest="polish_md_host",
                    default="http://localhost:11434",
                    help="Ollama HTTP host (default http://localhost:11434).")
+    p.add_argument(
+        "--polish-md-transcript-cleanup",
+        action="store_true",
+        help="For Transcript sections, allow punctuation and paragraph cleanup while preserving all words.",
+    )
     p.add_argument(
         "--allow-remote-ollama",
         action="store_true",
@@ -2448,6 +3213,10 @@ Browser UI:
     if args.agent_safe:
         args.json_events = True
     _events.configure(args.json_events)
+    ocr_language = _resolve_ocr_aliases_or_fatal(
+        args.legacy_ocr_language,
+        args.ocr_language,
+    )
     if args.verbose and args.quiet:
         _events.fatal("flag_conflict", "--verbose and --quiet are mutually exclusive")
     if args.json_events and args.verbose:
@@ -2484,6 +3253,17 @@ Browser UI:
         reel_extra = list(reel_extra) + ["--json-events"]
     if args.preferred_languages and "--preferred-languages" not in reel_extra:
         reel_extra = list(reel_extra) + ["--preferred-languages", args.preferred_languages]
+    if args.whisper_lang is not None and WHISPER_LANGUAGE_FLAG not in reel_extra:
+        try:
+            whisper_language = _normalize_whisper_language(args.whisper_lang)
+        except ValueError as exc:
+            _events.fatal("whisper_language_invalid", str(exc))
+        reel_extra = list(reel_extra) + [WHISPER_LANGUAGE_FLAG, whisper_language]
+    if args.spoken_language_mode is not None:
+        reel_extra = list(reel_extra) + [
+            SPOKEN_LANGUAGE_MODE_FLAG,
+            args.spoken_language_mode,
+        ]
     if args.ocr_article_images and ARTICLE_IMAGE_OCR_FLAG not in reel_extra:
         reel_extra = list(reel_extra) + [ARTICLE_IMAGE_OCR_FLAG]
 
@@ -2517,7 +3297,7 @@ Browser UI:
         rc = route_one(
             args.input,
             output,
-            args.lang,
+            ocr_language,
             reel_extra,
             **route_kwargs,
         )
@@ -2529,7 +3309,7 @@ Browser UI:
 
     # Post-conversion polish-md pass (skip on error, skip if output went to stdout).
     for generated_output in postprocess_outputs:
-        from omd._polish_md import polish_file
+        from omd._polish_md import PolishTooLargeError, polish_file
 
         if not direct_markdown_polish:
             skip_reason = _generated_markdown_polish_skip_reason(
@@ -2544,15 +3324,29 @@ Browser UI:
                 continue
         _progress.info(f"Polishing Markdown via Ollama: {generated_output.name}")
         try:
+            transcript_cleanup = (
+                {"transcript_cleanup": True}
+                if args.polish_md_transcript_cleanup
+                else {}
+            )
             polish_file(
                 generated_output,
                 model=args.polish_md_model,
                 host=args.polish_md_host,
                 force=args.force,
-                keep_raw=args.polish_md_keep_raw,
+                keep_raw=True,
+                **transcript_cleanup,
                 **({"allow_remote": True} if args.allow_remote_ollama else {}),
             )
-        except (Exception, SystemExit) as exc:
+        except PolishTooLargeError as exc:
+            if direct_markdown_polish:
+                _events.fatal("polish_too_big", str(exc))
+            _progress.warn(
+                f"Markdown polish failed for {generated_output.name}; "
+                f"keeping the converted Markdown. {exc}"
+            )
+            continue
+        except Exception as exc:
             if direct_markdown_polish:
                 raise
             _progress.warn(
@@ -2574,7 +3368,11 @@ Browser UI:
             postprocess_outputs,
         )
         for generated_output, source in manifest_sources.items():
-            _refresh_manifest_after_postprocess(source, generated_output)
+            _refresh_manifest_after_postprocess(
+                source,
+                generated_output,
+                preserve_existing_provenance=direct_markdown_polish,
+            )
 
     return rc
 

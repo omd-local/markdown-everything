@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ from typing import Callable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 from ._models import LOCAL_TEXT_CONTEXT_TOKENS
-from ._network_policy import build_no_redirect_opener, validate_ollama_base_url
+from ._network_policy import build_no_redirect_opener, build_ollama_opener, validate_ollama_base_url
 from .ollama_runtime import ollama_keep_alive
 from .structured_output import AIOutputSchema, StructuredOutputError, parse_structured_output
 
@@ -22,6 +23,18 @@ _DEEPSEEK_CHAT_ENDPOINT = "https://api.deepseek.com/chat/completions"
 _OLLAMA_CHAT_ENDPOINT = "http://localhost:11434/api/chat"
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_CONTEXT_TOKENS = 128 * 1024
+
+
+def _anthropic_uses_adaptive_thinking(model: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"claude-(?:opus-(?:4-[78]|5(?:-5)?)"
+            r"|sonnet-5(?:-5)?"
+            r"|(?:fable|mythos)-(?:5|5-1)"
+            r"|mythos-preview)",
+            model.strip().lower(),
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -148,7 +161,12 @@ def request_text(
         headers=transport.headers,
         method="POST",
     )
-    open_call = opener or build_no_redirect_opener().open
+    open_call = opener
+    if open_call is None:
+        if request.provider.strip().lower() == "ollama":
+            open_call = build_ollama_opener(transport.endpoint).open
+        else:
+            open_call = build_no_redirect_opener().open
     now = clock or monotonic
     started_at = now()
     stream_deadline = monotonic() + float(request.timeout_seconds)
@@ -307,6 +325,8 @@ def _transport_for(request: AIProviderRequest) -> _Transport:
                     "schema": request.output_schema.schema,
                 }
             }
+            if _anthropic_uses_adaptive_thinking(request.model):
+                body["output_config"]["effort"] = "low"
         if request.stream:
             body["stream"] = True
         if request.temperature is not None:
@@ -332,6 +352,11 @@ def _transport_for(request: AIProviderRequest) -> _Transport:
             body["stream_options"] = {"include_usage": True}
         if request.output_schema is not None:
             body["response_format"] = {"type": "json_object"}
+            # DeepSeek enables high-effort thinking by default. OMD answers use a
+            # bounded output budget and require the final JSON object, so allowing
+            # hidden reasoning to consume that budget can end with
+            # finish_reason=length before any complete answer is emitted.
+            body["thinking"] = {"type": "disabled"}
         if request.temperature is not None:
             body["temperature"] = float(request.temperature)
         return _Transport(
@@ -348,6 +373,7 @@ def _transport_for(request: AIProviderRequest) -> _Transport:
                 {"role": "user", "content": _user_prompt(request)},
             ],
             "stream": request.stream,
+            "think": False,
             "keep_alive": ollama_keep_alive(),
             "options": {
                 "num_ctx": request.context_window_tokens or LOCAL_TEXT_CONTEXT_TOKENS,

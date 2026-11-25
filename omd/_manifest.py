@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 from omd._io import write_atomic
+from omd._source_url import sanitize_persisted_source_text, sanitize_persisted_source_url
 
 MANIFEST_VERSION = 2
 _URL_RE = re.compile(r"https?://[^\s<>'\"）)]+")
@@ -31,6 +32,7 @@ def write_manifest_for_output(
     source: str,
     backend: str,
     transcript_language: str | None = None,
+    recognition: Mapping[str, Any] | None = None,
     untrusted: bool = False,
     warnings: Sequence[str] | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -38,32 +40,64 @@ def write_manifest_for_output(
 ) -> dict[str, Any]:
     """Write a JSON sidecar manifest for a generated Markdown file.
 
-    The output file must already exist. Rewrites preserve `created_at` when a
-    previous sidecar is present and valid JSON.
+    The output file must already exist. Rewrites preserve capture identity and
+    recognition metadata only when the previous sidecar names the same
+    canonical source.
     """
     output = Path(output_path)
     content = output.read_bytes()
     manifest_path = manifest_path_for_output(output)
     timestamp = _normalize_timestamp(now)
     existing = _read_manifest(manifest_path)
-    created_at = existing.get("created_at") if isinstance(existing.get("created_at"), str) else timestamp
-    content_checksum = hashlib.sha256(content).hexdigest()
     canonical_source = canonical_source_for(source)
+    existing_source = existing.get("source")
+    same_source = (
+        isinstance(existing_source, str)
+        and canonical_source_for(existing_source) == canonical_source
+    )
+    created_at = (
+        existing.get("created_at")
+        if same_source and isinstance(existing.get("created_at"), str)
+        else timestamp
+    )
+    content_checksum = hashlib.sha256(content).hexdigest()
     source_hash = source_hash_for(canonical_source)
     existing_output = existing.get("output")
-    preserve_capture_id = not isinstance(existing_output, str) or existing_output == str(output)
+    preserve_capture_id = same_source and (
+        not isinstance(existing_output, str) or existing_output == str(output)
+    )
     capture_id = (
         existing.get("capture_id")
         if preserve_capture_id and isinstance(existing.get("capture_id"), str)
         else capture_id_for(source=canonical_source, output_path=output)
     )
+    effective_transcript_language = transcript_language
+    if (
+        effective_transcript_language is None
+        and same_source
+        and isinstance(existing.get("transcript_language"), str)
+    ):
+        effective_transcript_language = existing["transcript_language"]
+    recognition_payload = _recognition_payload(
+        recognition
+        if recognition is not None
+        else existing.get("recognition") if same_source else None,
+        transcript_language=effective_transcript_language,
+    )
+    raw_source_fields = _raw_source_fields(source, canonical_source)
+    if (
+        same_source
+        and not raw_source_fields
+        and isinstance(existing.get("raw_source"), str)
+    ):
+        raw_source_fields = _raw_source_fields(existing["raw_source"], canonical_source)
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "source_id": source_id_for(canonical_source),
         "source_hash": source_hash,
         "capture_id": capture_id,
         "source": canonical_source,
-        **_raw_source_fields(source, canonical_source),
+        **raw_source_fields,
         **_source_locator_fields(canonical_source),
         "output": str(output),
         "backend": backend,
@@ -71,7 +105,8 @@ def write_manifest_for_output(
         "updated_at": timestamp,
         "content_checksum": content_checksum,
         "checksum": content_checksum,
-        "transcript_language": transcript_language,
+        "transcript_language": effective_transcript_language,
+        "recognition": recognition_payload,
         "untrusted": bool(untrusted),
         "warnings": [str(item) for item in (warnings or [])],
         "elements": elements_for_markdown(content.decode("utf-8", errors="replace"), source_ref=canonical_source),
@@ -81,15 +116,59 @@ def write_manifest_for_output(
     return manifest
 
 
+def _recognition_payload(
+    value: object,
+    *,
+    transcript_language: str | None,
+) -> dict[str, Any]:
+    """Return the additive recognition contract, preserving future fields."""
+    payload = _jsonable(value) if isinstance(value, Mapping) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    ocr = payload.get("ocr")
+    if not isinstance(ocr, dict):
+        ocr = {}
+    ocr.setdefault("requested", None)
+    ocr.setdefault("effective", None)
+    ocr.setdefault("source", None)
+
+    asr = payload.get("asr")
+    if not isinstance(asr, dict):
+        asr = {}
+    asr.setdefault("requested", None)
+    asr.setdefault("detected", None)
+    if transcript_language is not None:
+        asr["detected"] = transcript_language
+
+    generation = payload.get("generation")
+    if not isinstance(generation, dict):
+        generation = {}
+    generation["language_policy"] = "same-as-source"
+
+    # These fields describe observed content, not the requested OCR/ASR route.
+    # Keep them additive so a legacy sidecar gains a stable schema on refresh,
+    # while values reported by a recognizer retain their provenance.
+    payload.setdefault("content_languages_detected", [])
+    payload.setdefault("detected_script", None)
+    payload.setdefault("confidence", None)
+    payload["ocr"] = ocr
+    payload["asr"] = asr
+    payload["generation"] = generation
+    return payload
+
+
 def canonical_source_for(source: str) -> str:
     value = str(source).strip()
+    if not value:
+        return value
     parsed = urlparse(value)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return value
+        return sanitize_persisted_source_url(value)
     match = _URL_RE.search(value)
     if match:
-        return match.group(0).rstrip(".,;:!?")
-    return value
+        return sanitize_persisted_source_url(match.group(0).rstrip(".,;:!?"))
+    return str(Path(value).expanduser().resolve(strict=False))
 
 
 def source_hash_for(source: str) -> str:
@@ -164,9 +243,15 @@ def _source_locator_fields(source: str) -> dict[str, str]:
 
 
 def _raw_source_fields(raw_source: str, canonical_source: str) -> dict[str, str]:
-    if raw_source == canonical_source:
+    safe_raw_source = _safe_raw_source(raw_source)
+    if safe_raw_source == canonical_source:
         return {}
-    return {"raw_source": raw_source}
+    return {"raw_source": safe_raw_source}
+
+
+def _safe_raw_source(raw_source: str) -> str:
+    """Preserve share text while replacing any access-bearing source URL."""
+    return sanitize_persisted_source_text(raw_source)
 
 
 def _element_type_for_line(stripped: str) -> str:

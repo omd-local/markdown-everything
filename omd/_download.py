@@ -19,7 +19,9 @@ def max_download_bytes() -> int:
 
 
 def ytdlp_max_filesize_arg() -> str:
-    return f"{max_download_bytes()}B"
+    # yt-dlp accepts a bare byte count or a size suffix such as ``500M``.
+    # A trailing ``B`` is not a supported suffix in current releases.
+    return str(max_download_bytes())
 
 
 def _content_length(response) -> int:

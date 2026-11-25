@@ -11,8 +11,8 @@ from urllib.parse import urlparse
 
 from omd import __version__
 from omd._io import write_atomic
-from omd._language import DEFAULT_OCR_LANGUAGE
 from omd._models import recommended_local_text_model
+from omd.tag_normalization import normalize_generated_tag
 
 if TYPE_CHECKING:
     from omd.memory_cards import MemoryCardsResult
@@ -100,7 +100,7 @@ def capture_one(
     target: str,
     vault: str | Path,
     *,
-    lang: str = DEFAULT_OCR_LANGUAGE,
+    lang: str | None = None,
     reel_extra: list[str] | None = None,
     tags: list[str] | None = None,
     agent_safe: bool = False,
@@ -114,24 +114,25 @@ def capture_one(
     allow_remote_ollama: bool = False,
 ) -> CaptureResult:
     """Convert one target into a vault, sizing an omitted memory model to local RAM."""
-    from omd import cli
+    from omd import _events, cli
     from omd._preflight import inspect_target
 
     memory_model = _resolve_memory_model(memory_model)
     source = str(target)
     vault_root = Path(vault).expanduser()
-    ensure_vault_layout(vault_root)
     preflight = inspect_target(source)
+    ensure_vault_layout(vault_root)
     source_type = source_type_for(source, preflight)
     output_path = reserve_capture_path(vault_root, source, source_type)
-    rc = cli.route_one(
-        source,
-        output_path,
-        lang,
-        list(reel_extra or []),
-        agent_safe=agent_safe,
-        output_format="md",
-    )
+    with _events.suppress_done():
+        rc = cli.route_one(
+            source,
+            output_path,
+            lang,
+            list(reel_extra or []),
+            agent_safe=agent_safe,
+            output_format="md",
+        )
     if rc != 0:
         _cleanup_failed_capture(output_path)
         return CaptureResult(
@@ -155,12 +156,17 @@ def capture_one(
 
         _progress.info(f"Polishing captured Markdown via Ollama: {polish_md_model}")
         try:
-            body_without_frontmatter = _polish_md.polish_markdown(
+            polished_body = _polish_md.polish_markdown(
                 body_without_frontmatter,
                 model=polish_md_model,
                 host=polish_md_host,
                 allow_remote=allow_remote_ollama,
             )
+            if not polished_body.strip():
+                raise ValueError("polish produced empty Markdown")
+            raw_path = output_path.with_name(output_path.stem + ".raw" + output_path.suffix)
+            write_atomic(raw_path, body_without_frontmatter)
+            body_without_frontmatter = polished_body
         except Exception as exc:  # noqa: BLE001 - optional polish must not discard a valid capture.
             _progress.warn(f"Markdown polish failed; keeping structurally cleaned capture: {exc}")
     from omd._transcript import transcript_warnings_from_markdown
@@ -234,7 +240,7 @@ def capture_one(
     )
     _refresh_manifest(output_path, source=source, preflight=preflight, metadata=metadata)
     idx = update_index(vault_root, output_path=output_path, metadata=metadata)
-    return CaptureResult(
+    result = CaptureResult(
         source=source,
         output_path=output_path,
         index_path=idx,
@@ -243,13 +249,15 @@ def capture_one(
         tags=list(tags or []),
         return_code=0,
     )
+    _events.done(str(result.output_path))
+    return result
 
 
 def capture_batch(
     target: str,
     vault: str | Path,
     *,
-    lang: str = DEFAULT_OCR_LANGUAGE,
+    lang: str | None = None,
     reel_extra: list[str] | None = None,
     tags: list[str] | None = None,
     agent_safe: bool = False,
@@ -350,7 +358,7 @@ def _capture_one_with_retries(
     target: str,
     vault: Path,
     *,
-    lang: str,
+    lang: str | None,
     reel_extra: list[str],
     tags: list[str],
     agent_safe: bool,
@@ -514,7 +522,13 @@ def capture_metadata(
     markdown_polish_model: str | None = None,
     markdown_polish_host: str = "http://localhost:11434",
 ) -> dict[str, object]:
-    from omd._manifest import MANIFEST_VERSION, capture_id_for, source_hash_for, source_id_for
+    from omd._manifest import (
+        MANIFEST_VERSION,
+        canonical_source_for,
+        capture_id_for,
+        source_hash_for,
+        source_id_for,
+    )
 
     memory_model = _resolve_memory_model(memory_model)
     metadata = preflight.get("metadata")
@@ -530,6 +544,8 @@ def capture_metadata(
         path = source
     if path:
         path = str(Path(path).expanduser().resolve(strict=False))
+    if url:
+        url = canonical_source_for(url)
     source_hash = source_hash_for(source)
     markdown_polish_model = (markdown_polish_model or "").strip() or recommended_local_text_model()
     fields: dict[str, object] = {
@@ -762,9 +778,7 @@ def safe_filename_stem(value: str) -> str:
 
 
 def _normalize_tag(value: str) -> str:
-    tag = str(value).strip().lstrip("#").replace("_", "-").replace(" ", "-").lower()
-    tag = re.sub(r"[^a-z0-9\u4e00-\u9fff-]+", "-", tag).strip("-")
-    return tag
+    return normalize_generated_tag(value, allow_hierarchy=False)
 
 
 def _refresh_manifest(

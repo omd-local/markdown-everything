@@ -148,6 +148,7 @@ def test_anthropic_messages_transport_uses_native_shape_and_headers():
             max_output_tokens=256,
             api_key="sk-ant-secret",
             timeout_seconds=9.0,
+            temperature=0.0,
         ),
         opener=fake_open,
     )
@@ -168,12 +169,153 @@ def test_anthropic_messages_transport_uses_native_shape_and_headers():
             }
         ],
         "max_tokens": 256,
+        "temperature": 0.0,
     }
     assert response.provider == "anthropic"
     assert response.model == "claude-sonnet-4-20250514"
     assert response.text == "Anthropic answer."
     assert response.usage == {"input_tokens": 21, "output_tokens": 9}
     assert response.timing["elapsed_seconds"] >= 0.0
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5-5",
+        "claude-fable-5-1",
+        "claude-mythos-preview",
+    ],
+)
+def test_current_anthropic_structured_output_uses_low_effort(model):
+    from omd.ai_providers import AIOutputSchema, AIProviderRequest, request_text
+
+    seen: dict[str, object] = {}
+
+    def fake_open(request, timeout):
+        seen["body"] = _request_json(request)
+        return _FakeResponse(
+            {
+                "model": model,
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": '{"answer":"ready"}'}],
+                "usage": {"input_tokens": 12, "output_tokens": 8},
+            }
+        )
+
+    request_text(
+        AIProviderRequest(
+            provider="anthropic",
+            model=model,
+            task="Return JSON.",
+            system="Follow the schema.",
+            user="Ready?",
+            max_output_tokens=4096,
+            api_key="sk-ant-secret",
+            output_schema=AIOutputSchema(
+                name="answer",
+                schema={
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            ),
+            temperature=None,
+        ),
+        opener=fake_open,
+    )
+
+    assert seen["body"]["max_tokens"] == 4096
+    assert seen["body"]["output_config"]["effort"] == "low"
+    assert seen["body"]["output_config"]["format"]["type"] == "json_schema"
+
+
+@pytest.mark.parametrize(
+    ("model_text", "expected_code"),
+    [
+        (
+            '{"source_states":[{"claim":"Blue key on Tuesday.","citations":["S1"]}],"model_inference":[]}',
+            None,
+        ),
+        (
+            '{"source_states":[{"claim":"Blue key on Tuesday.","citations":[]}],"model_inference":[]}',
+            "malformed_structured_output",
+        ),
+        (
+            '{"source_states":[{"claim":"Blue key on Tuesday.","citations":["S99"]}],"model_inference":[]}',
+            "malformed_structured_output",
+        ),
+    ],
+)
+def test_anthropic_grounded_answer_preserves_and_enforces_citation_schema(
+    model_text, expected_code,
+):
+    from omd.ai_providers import AIProviderError, AIProviderRequest, request_text
+    from omd.structured_output import AIOutputSchema
+
+    seen: dict[str, object] = {}
+    claim = {
+        "type": "object",
+        "properties": {
+            "claim": {"type": "string"},
+            "citations": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["S1", "S2"]},
+                "minItems": 1,
+            },
+        },
+        "required": ["claim", "citations"],
+        "additionalProperties": False,
+    }
+    schema = AIOutputSchema(
+        name="grounded_answer",
+        schema={
+            "type": "object",
+            "properties": {
+                "source_states": {"type": "array", "items": claim, "minItems": 1},
+                "model_inference": {"type": "array", "items": claim},
+            },
+            "required": ["source_states", "model_inference"],
+            "additionalProperties": False,
+        },
+    )
+
+    def fake_open(request, timeout):
+        seen["body"] = _request_json(request)
+        return _FakeResponse(
+            {
+                "model": "claude-opus-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": model_text}],
+                "usage": {"input_tokens": 12, "output_tokens": 8},
+            }
+        )
+
+    request = AIProviderRequest(
+        provider="anthropic",
+        model="claude-opus-5-5",
+        task="Answer from evidence.",
+        system="Follow the schema.",
+        user="Source S1 says blue key on Tuesday.",
+        max_output_tokens=4096,
+        api_key="sk-ant-secret",
+        output_schema=schema,
+        temperature=None,
+    )
+    if expected_code is None:
+        response = request_text(request, opener=fake_open)
+        assert response.structured["source_states"][0]["citations"] == ["S1"]
+    else:
+        with pytest.raises(AIProviderError) as excinfo:
+            request_text(request, opener=fake_open)
+        assert excinfo.value.code == expected_code
+
+    sent_schema = seen["body"]["output_config"]["format"]["schema"]
+    source_states = sent_schema["properties"]["source_states"]
+    citations = source_states["items"]["properties"]["citations"]
+    assert source_states["minItems"] == 1
+    assert citations["minItems"] == 1
+    assert citations["items"]["enum"] == ["S1", "S2"]
 
 
 def test_deepseek_transport_uses_distinct_chat_completions_endpoint():
@@ -282,6 +424,7 @@ def test_ollama_transport_uses_requested_local_context_window(monkeypatch):
             {"role": "user", "content": "Task:\nSummarize.\n\nUser:\nInput note"},
         ],
         "stream": False,
+        "think": False,
         "keep_alive": "2m",
         "options": {"num_ctx": 32768, "num_predict": 75},
     }
@@ -1000,7 +1143,13 @@ def test_experimental_openai_compatible_provider_is_not_publicly_available():
     [
         ("openai", {"text": {"format": {"type": "json_schema"}}}),
         ("anthropic", {"output_config": {"format": {"type": "json_schema"}}}),
-        ("deepseek", {"response_format": {"type": "json_object"}}),
+        (
+            "deepseek",
+            {
+                "response_format": {"type": "json_object"},
+                "thinking": {"type": "disabled"},
+            },
+        ),
         ("ollama", {"format": {"type": "object"}}),
     ],
 )
@@ -1199,6 +1348,12 @@ def test_anthropic_streaming_aggregates_native_message_events():
         return _FakeStreamResponse(
             [
                 'data: {"type":"message_start","message":{"model":"claude-selected","usage":{"input_tokens":7,"output_tokens":1}}}\n',
+                '\n',
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n',
+                '\n',
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Private reasoning"}}\n',
+                '\n',
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}\n',
                 '\n',
                 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}\n',
                 '\n',

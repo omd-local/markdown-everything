@@ -76,7 +76,7 @@ def test_memory_pressure_stays_normal_when_available_memory_is_unknown(monkeypat
     assert ollama_runtime.memory_pressure_level() == "normal"
 
 
-def test_request_ollama_json_uses_no_redirect_opener_by_default(monkeypatch):
+def test_request_ollama_json_uses_ollama_opener_by_default(monkeypatch):
     from omd import ollama_runtime
 
     captured: dict[str, object] = {}
@@ -98,11 +98,11 @@ def test_request_ollama_json_uses_no_redirect_opener_by_default(monkeypatch):
             captured["timeout"] = timeout
             return FakeResponse()
 
-    monkeypatch.setattr(
-        ollama_runtime,
-        "build_no_redirect_opener",
-        lambda: FakeOpener(),
-    )
+    def build_opener(endpoint):
+        assert endpoint == "http://localhost:11434/api/chat"
+        return FakeOpener()
+
+    monkeypatch.setattr(ollama_runtime, "build_ollama_opener", build_opener)
 
     result = ollama_runtime.request_ollama_json(
         urllib.request.Request("http://localhost:11434/api/chat", data=b"{}"),
@@ -155,3 +155,42 @@ def test_request_ollama_json_rejects_non_object_payload():
             timeout=3,
             open_call=lambda _request, timeout: FakeResponse(),
         )
+
+
+def test_request_ollama_json_uses_no_redirect_opener_by_default(monkeypatch):
+    from omd import ollama_runtime
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, limit: int) -> bytes:
+            captured["limit"] = limit
+            return b'{"response":"ok"}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        ollama_runtime,
+        "build_ollama_opener",
+        lambda endpoint: FakeOpener(),
+    )
+
+    result = ollama_runtime.request_ollama_json(
+        urllib.request.Request("http://localhost:11434/api/chat", data=b"{}"),
+        timeout=3,
+    )
+
+    assert result == {"response": "ok"}
+    assert captured["url"] == "http://localhost:11434/api/chat"
+    assert captured["timeout"] == 3
+    assert captured["limit"] == ollama_runtime.MAX_OLLAMA_RESPONSE_BYTES + 1

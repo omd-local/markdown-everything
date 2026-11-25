@@ -27,7 +27,7 @@ from .retrieval import (
     validate_vault_markdown_path,
 )
 from .structured_output import AIOutputSchema
-from .tag_normalization import normalize_generated_tag
+from .tag_normalization import canonical_tag_identity, normalize_generated_tag
 
 
 SCHEMA_VERSION = 1
@@ -56,6 +56,14 @@ concepts. Prefer relevant existing vault tags and avoid generic tags such as not
 content, information, or misc. Select existing vault tags only by supplied tag_id,
 placing that ID in the existing_tags tag field. For each link, set evidence to one
 supplied evidence_options ID; never write, summarize, or paraphrase an evidence excerpt.
+Summarize the note's subject, not filenames, capture metadata, or the candidate catalog.
+The catalog is only a lookup list, not evidence about the note. Suggest a link or tag
+only when the note's substantive content supports it; sharing a source type is insufficient.
+New concepts are optional topics from the note that have no existing candidate title or
+alias. Never copy an existing title, filename, placeholder, or catalog-only topic into
+new_concepts. New tags must be meaningful topic labels, never tag IDs.
+Each tag reason must explain its relationship to this note, not just repeat the tag.
+Keep the proposal concise: at most 3 links, 3 new concepts, and 5 tags in each tag list.
 Return only the JSON object required by the supplied schema and never reveal reasoning,
 environment values, credentials, or unrelated content."""
 
@@ -93,6 +101,7 @@ class EnrichNoteError(RuntimeError):
         self.code = code
         self.request_id = request_id
         self.validation = validation
+
 
 
 @dataclass(frozen=True)
@@ -259,8 +268,36 @@ def run_enrich_note(
         result.structured,
         evidence_by_id,
         tag_by_id,
+        warnings=combined_warnings,
         request_id=request.request_id,
     )
+    if (
+        isinstance(resolved, dict) and isinstance(resolved.get("new_concepts"), list)
+        and len(resolved["new_concepts"]) <= MAX_MODEL_CONCEPTS
+    ):
+        identities = {
+            identity.casefold()
+            for candidate in request.candidates
+            for identity in (candidate.title, *candidate.aliases)
+        }
+        identities.add(PurePosixPath(request.note.path).stem.casefold())
+        title = re.search(r"^#\s+(.+)$", request.note.content, re.MULTILINE)
+        if title is not None:
+            identities.add(title.group(1).strip().casefold())
+        concepts = []
+        for item in resolved["new_concepts"]:
+            if (
+                isinstance(item, dict) and set(item) == {"label", "reason"}
+                and isinstance(item["label"], str) and isinstance(item["reason"], str)
+                and item["label"].strip().casefold() in identities
+                and "[[" not in item["label"] and "]]" not in item["label"]
+                and len(item["label"]) <= 256 and len(item["reason"]) <= 500
+                and item["reason"].strip()
+            ):
+                _append_warning(combined_warnings, "existing_concept_omitted")
+                continue
+            concepts.append(item)
+        resolved["new_concepts"] = concepts
     validated = validate_model_output(resolved, request)
     if any(
         item.get("candidate_id") not in prompt_candidate_ids
@@ -315,7 +352,7 @@ def decode_request(raw: bytes) -> EnrichNoteRequest:
 def model_output_contract(
     *,
     evidence_option_ids: Sequence[str] | None = None,
-    vault_tag_ids: Sequence[str] | None = None,
+    candidate_ids: Sequence[str] | None = None,
 ) -> AIOutputSchema:
     if evidence_option_ids is not None and (
         isinstance(evidence_option_ids, (str, bytes))
@@ -334,30 +371,26 @@ def model_output_contract(
         or len(set(normalized_ids)) != len(normalized_ids)
     ):
         raise ValueError("evidence_option_ids are invalid")
-    if vault_tag_ids is not None and (
-        isinstance(vault_tag_ids, (str, bytes))
-        or not isinstance(vault_tag_ids, Sequence)
+    if candidate_ids is not None and (
+        isinstance(candidate_ids, (str, bytes)) or not isinstance(candidate_ids, Sequence)
     ):
-        raise TypeError("vault_tag_ids must be a sequence of strings or None")
-    normalized_tag_ids = tuple(vault_tag_ids or ())
+        raise TypeError("candidate_ids must be a sequence of strings or None")
+    normalized_candidate_ids = tuple(candidate_ids or ())
     if (
-        len(normalized_tag_ids) > MAX_VAULT_TAGS
-        or any(
-            not isinstance(value, str) or not value or len(value) > 128
-            for value in normalized_tag_ids
-        )
-        or len(set(normalized_tag_ids)) != len(normalized_tag_ids)
+        len(normalized_candidate_ids) > MAX_PROMPT_CANDIDATES
+        or any(not isinstance(value, str) or not value or len(value) > 128 for value in normalized_candidate_ids)
+        or len(set(normalized_candidate_ids)) != len(normalized_candidate_ids)
     ):
-        raise ValueError("vault_tag_ids are invalid")
+        raise ValueError("candidate_ids are invalid")
 
     text = {"type": "string"}
     boolean = {"type": "boolean"}
     evidence = {"type": "string"}
     if evidence_option_ids is not None and normalized_ids:
         evidence["enum"] = list(normalized_ids)
-    existing_tag = {"type": "string"}
-    if vault_tag_ids is not None and normalized_tag_ids:
-        existing_tag["enum"] = list(normalized_tag_ids)
+    candidate = {"type": "string"}
+    if normalized_candidate_ids:
+        candidate["enum"] = list(normalized_candidate_ids)
     return AIOutputSchema(
         name="enrich_note_v1",
         schema={
@@ -369,7 +402,7 @@ def model_output_contract(
                     "items": {
                         "type": "object",
                         "properties": {
-                            "candidate_id": text,
+                            "candidate_id": candidate,
                             "reason": text,
                             "evidence": evidence,
                             "recommended": boolean,
@@ -392,7 +425,7 @@ def model_output_contract(
                     "items": {
                         "type": "object",
                         "properties": {
-                            "tag": existing_tag,
+                            "tag": text,
                             "reason": text,
                             "recommended": boolean,
                         },
@@ -501,46 +534,69 @@ def _validate_model_output(
             )
             seen_concepts.add(key)
 
-    tag_identity = {tag.casefold(): tag for tag in request.vault_tags}
+    tag_identity = {canonical_tag_identity(tag): tag for tag in request.vault_tags}
     normalized_existing_tags: list[dict[str, object]] = []
+    normalized_new_tags: list[dict[str, str]] = []
+    reclassified_new_tags: list[tuple[str, str]] = []
     seen_tags: set[str] = set()
     for value in existing_tags:
         item = _model_object(value, {"tag", "reason", "recommended"}, "existing_tags")
         supplied = _model_string(item["tag"], "tag", 128)
-        key = supplied.casefold()
+        key = canonical_tag_identity(supplied)
+        reason = _model_string(item["reason"], "reason", 500)
+        recommended = _model_boolean(item["recommended"], "recommended")
         if key not in tag_identity:
-            raise EnrichNoteError(
-                "invalid_model_json",
-                "model classified an unknown vault tag as existing",
-                request_id=request.request_id,
-            )
+            tag = normalize_generated_tag(supplied)
+            if not tag:
+                raise EnrichNoteError("invalid_model_json", "model returned an empty normalized tag")
+            if re.fullmatch(r"tag-\d+", tag):
+                raise EnrichNoteError(
+                    "invalid_model_json",
+                    "model selected an unknown vault tag",
+                    request_id=request.request_id,
+                )
+            reclassified_new_tags.append((tag, reason))
+            continue
         if key not in seen_tags:
             normalized_existing_tags.append(
                 {
                     "tag": tag_identity[key],
-                    "reason": _model_string(item["reason"], "reason", 500),
-                    "recommended": _model_boolean(item["recommended"], "recommended"),
+                    "reason": reason,
+                    "recommended": recommended,
                 }
             )
             seen_tags.add(key)
 
-    normalized_new_tags: list[dict[str, str]] = []
-    for value in new_tags:
-        item = _model_object(value, {"tag", "reason"}, "new_tags")
-        tag = normalize_generated_tag(_model_string(item["tag"], "tag", 128))
+    def add_new_tag(raw_tag: str, reason: str) -> None:
+        tag = normalize_generated_tag(raw_tag)
         if not tag:
             raise EnrichNoteError("invalid_model_json", "model returned an empty normalized tag")
-        key = tag.casefold()
-        reason = _model_string(item["reason"], "reason", 500)
-        if key in seen_tags:
-            continue
-        if key in tag_identity:
-            normalized_existing_tags.append(
-                {"tag": tag_identity[key], "reason": reason, "recommended": False}
+        if re.fullmatch(r"tag-\d+", tag):
+            raise EnrichNoteError(
+                "invalid_model_json",
+                "model selected an unknown vault tag",
+                request_id=request.request_id,
             )
-        else:
+        key = canonical_tag_identity(tag)
+        if key in seen_tags:
+            return
+        if key in tag_identity:
+            if len(normalized_existing_tags) < MAX_MODEL_EXISTING_TAGS:
+                normalized_existing_tags.append(
+                    {"tag": tag_identity[key], "reason": reason, "recommended": False}
+                )
+        elif len(normalized_new_tags) < MAX_MODEL_NEW_TAGS:
             normalized_new_tags.append({"tag": tag, "reason": reason})
         seen_tags.add(key)
+
+    for value in new_tags:
+        item = _model_object(value, {"tag", "reason"}, "new_tags")
+        add_new_tag(
+            _model_string(item["tag"], "tag", 128),
+            _model_string(item["reason"], "reason", 500),
+        )
+    for tag, reason in reclassified_new_tags:
+        add_new_tag(tag, reason)
 
     return {
         "summary": summary,
@@ -592,21 +648,27 @@ def build_proposal_response(
         )
 
     source_tags = {
-        normalize_generated_tag(tag).casefold()
+        normalize_generated_tag(tag)
         for tag in extract_obsidian_tags(request.note.content)
         if normalize_generated_tag(tag)
     }
     existing_tags = []
     for item in model_output["existing_tags"]:
         assert isinstance(item, dict)
-        if normalize_generated_tag(item["tag"]).casefold() in source_tags:
+        if normalize_generated_tag(item["reason"]) == normalize_generated_tag(item["tag"]):
+            _append_warning(response_warnings, "unexplained_tag_omitted")
+            continue
+        if normalize_generated_tag(item["tag"]) in source_tags:
             _append_warning(response_warnings, "existing_tag_already_present")
             continue
         existing_tags.append(item)
     new_tags = []
     for item in model_output["new_tags"]:
         assert isinstance(item, dict)
-        if normalize_generated_tag(item["tag"]).casefold() in source_tags:
+        if normalize_generated_tag(item["reason"]) == normalize_generated_tag(item["tag"]):
+            _append_warning(response_warnings, "unexplained_tag_omitted")
+            continue
+        if normalize_generated_tag(item["tag"]) in source_tags:
             _append_warning(response_warnings, "new_tag_already_present")
             continue
         new_tags.append(item)
@@ -713,17 +775,14 @@ def _build_model_input(
     dict[str, str],
     dict[str, str],
 ]:
-    evidence_options = _extract_evidence_options(request.note.content)
+    source_content = _source_for_model(request.note.content)
+    evidence_options = _extract_evidence_options(source_content)
     evidence_by_id = {
         f"evidence-{index}": excerpt
         for index, excerpt in enumerate(evidence_options, start=1)
     }
-    all_tag_by_id = {
-        f"tag-{index}": tag for index, tag in enumerate(request.vault_tags, start=1)
-    }
     output_schema = model_output_contract(
         evidence_option_ids=tuple(evidence_by_id),
-        vault_tag_ids=tuple(all_tag_by_id),
     )
     schema_text = json.dumps(
         output_schema.schema,
@@ -752,14 +811,66 @@ def _build_model_input(
     }
     prompt_overhead_tokens = estimated_text_tokens(_compact_json(payload))
     note_budget = max(128, int(max(0, available_tokens - prompt_overhead_tokens) * 0.65))
-    note_content = _prefix_for_token_budget(request.note.content, note_budget)
+    note_content = _prefix_for_token_budget(source_content, note_budget)
     warnings: list[str] = []
-    if note_content != request.note.content:
+    if note_content != source_content:
         warnings.append("source_truncated_for_model_context")
 
     untrusted_note = payload["untrusted_note"]
     assert isinstance(untrusted_note, dict)
     untrusted_note["content"] = note_content
+    source_terms = set(re.findall(r"[\w]+", note_content.casefold()))
+    relevant_candidate_tags = {
+        canonical_tag_identity(tag)
+        for candidate in request.candidates
+        if source_terms.intersection(
+            term for term in re.findall(r"[\w]+", " ".join((candidate.title, *candidate.aliases)).casefold())
+            if len(term) >= 2
+        )
+        for tag in candidate.tags
+    }
+    source_tags = {canonical_tag_identity(tag) for tag in extract_obsidian_tags(request.note.content)}
+    # Formats from other captures are weaker context than topic labels. Keep all
+    # tags eligible so semantic synonyms and user-specific taxonomies survive.
+    capture_tags = {
+        canonical_tag_identity(tag)
+        for candidate in request.candidates
+        for tag in candidate.tags
+        if canonical_tag_identity(tag) in {"audio", "pdf", "webpage", "video", "image", "document"}
+    }
+    ordered_tags = sorted(
+        request.vault_tags,
+        key=lambda tag: (
+            canonical_tag_identity(tag) not in source_tags,
+            canonical_tag_identity(tag) in capture_tags,
+            not set(re.findall(r"[\w]+", tag.casefold())).issubset(source_terms),
+            canonical_tag_identity(tag) not in relevant_candidate_tags,
+            -len(source_terms.intersection(re.findall(r"[\w]+", tag.casefold()))),
+        ),
+    )
+    all_tag_by_id = {f"tag-{index}": tag for index, tag in enumerate(ordered_tags, start=1)}
+    # Reserve room for tags before candidates can exhaust the remaining context.
+    tags_payload = payload["vault_tags"]
+    assert isinstance(tags_payload, list)
+    tag_budget = max(64, int(available_tokens * 0.15))
+    for tag_id, tag in all_tag_by_id.items():
+        tags_payload.append({"tag_id": tag_id, "tag": tag})
+        if estimated_text_tokens(_compact_json(tags_payload)) > tag_budget:
+            tags_payload.pop()
+            break
+    if len(tags_payload) < len(ordered_tags):
+        warnings.append("vault_tags_truncated_for_model_context")
+
+    def fits_context() -> bool:
+        schema = model_output_contract(
+            evidence_option_ids=tuple(evidence_by_id),
+            candidate_ids=tuple(str(item["candidate_id"]) for item in candidates_payload),
+        )
+        return estimated_text_tokens("\n".join((
+            _SYSTEM_PROMPT, "enrich_note_preview", _compact_json(payload),
+            json.dumps(schema.schema, ensure_ascii=True, separators=(",", ":")),
+        ))) + MAX_OUTPUT_TOKENS + 64 <= LOCAL_TEXT_CONTEXT_TOKENS
+
     candidates_payload = payload["untrusted_candidates"]
     assert isinstance(candidates_payload, list)
     for candidate in request.candidates[:MAX_PROMPT_CANDIDATES]:
@@ -771,24 +882,14 @@ def _build_model_input(
             "evidence": candidate.evidence,
         }
         candidates_payload.append(item)
-        if estimated_text_tokens(_compact_json(payload)) > available_tokens:
+        if not fits_context():
             candidates_payload.pop()
             break
     if len(candidates_payload) < len(request.candidates):
         warnings.append("candidate_catalog_truncated_for_model_context")
 
-    tags_payload = payload["vault_tags"]
-    assert isinstance(tags_payload, list)
-    for tag_id, tag in all_tag_by_id.items():
-        tags_payload.append({"tag_id": tag_id, "tag": tag})
-        if estimated_text_tokens(_compact_json(payload)) > available_tokens:
-            tags_payload.pop()
-            break
-    if len(tags_payload) < len(request.vault_tags):
-        warnings.append("vault_tags_truncated_for_model_context")
-
     encoded = _compact_json(payload)
-    if estimated_text_tokens(encoded) > available_tokens:
+    if not fits_context():
         raise EnrichNoteError(
             "request_too_large",
             "request cannot fit the local model context budget",
@@ -806,7 +907,7 @@ def _build_model_input(
     }
     output_schema = model_output_contract(
         evidence_option_ids=tuple(evidence_by_id),
-        vault_tag_ids=tuple(tag_by_id),
+        candidate_ids=tuple(str(item["candidate_id"]) for item in candidates_payload),
     )
     return (
         encoded,
@@ -823,6 +924,7 @@ def _resolve_model_references(
     evidence_by_id: dict[str, str],
     tag_by_id: dict[str, str],
     *,
+    warnings: list[str],
     request_id: str,
 ) -> object:
     if not isinstance(payload, dict):
@@ -852,16 +954,88 @@ def _resolve_model_references(
             if not isinstance(value, dict) or "tag" not in value:
                 resolved_tags.append(value)
                 continue
-            tag_id = value["tag"]
-            if not isinstance(tag_id, str) or tag_id not in tag_by_id:
-                raise EnrichNoteError(
-                    "invalid_model_json",
-                    "model selected an unknown vault tag",
-                    request_id=request_id,
-                )
-            resolved_tags.append({**value, "tag": tag_by_id[tag_id]})
+            tag_value = value["tag"]
+            if not isinstance(tag_value, str) or len(tag_value) > 128:
+                resolved_tags.append(value)
+                continue
+            tag_id = normalize_generated_tag(tag_value)
+            if tag_id in tag_by_id:
+                value = {**value, "tag": tag_by_id[tag_id]}
+            elif re.fullmatch(r"tag-\d+", tag_id):
+                _append_warning(warnings, "unknown_tag_reference_omitted")
+                continue
+            else:
+                # Only a bounded tag ID proves that the model selected an item
+                # OMD exposed in this request. A free-form string may match a
+                # wider catalog tag that was omitted for context limits. Keep
+                # the useful match visible, but never preselect it.
+                value = {**value, "recommended": False}
+            resolved_tags.append(value)
         resolved["existing_tags"] = resolved_tags
+    new_tags = payload.get("new_tags")
+    if isinstance(new_tags, list):
+        resolved_new_tags: list[object] = []
+        for value in new_tags:
+            if (
+                not isinstance(value, dict) or not isinstance(value.get("tag"), str)
+                or len(value["tag"]) > 128
+            ):
+                resolved_new_tags.append(value)
+                continue
+            tag = normalize_generated_tag(value["tag"])
+            if re.fullmatch(r"tag-\d+", tag):
+                if tag not in tag_by_id:
+                    _append_warning(warnings, "unknown_tag_reference_omitted")
+                    continue
+                value = {**value, "tag": tag_by_id[tag]}
+            resolved_new_tags.append(value)
+        resolved["new_tags"] = resolved_new_tags
     return resolved
+
+
+def _source_for_model(source: str) -> str:
+    """Drop conversion metadata and link-only navigation from the prompt copy only."""
+    lines = source.splitlines(keepends=True)
+    if lines and lines[0].strip() == "---":
+        end = next((i for i, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+        if end is not None:
+            lines = lines[end + 1:]
+    # OMD wraps converted content with its own title and provenance. Some web
+    # converters include navigation before the article's repeated title.
+    title = next((line.strip() for line in lines if line.startswith("# ")), None)
+    full_content = next((i for i, line in enumerate(lines) if line.strip() == "## Full Content"), None)
+    if full_content is None or not any(
+        re.match(r"^>\s*(?:\[Source\]|Source:).*Captured:", line.strip())
+        for line in lines[:full_content]
+    ):
+        return "".join(lines)
+    if title is not None and full_content is not None:
+        article_start = next((
+            i for i, line in enumerate(lines[full_content + 1:], full_content + 1)
+            if line.strip() == title
+        ), None)
+        if article_start is not None:
+            lines = lines[article_start:]
+    retained: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^>\s*(?:\[Source\]|Source:).*Captured:", stripped):
+            continue
+        if re.match(r"^\*\s+(?:Source|Author|Published):", stripped):
+            continue
+        if stripped == "## Full Content":
+            continue
+        # Images and standalone links (including linked tables of contents) do not
+        # describe the article. Keep mixed prose and links unchanged for evidence.
+        without_links = re.sub(r"!\[[^\]]*\]\([^\n]*?\)", "", stripped)
+        without_links = re.sub(r"\[[^\]]*\]\([^\n]*?\)", "", without_links)
+        without_links = re.sub(r"^(?:\d+[.)]\s*|[-*+]\s*)", "", without_links)
+        if stripped and not re.search(r"\w", without_links):
+            continue
+        if stripped.casefold() in {"sign up", "sign in", "get app", "share", "follow", "/sitemap/"}:
+            continue
+        retained.append(line)
+    return "".join(retained)
 
 
 def _extract_evidence_options(source: str) -> tuple[str, ...]:
@@ -870,6 +1044,7 @@ def _extract_evidence_options(source: str) -> tuple[str, ...]:
     lines = source.splitlines()
     frontmatter = bool(lines and lines[0].strip() == "---")
 
+    body_lines: list[str] = []
     for index, raw_line in enumerate(lines):
         line = raw_line.strip()
         if frontmatter:
@@ -879,6 +1054,11 @@ def _extract_evidence_options(source: str) -> tuple[str, ...]:
         if not line or line.startswith("```"):
             continue
         line = re.sub(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)", "", line).strip()
+        body_lines.append(line)
+    # Prefer substantive sentences over titles, navigation and short metadata.
+    # Every excerpt remains an exact substring of the original note.
+    body_lines.sort(key=lambda line: len(line) < 60)
+    for line in body_lines:
         for excerpt in _split_evidence_line(line):
             key = _normalized_text(excerpt)
             if len(excerpt) < 6 or not key or key in seen:
@@ -1040,7 +1220,7 @@ def _parse_request(payload: dict[str, object]) -> EnrichNoteRequest:
         _request_string(value, "vault_tags item", 128)
         for value in _request_list(payload["vault_tags"], "vault_tags", MAX_VAULT_TAGS)
     )
-    if len({tag.casefold() for tag in vault_tags}) != len(vault_tags):
+    if len({canonical_tag_identity(tag) for tag in vault_tags}) != len(vault_tags):
         raise EnrichNoteError(
             "invalid_request", "vault_tags must be unique ignoring case", request_id=request_id
         )
@@ -1090,6 +1270,7 @@ def _parse_candidate(value: object, request_id: str) -> EnrichCandidate:
         ) from exc
     evidence = " ".join(evidence.split())
     return EnrichCandidate(candidate_id, path, title, aliases, tags, evidence)
+
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

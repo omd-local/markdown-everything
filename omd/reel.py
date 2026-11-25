@@ -21,16 +21,30 @@ faster-whisper Python package installed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
+import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+from collections.abc import Iterator
+from typing import NoReturn
+from urllib.parse import urljoin, urlparse
 
+from omd._cookies import (
+    DOUYIN_COOKIE_DOMAINS,
+    CookieFileError,
+    host_matches,
+    write_scoped_cookie_jar,
+)
 from omd._language import DEFAULT_OCR_LANGUAGE
 from omd._models import (
     LOCAL_TEXT_CONTEXT_TOKENS,
@@ -39,37 +53,115 @@ from omd._models import (
     local_text_model_issue,
     recommended_local_text_model,
 )
+from omd._source_url import SourceURLCountError, extract_single_http_url
 from omd.ollama_runtime import ollama_keep_alive, request_ollama_json
 
 DOUYIN_HOSTS = {"douyin.com", "v.douyin.com", "iesdouyin.com", "www.douyin.com"}
+DOUYIN_SHORTLINK_HOSTS = ("v.douyin.com",)
+MAX_DOUYIN_REDIRECTS = 5
+DOUYIN_PRIVATE_DIR_PREFIX = "omd-reel-cookies-"
+_DOUYIN_PRIVATE_DIR_RE = re.compile(
+    rf"^{re.escape(DOUYIN_PRIVATE_DIR_PREFIX)}(?P<pid>[0-9]+)-[A-Za-z0-9_-]+$"
+)
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_FAST_WHISPER_MODEL = "small"
-URL_RE = re.compile(r"https?://[^\s'\"<>，。、）)】]+", re.UNICODE)
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+class DouyinRedirectError(ValueError):
+    """Safe shortlink rejection without exposing the submitted URL."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _prune_stale_douyin_cookie_dirs(temp_root: Path | None = None) -> None:
+    """Remove private jars left by an uncatchable process termination."""
+    root = Path(tempfile.gettempdir()) if temp_root is None else Path(temp_root)
+    try:
+        root_resolved = root.resolve(strict=True)
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    current_pid = os.getpid()
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    for entry in entries:
+        match = _DOUYIN_PRIVATE_DIR_RE.fullmatch(entry.name)
+        if match is None:
+            continue
+        pid = int(match.group("pid"))
+        if pid == current_pid or _pid_is_running(pid):
+            continue
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            if current_uid is not None and entry_stat.st_uid != current_uid:
+                continue
+            resolved = entry.resolve(strict=True)
+            if resolved.parent != root_resolved:
+                continue
+            shutil.rmtree(resolved)
+        except OSError:
+            # Fail closed: an uncertain entry is never followed or removed.
+            continue
+
+
+@contextlib.contextmanager
+def _private_douyin_cookie_dir(temp_root: Path | None = None) -> Iterator[Path]:
+    root = Path(tempfile.gettempdir()) if temp_root is None else Path(temp_root)
+    _prune_stale_douyin_cookie_dirs(root)
+    directory = Path(
+        tempfile.mkdtemp(
+            prefix=f"{DOUYIN_PRIVATE_DIR_PREFIX}{os.getpid()}-",
+            dir=str(root),
+        )
+    )
+    directory.chmod(0o700)
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _sigterm_as_system_exit() -> Iterator[None]:
+    """Make process-group cancellation unwind Python cleanup handlers."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def handle_sigterm(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def is_douyin(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
+    host = (urlparse(url).hostname or "").lower()
     return any(h == host or host.endswith("." + h) for h in {"douyin.com", "iesdouyin.com"})
-
-
-def cookies_txt_to_string(path: str, host_filter="douyin") -> str:
-    filters = (host_filter,) if isinstance(host_filter, str) else tuple(host_filter)
-    cookie_path = Path(path).expanduser()
-    if not cookie_path.is_file():
-        return ""
-    out = []
-    with cookie_path.open(encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 7:
-                continue
-            domain, _, _, _, _, name, value = parts[:7]
-            if any(f in domain for f in filters):
-                out.append(f"{name}={value}")
-    return "; ".join(out)
 
 
 def extract_url(raw: str) -> str:
@@ -77,14 +169,91 @@ def extract_url(raw: str) -> str:
     `5.15 复制打开抖音… https://v.douyin.com/abc/ T@L.wS …`.
     Accepts a bare URL unchanged.
     """
-    raw = raw.strip()
-    if raw.startswith(("http://", "https://")) and " " not in raw:
-        return raw
-    m = URL_RE.search(raw)
-    if not m:
+    try:
+        url = extract_single_http_url(raw.strip())
+    except SourceURLCountError as exc:
+        from omd import _events
+
+        _events.fatal("source_url_count_invalid", str(exc))
+    if not url:
         from omd import _events
         _events.fatal("url_not_found", "no http(s) URL found in input")
-    return m.group(0).rstrip("/.,;)")
+    return url
+
+
+def _validate_douyin_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise DouyinRedirectError(
+            "Douyin rejected a malformed shortlink destination. No cookies were sent."
+        ) from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or not host_matches(host, DOUYIN_COOKIE_DOMAINS)
+    ):
+        raise DouyinRedirectError(
+            "Douyin rejected a shortlink destination outside approved HTTPS hosts. "
+            "No cookies were sent."
+        )
+    return host
+
+
+def _douyin_http_get(url: str) -> tuple[int, dict, str]:
+    """Fetch one redirect hop without cookies or automatic redirects."""
+    _validate_douyin_url(url)
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=30) as response:
+            return response.status, dict(response.headers), response.geturl()
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, dict(exc.headers or {}), exc.geturl()
+        finally:
+            exc.close()
+
+
+def expand_douyin_short_url(url: str) -> str:
+    """Resolve a bounded Douyin shortlink chain before any cookie use."""
+    host = _validate_douyin_url(url)
+    if not host_matches(host, DOUYIN_SHORTLINK_HOSTS):
+        return url
+    current = url
+    try:
+        for _hop in range(MAX_DOUYIN_REDIRECTS):
+            status, headers, final = _douyin_http_get(current)
+            location = headers.get("Location") or headers.get("location")
+            if status in (301, 302, 303, 307, 308) and location:
+                target = urljoin(current, location)
+                target_host = _validate_douyin_url(target)
+                if not host_matches(target_host, DOUYIN_SHORTLINK_HOSTS):
+                    return target
+                current = target
+                continue
+            final_host = _validate_douyin_url(final)
+            if host_matches(final_host, DOUYIN_SHORTLINK_HOSTS):
+                raise DouyinRedirectError(
+                    "Douyin did not resolve the shortlink to a content URL. No cookies "
+                    "were sent; check the link and retry."
+                )
+            return final
+    except DouyinRedirectError:
+        raise
+    except (OSError, urllib.error.URLError) as exc:
+        raise DouyinRedirectError(
+            "Douyin could not expand the shortlink anonymously. Check the network "
+            "and retry. No cookies were sent."
+        ) from exc
+    raise DouyinRedirectError(
+        "Douyin rejected a shortlink with too many redirects. No cookies were sent."
+    )
 
 
 def find_tool(cmd: str) -> str | None:
@@ -137,21 +306,30 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
         raise
 
 
-def _usable_f2_media(path: Path) -> bool:
-    """Ignore macOS AppleDouble sidecars and hidden artifacts from external drives."""
-    name = path.name
-    return path.is_file() and not name.startswith("._") and not name.startswith(".")
-
-
 def detect_language_hint(url: str, override: str | None, preferred: str | None = None) -> str | None:
     from omd._language import choose_whisper_language
-    if override:
-        return override
-    chosen = choose_whisper_language(None, preferred=preferred)
+
+    chosen = choose_whisper_language(override, preferred=preferred)
+    if override is not None:
+        return chosen
     if chosen:
         return chosen
     host = urlparse(url).netloc.lower()
     return "zh" if any(h in host for h in DOUYIN_HOSTS) else None
+
+
+def _resolve_whisper_cli_language(
+    legacy: str | None,
+    explicit: str | None,
+) -> tuple[str | None, bool]:
+    """Reconcile reel's deprecated ASR-only ``--lang`` alias."""
+    if legacy is not None and any(separator in legacy for separator in ("+", ",")):
+        raise ValueError(
+            "reel --lang accepts a single Whisper language; use --ocr-language for OCR sets"
+        )
+    from omd.cli import _coalesce_whisper_language_values
+
+    return _coalesce_whisper_language_values(legacy, explicit), legacy is not None
 
 
 def download_ytdlp(
@@ -161,8 +339,30 @@ def download_ytdlp(
     cookies_file: str | None,
     max_duration: int | None = None,
 ) -> tuple[Path, dict, Path | None]:
-    from omd._download import ytdlp_max_filesize_arg
     yt_dlp = require("yt-dlp")
+    cmd = _build_ytdlp_command(
+        yt_dlp,
+        url,
+        workdir,
+        cookies_browser=cookies_browser,
+        cookies_file=cookies_file,
+        max_duration=max_duration,
+    )
+    run(cmd)
+    return _read_ytdlp_outputs(workdir)
+
+
+def _build_ytdlp_command(
+    yt_dlp: str,
+    url: str,
+    workdir: Path,
+    *,
+    cookies_browser: str | None,
+    cookies_file: str | None,
+    max_duration: int | None,
+) -> list[str]:
+    from omd._download import ytdlp_max_filesize_arg
+
     out_template = str(workdir / "reel.%(ext)s")
     cmd = [
         yt_dlp,
@@ -180,7 +380,10 @@ def download_ytdlp(
     if max_duration:
         cmd += ["--match-filter", f"duration <= {int(max_duration)}"]
     cmd.append(url)
-    run(cmd)
+    return cmd
+
+
+def _read_ytdlp_outputs(workdir: Path) -> tuple[Path, dict, Path | None]:
     audio = next(workdir.glob("reel.mp3"))
     info_path = next(workdir.glob("reel.info.json"))
     info = json.loads(info_path.read_text())
@@ -188,93 +391,134 @@ def download_ytdlp(
     return audio, info, thumbs[0] if thumbs else None
 
 
-def _yaml_double_quote(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _write_f2_cookie_config(workdir: Path, cookie_str: str) -> Path:
-    cfg = workdir / "f2-dy-cookie.yaml"
-    cfg.write_text(
-        "douyin:\n"
-        f"  cookie: {_yaml_double_quote(cookie_str)}\n"
-        "  interval: all\n"
-        "  path: Download\n",
-        encoding="utf-8",
-    )
-    cfg.chmod(0o600)
-    return cfg
-
-
-def _build_f2_douyin_command(f2: str, cfg: Path, url: str, workdir: Path) -> list[str]:
-    return [
-        f2, "dy", "-c", str(cfg), "-M", "one",
-        "-u", url, "-p", str(workdir),
-        "-m", "true", "-v", "true", "-d", "true",
-    ]
-
-
-def download_f2(url: str, workdir: Path, cookies_file: str | None) -> tuple[Path, dict, Path | None]:
-    f2 = require("f2")
-    if not cookies_file:
-        from omd import _events
-        _events.fatal(
-            "cookies_missing",
-            "Douyin requires --cookies <cookies.txt>. yt-dlp's Douyin "
-            "extractor is broken; f2 fallback needs cookies.",
+def _yt_dlp_has_douyin_extractor(yt_dlp: str) -> bool:
+    try:
+        result = subprocess.run(
+            [yt_dlp, "--list-extractors"],
+            text=True,
+            capture_output=True,
+            timeout=15,
         )
-    cookie_str = cookies_txt_to_string(cookies_file, host_filter="douyin")
-    if not cookie_str:
-        from omd import _events
-        _events.fatal("cookies_invalid", f"no douyin cookies found in {cookies_file}")
-    with tempfile.TemporaryDirectory() as cookie_cfg_dir:
-        cookie_cfg = _write_f2_cookie_config(Path(cookie_cfg_dir), cookie_str)
-        cmd = _build_f2_douyin_command(f2, cookie_cfg, url, workdir)
-        from omd import _progress
-        if _progress.is_verbose():
-            proc = subprocess.run(cmd, input="n\n", text=True)
-        else:
-            proc = subprocess.run(cmd, input="n\n", text=True, capture_output=True)
-    if proc.returncode != 0:
-        if proc.stdout:
-            sys.stderr.write(proc.stdout)
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        from omd import _events
-        _events.fatal("f2_failed", f"f2 exited {proc.returncode}")
-    mp4s = sorted(p for p in workdir.rglob("*_video.mp4") if _usable_f2_media(p))
-    if mp4s:
-        ffmpeg = require("ffmpeg")
-        mp4 = mp4s[0]
-        audio = mp4.with_name(mp4.stem.replace("_video", "_audio") + ".mp3")
-        run([
-            ffmpeg, "-y", "-i", str(mp4),
-            "-vn", "-acodec", "libmp3lame", "-q:a", "2",
-            str(audio),
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        base = audio.parent
-    else:
-        mp3s = sorted(p for p in workdir.rglob("*_music.mp3") if _usable_f2_media(p))
-        if not mp3s:
-            from omd import _events
-            _events.fatal("f2_no_audio", f"f2 produced no audio under {workdir}; check cookies / URL.")
-        audio = mp3s[0]
-        base = audio.parent
-    desc_path = next((p for p in base.glob("*_desc.txt") if _usable_f2_media(p)), None)
-    cover = next(
-        (
-            p for p in base.glob("*_cover.*")
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and _usable_f2_media(p)
-        ),
-        None,
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    return any(
+        line.strip().split(maxsplit=1)[0].casefold() == "douyin"
+        for line in result.stdout.splitlines()
+        if line.strip()
     )
-    info: dict = {
-        "extractor_key": "Douyin",
-        "webpage_url": url,
-        "uploader": base.name,
-        "title": audio.stem.replace("_music", ""),
-        "description": desc_path.read_text().strip() if desc_path else "",
-    }
-    return audio, info, cover
+
+
+def _douyin_failure_is_cookie_rejection(output: str) -> bool:
+    lowered = output.casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "authentication required",
+            "cookies are invalid",
+            "cookies are no longer valid",
+            "fresh cookies",
+            "login required",
+            "please log in",
+            "requires authentication",
+            "sign in to confirm",
+        )
+    )
+
+
+def _fatal_douyin(kind: str, message: str) -> NoReturn:
+    from omd import _events
+
+    _events.fatal(kind, message)
+    raise AssertionError("unreachable")
+
+
+def download_douyin_ytdlp(
+    url: str,
+    workdir: Path,
+    cookies_file: str | None,
+    *,
+    max_duration: int | None = None,
+) -> tuple[Path, dict, Path | None]:
+    """Download Douyin with a scoped cookie jar; never flatten cookies."""
+    yt_dlp = require("yt-dlp")
+    if not _yt_dlp_has_douyin_extractor(yt_dlp):
+        _fatal_douyin(
+            "douyin_fetch_failed",
+            "The installed yt-dlp does not include the Douyin extractor. Upgrade "
+            "yt-dlp with `python -m pip install --upgrade yt-dlp` or your package "
+            "manager, then retry.",
+        )
+    try:
+        resolved_url = expand_douyin_short_url(url)
+    except DouyinRedirectError as exc:
+        _fatal_douyin("douyin_redirect_rejected", str(exc))
+
+    with _private_douyin_cookie_dir() as cookie_dir:
+        private_jar = cookie_dir / "cookies.txt"
+        try:
+            write_scoped_cookie_jar(
+                cookies_file,
+                DOUYIN_COOKIE_DOMAINS,
+                private_jar,
+                platform="Douyin",
+            )
+        except CookieFileError as exc:
+            _fatal_douyin(exc.kind, str(exc))
+        except OSError:
+            _fatal_douyin(
+                "douyin_fetch_failed",
+                "Douyin could not prepare a private cookie jar. Check local temporary "
+                "file permissions, then retry.",
+            )
+
+        cmd = _build_ytdlp_command(
+            yt_dlp,
+            resolved_url,
+            workdir,
+            cookies_browser=None,
+            cookies_file=str(private_jar),
+            max_duration=max_duration,
+        )
+        try:
+            result = subprocess.run(cmd, text=True, capture_output=True)
+        except OSError:
+            _fatal_douyin(
+                "douyin_fetch_failed",
+                "yt-dlp could not start the Douyin download. Reinstall or upgrade "
+                "yt-dlp, then retry.",
+            )
+
+    if result.returncode != 0:
+        output = f"{result.stdout}\n{result.stderr}"
+        if _douyin_failure_is_cookie_rejection(output):
+            _fatal_douyin(
+                "cookies_rejected",
+                "Douyin rejected the supplied cookies. Sign in again, export fresh "
+                "Douyin cookies, then retry.",
+            )
+        if "unsupported url" in output.casefold() or "no suitable extractor" in output.casefold():
+            _fatal_douyin(
+                "douyin_fetch_failed",
+                "The installed yt-dlp could not handle this Douyin URL. Upgrade yt-dlp "
+                "with `python -m pip install --upgrade yt-dlp`, then retry.",
+            )
+        _fatal_douyin(
+            "douyin_fetch_failed",
+            "yt-dlp could not fetch this Douyin URL. Check that the link is public "
+            "and still available, update yt-dlp, then retry.",
+        )
+
+    try:
+        return _read_ytdlp_outputs(workdir)
+    except (OSError, StopIteration, json.JSONDecodeError):
+        _fatal_douyin(
+            "douyin_fetch_failed",
+            "yt-dlp finished without usable Douyin audio or metadata. Update yt-dlp "
+            "and retry; if it repeats, check that the post is still available.",
+        )
+        raise AssertionError("unreachable")
 
 
 def download(
@@ -285,7 +529,12 @@ def download(
     max_duration: int | None = None,
 ) -> tuple[Path, dict, Path | None]:
     if is_douyin(url):
-        return download_f2(url, workdir, cookies_file)
+        return download_douyin_ytdlp(
+            url,
+            workdir,
+            cookies_file,
+            max_duration=max_duration,
+        )
     return download_ytdlp(url, workdir, cookies_browser, cookies_file, max_duration=max_duration)
 
 
@@ -508,12 +757,18 @@ def polish_transcript(
     return out
 
 
-def ocr_thumbnail(thumb: Path, lang: str = DEFAULT_OCR_LANGUAGE) -> str:
-    tesseract = find_tool("tesseract")
-    if not tesseract:
-        return ""
+def ocr_thumbnail(
+    thumb: Path,
+    lang: str = DEFAULT_OCR_LANGUAGE,
+    *,
+    executable: str | None = None,
+) -> str:
+    from omd.cli import _prepare_ocr_execution
+
+    if executable is None:
+        lang, executable = _prepare_ocr_execution(lang)
     res = subprocess.run(
-        [tesseract, str(thumb), "-", "-l", lang],
+        [executable, str(thumb), "-", "-l", lang],
         capture_output=True, text=True,
     )
     return res.stdout.strip() if res.returncode == 0 else ""
@@ -585,13 +840,37 @@ def compose_markdown(url: str, info: dict, transcript: dict, ocr_text: str, poli
     return "\n".join(lines)
 
 
-def main() -> int:
+def _main() -> int:
+    from omd.config import SPOKEN_LANGUAGE_MODES
+
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("url", help="URL or full share blob (e.g. Douyin '5.15 复制打开抖音…' string).")
     p.add_argument("-o", "--output", help="Write markdown here (default: stdout).")
-    p.add_argument("--lang", help="Whisper language hint (e.g. zh, en).")
+    p.add_argument(
+        "--lang",
+        dest="legacy_whisper_lang",
+        help="Deprecated ASR alias for --whisper-lang (one language code only).",
+    )
+    p.add_argument(
+        "--whisper-lang",
+        default=None,
+        help="Whisper language hint such as zh/en, or auto; omit to inherit adapter/config defaults.",
+    )
+    p.add_argument(
+        "--spoken-language-mode",
+        choices=SPOKEN_LANGUAGE_MODES,
+        default=None,
+        help="Spoken-language policy; explicit requires --whisper-lang.",
+    )
+    p.add_argument(
+        "--ocr-lang",
+        "--ocr-language",
+        dest="ocr_language",
+        default=None,
+        help="Tesseract OCR language set for --ocr (for example chi_sim+eng).",
+    )
     p.add_argument("--preferred-languages", default=None,
-                   help="Comma-separated common Whisper languages; first is used when --lang is omitted.")
+                   help="Comma-separated common Whisper languages; first is used when --whisper-lang is omitted.")
     p.add_argument("--model", default=DEFAULT_MODEL, help="Whisper model.")
     p.add_argument(
         "--whisper-backend",
@@ -631,6 +910,42 @@ def main() -> int:
     from omd import _events, _progress
     _events.configure(args.json_events)
     _progress.configure(verbose=args.verbose, quiet=args.quiet)
+    try:
+        whisper_override, used_legacy_lang = _resolve_whisper_cli_language(
+            args.legacy_whisper_lang,
+            args.whisper_lang,
+        )
+        from omd.config import config_path, load_config, resolve_capture_config
+
+        runtime_config_path = config_path()
+        configured = load_config(runtime_config_path) if runtime_config_path.exists() else None
+        from omd._language import parse_preferred_languages
+
+        spoken_mode = args.spoken_language_mode
+        spoken_hint = whisper_override
+        if spoken_mode is None:
+            if whisper_override == "auto":
+                spoken_mode, spoken_hint = "auto-detect", None
+            elif whisper_override is not None:
+                spoken_mode = "explicit"
+            elif args.preferred_languages is not None:
+                preferred = parse_preferred_languages(args.preferred_languages)
+                spoken_mode = "explicit" if preferred else "inherit-adapter-default"
+                spoken_hint = preferred[0] if preferred else None
+        elif spoken_mode != "explicit" and whisper_override is not None:
+            raise ValueError(
+                "--whisper-lang may only accompany explicit spoken-language mode"
+            )
+        resolved_capture = resolve_capture_config(
+            configured,
+            explicit_ocr_language=args.ocr_language,
+            explicit_spoken_language_mode=spoken_mode,
+            explicit_spoken_language_hint=spoken_hint,
+        )
+    except ValueError as exc:
+        _events.fatal("language_config_invalid", str(exc))
+    if used_legacy_lang:
+        _progress.warn("reel --lang is deprecated; use --whisper-lang for speech recognition")
     if args.polish:
         from omd._network_policy import validate_ollama_host
 
@@ -640,7 +955,24 @@ def main() -> int:
             _events.fatal("ollama_host_blocked", str(exc))
 
     args.url = extract_url(args.url)
-    lang = detect_language_hint(args.url, args.lang, args.preferred_languages)
+    if resolved_capture.spoken_language_mode == "auto-detect":
+        detection_override = "auto"
+        preferred_languages = None
+    elif resolved_capture.spoken_language_mode == "explicit":
+        detection_override = resolved_capture.spoken_language_hint
+        preferred_languages = None
+    else:
+        detection_override = None
+        # The policy is already resolved; an empty preference list prevents
+        # environment settings from overriding the selected adapter default.
+        preferred_languages = ""
+    lang = detect_language_hint(args.url, detection_override, preferred_languages)
+    ocr_language = resolved_capture.ocr_language
+    ocr_executable: str | None = None
+    if args.ocr:
+        from omd.cli import _prepare_ocr_execution
+
+        ocr_language, ocr_executable = _prepare_ocr_execution(ocr_language)
 
     workdir_ctx = (
         tempfile.TemporaryDirectory()
@@ -669,7 +1001,11 @@ def main() -> int:
             expected_duration=info.get("duration"),
         )
         report_transcript_quality(quality_warnings, polish_requested=bool(args.polish))
-        ocr_text = ocr_thumbnail(thumb) if args.ocr and thumb else ""
+        ocr_text = (
+            ocr_thumbnail(thumb, ocr_language, executable=ocr_executable)
+            if args.ocr and thumb
+            else ""
+        )
         polished = ""
         if args.polish and not quality_warnings:
             raw_text = (transcript.get("text") or "").strip()
@@ -692,6 +1028,12 @@ def main() -> int:
     finally:
         if workdir_ctx is not None:
             workdir_ctx.cleanup()
+
+
+def main() -> int:
+    _prune_stale_douyin_cookie_dirs()
+    with _sigterm_as_system_exit():
+        return _main()
 
 
 if __name__ == "__main__":

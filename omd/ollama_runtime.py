@@ -10,7 +10,7 @@ import urllib.request
 from collections.abc import Callable
 
 from ._models import GIB, detect_total_memory_bytes
-from ._network_policy import build_no_redirect_opener
+from ._network_policy import build_ollama_opener
 
 
 _KEEP_ALIVE_RE = re.compile(r"^(?:0|\d+(?:\.\d+)?(?:ns|us|ms|s|m|h))$")
@@ -25,7 +25,7 @@ def request_ollama_json(
     open_call: Callable | None = None,
 ) -> dict[str, object]:
     """Read one bounded Ollama JSON response without forwarding redirects."""
-    open_request = open_call or build_no_redirect_opener().open
+    open_request = open_call or build_ollama_opener(request.full_url).open
     with open_request(request, timeout=timeout) as response:
         raw = response.read(MAX_OLLAMA_RESPONSE_BYTES + 1)
     if len(raw) > MAX_OLLAMA_RESPONSE_BYTES:

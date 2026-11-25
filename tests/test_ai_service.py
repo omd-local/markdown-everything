@@ -15,6 +15,9 @@ def _availability(provider: str, model: str, *, available: bool = True):
         destination_domain=("localhost" if provider == "ollama" else f"api.{provider}.com"),
         alternative_models=() if available else ("other-model",),
         elapsed_seconds=0.01,
+        answer_compatibility="supported",
+        answer_compatibility_reason="Test model supports the required answer contract.",
+        answer_contract="strict_json_schema",
     )
 
 
@@ -356,6 +359,99 @@ def test_unavailable_selected_model_is_not_replaced_or_sent():
     assert requested == []
 
 
+def test_unverified_answer_model_is_blocked_before_provider_request():
+    from dataclasses import replace
+
+    from omd.ai_service import (
+        AIServiceError,
+        AITextTask,
+        create_text_task_consent,
+        execute_text_task,
+    )
+
+    task = AITextTask(
+        provider="openai",
+        model="future-openai-model",
+        capability="note_organisation",
+        operation="Organise this note",
+        system_prompt="Use only the source.",
+        max_output_tokens=128,
+    )
+    source = "Private note"
+    grant = create_text_task_consent(
+        task, as_of=date(2026, 11, 2), source_text=source, now=lambda: 100.0
+    )
+    requested = []
+
+    with pytest.raises(AIServiceError, match="Catalog availability alone") as excinfo:
+        execute_text_task(
+            task,
+            as_of=date(2026, 11, 2),
+            source_text=source,
+            consent_granted=True,
+            consent_grant=grant,
+            credential_loader=lambda provider: "sk-secret",
+            model_validator=lambda provider, model, **kwargs: replace(
+                _availability(provider, model),
+                answer_compatibility="unverified",
+                answer_compatibility_reason=(
+                    "OMD has not verified future-openai-model. "
+                    "Catalog availability alone does not prove compatibility."
+                ),
+                answer_contract=None,
+            ),
+            requester=lambda request: requested.append(request),
+            now=lambda: 101.0,
+        )
+
+    assert excinfo.value.code == "selected_model_incompatible"
+    assert requested == []
+
+
+def test_supported_answer_model_without_contract_is_rejected_as_invalid_check():
+    from dataclasses import replace
+
+    from omd.ai_service import (
+        AIServiceError,
+        AITextTask,
+        create_text_task_consent,
+        execute_text_task,
+    )
+
+    task = AITextTask(
+        provider="openai",
+        model="gpt-4.1",
+        capability="note_organisation",
+        operation="Organise this note",
+        system_prompt="Use only the source.",
+        max_output_tokens=128,
+    )
+    source = "Private note"
+    grant = create_text_task_consent(
+        task, as_of=date(2026, 11, 2), source_text=source, now=lambda: 100.0
+    )
+    requested = []
+
+    with pytest.raises(AIServiceError, match="answer compatibility is invalid") as excinfo:
+        execute_text_task(
+            task,
+            as_of=date(2026, 11, 2),
+            source_text=source,
+            consent_granted=True,
+            consent_grant=grant,
+            credential_loader=lambda provider: "sk-secret",
+            model_validator=lambda provider, model, **kwargs: replace(
+                _availability(provider, model),
+                answer_contract=None,
+            ),
+            requester=lambda request: requested.append(request),
+            now=lambda: 101.0,
+        )
+
+    assert excinfo.value.code == "model_check_invalid"
+    assert requested == []
+
+
 def test_cloud_result_exposes_usage_and_destination_but_not_secret():
     from omd.ai_providers import AIProviderResponse
     from omd.ai_service import AITextTask, create_text_task_consent, execute_text_task
@@ -524,7 +620,7 @@ def test_structured_contract_is_forwarded_and_returned_defensively():
 
     result = execute_text_task(
         task,
-        source_text="Local note",
+        as_of=date(2026, 11, 2), source_text="Local note",
         consent_granted=False,
         model_validator=lambda provider, model, **kwargs: _availability(provider, model),
         requester=lambda request: (

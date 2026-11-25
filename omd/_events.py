@@ -31,6 +31,10 @@ _ITEM_CONTEXT: ContextVar[tuple[int, int, int] | None] = ContextVar(
     "omd_event_item_context",
     default=None,
 )
+_DONE_SUPPRESSED: ContextVar[bool] = ContextVar(
+    "omd_event_done_suppressed",
+    default=False,
+)
 
 
 def configure(enabled: bool) -> None:
@@ -55,6 +59,16 @@ def item_context(*, index: int, total: int, attempt: int = 1) -> Iterator[None]:
         yield
     finally:
         _ITEM_CONTEXT.reset(token)
+
+
+@contextmanager
+def suppress_done() -> Iterator[None]:
+    """Suppress nested terminal events while preserving progress and errors."""
+    token = _DONE_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _DONE_SUPPRESSED.reset(token)
 
 
 def _item_fields(
@@ -185,7 +199,7 @@ def stage_state(
 def done(output: str | None = None, *, request_id: str | None = None) -> None:
     """Pipeline finished successfully. `output` is the final .md path, or
     None if the result went to stdout."""
-    if _ENABLED:
+    if _ENABLED and not _DONE_SUPPRESSED.get():
         event = {"event": "done", "output": output}
         if request_id is not None:
             event["request_id"] = request_id
@@ -196,6 +210,12 @@ def warn(msg: str) -> None:
     """Non-fatal warning. UI may surface as a toast."""
     if _ENABLED:
         _emit({"event": "warn", "message": msg})
+
+
+def recognition_resolved(recognition: dict[str, object]) -> None:
+    """Expose the resolved OCR/ASR decision to machine consumers."""
+    if _ENABLED:
+        _emit({"event": "recognition_resolved", "recognition": recognition})
 
 
 def error(
@@ -215,6 +235,7 @@ def error(
         if validation is not None:
             event["validation"] = validation
         _emit(event)
+
 
 
 def fatal(kind: str, message: str, code: int = 1) -> None:

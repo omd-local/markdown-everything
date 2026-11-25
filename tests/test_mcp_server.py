@@ -77,6 +77,35 @@ def test_run_omd_success_does_not_expose_raw_subprocess_output(monkeypatch):
     assert attacker_stdout not in json.dumps(result)
 
 
+def test_run_omd_success_ignores_routine_json_events_and_deduplicates_flag(monkeypatch):
+    seen = {}
+    stderr = "\n".join([
+        json.dumps({"event": "stage", "name": "convert"}),
+        json.dumps({"event": "progress", "cur": 1, "total": 1}),
+        json.dumps({"event": "stage_state", "state": "completed"}),
+        json.dumps({"event": "recognition_resolved", "recognition": {}}),
+        json.dumps({"event": "done", "output": "/tmp/output.md"}),
+    ])
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr=stderr, stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    result = mcp_server._run_omd(
+        "input.pdf",
+        None,
+        None,
+        ["--json-events", "--json-events"],
+    )
+
+    assert seen["cmd"].count("--json-events") == 1
+    assert result["log"] == "completed"
+
+
 def test_run_omd_enables_public_network_policy_only_during_subprocess(monkeypatch):
     seen = {}
 
@@ -130,6 +159,123 @@ def test_run_omd_failure_does_not_expose_raw_subprocess_output(monkeypatch):
     assert attacker_stdout not in message
 
 
+def test_convert_tool_preserves_bounded_structured_subprocess_error(monkeypatch, capsys):
+    seen = {}
+    stderr = "\n".join([
+        "untrusted adapter log that must not cross the MCP boundary",
+        json.dumps({
+            "v": 1,
+            "event": "error",
+            "kind": "ocr_language_pack_missing",
+            "message": "Missing Tesseract language pack(s): chi_sim",
+            "data": {"missing_packs": ["chi_sim"], "language_source": "config"},
+            "untrusted_extra": "do not expose me",
+        }),
+    ])
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        return SimpleNamespace(returncode=1, stderr=stderr, stdout="untrusted stdout")
+
+    monkeypatch.setattr(
+        mcp_server.subprocess,
+        "run",
+        fake_run,
+    )
+
+    mcp_server._handle({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "convert_to_markdown",
+            "arguments": {"uri": "https://example.com/image.png"},
+        },
+    })
+
+    response = json.loads(capsys.readouterr().out)
+    assert seen["cmd"].count("--json-events") == 1
+    assert response["error"] == {
+        "code": -32000,
+        "message": "Missing Tesseract language pack(s): chi_sim",
+        "data": {
+            "kind": "ocr_language_pack_missing",
+            "returncode": 1,
+            "data": {
+                "missing_packs": ["chi_sim"],
+                "language_source": "config",
+            },
+        },
+    }
+    serialized = json.dumps(response)
+    assert "untrusted adapter log" not in serialized
+    assert "untrusted stdout" not in serialized
+    assert "untrusted_extra" not in serialized
+
+
+def test_convert_tool_omits_oversized_structured_error_data(monkeypatch, capsys):
+    oversized = "s" * (mcp_server.SUBPROCESS_ERROR_DATA_CHARS + 1)
+    stderr = json.dumps({
+        "event": "error",
+        "kind": "fetch_failed",
+        "message": "The source could not be fetched",
+        "data": {"debug": oversized},
+    })
+
+    monkeypatch.setattr(
+        mcp_server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stderr=stderr, stdout=""),
+    )
+
+    mcp_server._handle({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "convert_to_markdown",
+            "arguments": {"uri": "https://example.com/article"},
+        },
+    })
+
+    response = json.loads(capsys.readouterr().out)
+    assert response["error"] == {
+        "code": -32000,
+        "message": "The source could not be fetched",
+        "data": {"kind": "fetch_failed", "returncode": 1},
+    }
+    assert oversized not in json.dumps(response)
+
+
+def test_convert_tool_plain_subprocess_failure_keeps_legacy_error_shape(monkeypatch, capsys):
+    monkeypatch.setattr(
+        mcp_server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=7,
+            stderr="plain adapter failure",
+            stdout="",
+        ),
+    )
+
+    mcp_server._handle({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "convert_to_markdown",
+            "arguments": {"uri": "https://example.com/article"},
+        },
+    })
+
+    response = json.loads(capsys.readouterr().out)
+    assert response["error"] == {
+        "code": -32000,
+        "message": "omd exited 7 (status: failed)",
+    }
+    assert "plain adapter failure" not in json.dumps(response)
+
+
 def test_run_omd_rejects_empty_uri_before_subprocess(monkeypatch):
     def fail_run(*_args, **_kwargs):
         raise AssertionError("subprocess should not run for an empty uri")
@@ -151,6 +297,16 @@ def test_mcp_rejects_loopback_url_by_default():
 def test_mcp_rejects_loopback_url_inside_share_text():
     with pytest.raises(ValueError, match="public internet"):
         mcp_server._validate_mcp_input("Read this: http://127.0.0.1:7860/private")
+
+
+def test_mcp_rejects_multiple_urls_even_when_input_starts_with_url():
+    with pytest.raises(ValueError, match="exactly one") as exc_info:
+        mcp_server._validate_mcp_input(
+            "https://example.com/public http://127.0.0.1:7860/private"
+        )
+    message = str(exc_info.value)
+    assert "example.com" not in message
+    assert "127.0.0.1" not in message
 
 
 def test_mcp_private_url_override_is_explicit(monkeypatch):
@@ -389,7 +545,19 @@ def test_run_omd_allows_share_blob_with_url_when_roots_are_restricted(monkeypatc
     assert result["markdown"] == _trusted("# Done\n")
 
 
-@pytest.mark.parametrize("flag", ["-o", "--output", "--keep", "--cookies"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "-o",
+        "--output",
+        "--keep",
+        "--cookies",
+        "--douyin-cookies",
+        "--instagram-cookies",
+        "--xhs-cookies",
+        "--cookies-from-browser",
+    ],
+)
 def test_run_omd_rejects_sink_and_auth_reel_options(flag):
     with pytest.raises(ValueError, match="forbidden flag"):
         mcp_server._run_omd("https://youtu.be/abc", "out.md", "eng", [flag, "value"])
@@ -411,12 +579,305 @@ def test_convert_tool_schema_defaults_to_markdown():
     tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "convert_to_markdown")
 
     assert tool["inputSchema"]["properties"]["output_format"]["default"] == "md"
+    assert {"lang", "ocr_language", "asr_language", "asr_mode"} <= set(
+        tool["inputSchema"]["properties"]
+    )
+    assert tool["inputSchema"]["properties"]["asr_mode"]["enum"] == [
+        "inherit-adapter-default",
+        "auto-detect",
+        "explicit",
+    ]
 
 
 def test_capture_to_vault_tool_schema_exists():
     tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "capture_to_vault")
 
     assert set(tool["inputSchema"]["required"]) == {"uri", "vault"}
+    assert {"lang", "ocr_language", "asr_language", "asr_mode"} <= set(
+        tool["inputSchema"]["properties"]
+    )
+    assert tool["inputSchema"]["properties"]["asr_mode"]["enum"] == [
+        "inherit-adapter-default",
+        "auto-detect",
+        "explicit",
+    ]
+
+
+def test_run_omd_accepts_explicit_ocr_and_asr_fields(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    result = mcp_server._run_omd(
+        "input.pdf",
+        None,
+        None,
+        [],
+        ocr_language="chi_sim+eng",
+        asr_language="auto",
+    )
+
+    assert result["markdown"] == _trusted("# Done\n")
+    assert seen["cmd"][seen["cmd"].index("--ocr-language") + 1] == "chi_sim+eng"
+    assert seen["cmd"][seen["cmd"].index("--whisper-lang") + 1] == "auto"
+    assert "--lang" not in seen["cmd"]
+
+
+def test_run_omd_inherit_asr_mode_suppresses_environment_and_config_hint(
+    monkeypatch,
+    tmp_path,
+):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "schema_version": 1,
+        "capture": {
+            "spoken_language_mode": "explicit",
+            "spoken_language_hint": "zh",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_MODE", "explicit")
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_HINT", "ja")
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    mcp_server._run_omd(
+        "https://youtu.be/abc",
+        None,
+        None,
+        [],
+        asr_mode="inherit-adapter-default",
+    )
+
+    mode_index = seen["cmd"].index("--spoken-language-mode")
+    assert seen["cmd"][mode_index + 1] == "inherit-adapter-default"
+    assert "--whisper-lang" not in seen["cmd"]
+
+
+@pytest.mark.parametrize(
+    ("asr_mode", "asr_language", "expected"),
+    [
+        ("inherit-adapter-default", "en", "conflicts"),
+        ("auto-detect", "en", "conflicts"),
+        ("explicit", None, "requires asr_language"),
+        ("explicit", "auto", "requires a non-auto"),
+        ("automatic", None, "asr_mode must be one of"),
+    ],
+)
+def test_run_omd_validates_asr_mode_language_combinations(
+    asr_mode,
+    asr_language,
+    expected,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mcp_server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        mcp_server._run_omd(
+            "https://youtu.be/abc",
+            None,
+            None,
+            [],
+            asr_language=asr_language,
+            asr_mode=asr_mode,
+        )
+
+
+@pytest.mark.parametrize(
+    ("asr_mode", "asr_language", "expected_options"),
+    [
+        ("auto-detect", "auto", ["--spoken-language-mode", "auto-detect"]),
+        (
+            "explicit",
+            "fr",
+            ["--spoken-language-mode", "explicit", "--whisper-lang", "fr"],
+        ),
+    ],
+)
+def test_run_omd_forwards_explicit_asr_modes(
+    asr_mode,
+    asr_language,
+    expected_options,
+    monkeypatch,
+):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    mcp_server._run_omd(
+        "https://youtu.be/abc",
+        None,
+        None,
+        [],
+        asr_language=asr_language,
+        asr_mode=asr_mode,
+    )
+
+    option_start = seen["cmd"].index("--spoken-language-mode")
+    assert seen["cmd"][option_start:option_start + len(expected_options)] == expected_options
+
+
+def test_run_omd_coalesces_legacy_reel_option_asr_mode(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    mcp_server._run_omd(
+        "https://youtu.be/abc",
+        None,
+        None,
+        ["--spoken-language-mode", "inherit-adapter-default"],
+        asr_mode="inherit-adapter-default",
+    )
+
+    assert seen["cmd"].count("--spoken-language-mode") == 1
+    mode_index = seen["cmd"].index("--spoken-language-mode")
+    assert seen["cmd"][mode_index + 1] == "inherit-adapter-default"
+
+
+def test_run_omd_rejects_conflicting_legacy_reel_option_asr_mode(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+
+    with pytest.raises(ValueError, match="conflicting spoken language modes"):
+        mcp_server._run_omd(
+            "https://youtu.be/abc",
+            None,
+            None,
+            ["--spoken-language-mode", "auto-detect"],
+            asr_mode="inherit-adapter-default",
+        )
+
+
+def test_run_omd_rejects_conflicting_legacy_and_explicit_ocr_fields(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+
+    with pytest.raises(ValueError, match="conflicting OCR language values"):
+        mcp_server._run_omd(
+            "input.pdf",
+            None,
+            "eng",
+            [],
+            ocr_language="chi_sim+eng",
+        )
+
+
+def test_run_omd_normalizes_legacy_mcp_lang_with_shared_parser(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    mcp_server._run_omd("input.pdf", None, " chi_sim + eng ", [])
+
+    assert seen["cmd"][seen["cmd"].index("--ocr-language") + 1] == "chi_sim+eng"
+
+
+def test_run_omd_preserves_reel_options_lang_as_deprecated_asr_alias(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    mcp_server._run_omd("https://youtu.be/abc", None, "eng", ["--lang", "zh"])
+
+    assert seen["cmd"][seen["cmd"].index("--ocr-language") + 1] == "eng"
+    assert seen["cmd"][seen["cmd"].index("--whisper-lang") + 1] == "zh"
+    assert "--lang" not in seen["cmd"]
+
+
+def test_run_omd_treats_xhs_reel_options_lang_as_deprecated_ocr_alias(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+    share_blob = "打开小红书查看 https://xhslink.com/a/abc123/ 复制此链接"
+
+    mcp_server._run_omd(
+        share_blob,
+        None,
+        None,
+        ["--lang", "chi_sim+eng"],
+        asr_language="zh",
+    )
+
+    assert seen["cmd"][seen["cmd"].index("--ocr-language") + 1] == "chi_sim+eng"
+    assert seen["cmd"][seen["cmd"].index("--whisper-lang") + 1] == "zh"
+    assert "--lang" not in seen["cmd"]
+
+
+def test_run_omd_coalesces_repeated_xhs_legacy_ocr_aliases(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, capture_output, text):
+        seen["cmd"] = cmd
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text("# Done\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+    mcp_server._run_omd(
+        "https://xhslink.com/a/abc123/",
+        None,
+        None,
+        ["--lang", "chi_sim+eng", "--lang", "chi_sim+eng"],
+    )
+
+    assert seen["cmd"].count("--ocr-language") == 1
+    assert seen["cmd"][seen["cmd"].index("--ocr-language") + 1] == "chi_sim+eng"
+    assert "--lang" not in seen["cmd"]
 
 
 def test_inspect_source_tool_schema_defaults_to_readiness():
@@ -436,7 +897,7 @@ def test_inspect_source_returns_preflight_and_readiness(monkeypatch):
     from omd import doctor
 
     monkeypatch.setattr(doctor, "run_checks", lambda: [
-        doctor.Check("f2", False, "tool", "not on PATH", "Douyin downloads"),
+        doctor.Check("yt-dlp", False, "tool", "not on PATH", "Douyin downloads"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
         doctor.Check("mlx_whisper", True, "tool", "/bin/mlx_whisper", "Apple Silicon transcription"),
     ])
@@ -445,7 +906,7 @@ def test_inspect_source_returns_preflight_and_readiness(monkeypatch):
 
     assert result["detected_type"] == "douyin_url"
     assert result["readiness"]["ready"] is False
-    assert result["readiness"]["missing_tools"] == ["f2"]
+    assert result["readiness"]["missing_tools"] == ["yt-dlp"]
     assert result["readiness"]["missing_auth"] == ["cookies_file"]
 
 
@@ -491,17 +952,127 @@ def test_run_capture_to_vault_returns_agent_readable_paths(monkeypatch, tmp_path
     assert result["untrusted"] is True
 
 
+def test_run_capture_to_vault_forwards_explicit_ocr_and_asr_fields(monkeypatch, tmp_path):
+    from omd import capture
+    from omd._manifest import manifest_path_for_output
+
+    monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(tmp_path))
+    source = tmp_path / "mixed.png"
+    source.write_bytes(b"png")
+    vault = tmp_path / "vault"
+    output = vault / "Sources" / "Images" / "mixed.md"
+    index = vault / "Index" / "OMD Captures.md"
+    seen = {}
+
+    def fake_capture_one(uri, vault_arg, **kwargs):
+        seen.update(kwargs)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        index.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Mixed\n", encoding="utf-8")
+        manifest_path_for_output(output).write_text('{"warnings":[]}\n', encoding="utf-8")
+        return capture.CaptureResult(
+            source=uri,
+            output_path=output,
+            index_path=index,
+            source_type="image",
+            title="Mixed",
+            tags=[],
+            return_code=0,
+        )
+
+    monkeypatch.setattr(capture, "capture_one", fake_capture_one)
+
+    mcp_server._run_capture_to_vault(
+        str(source),
+        str(vault),
+        None,
+        [],
+        ocr_language="chi_sim+eng",
+        asr_language="zh",
+    )
+
+    assert seen["lang"] == "chi_sim+eng"
+    assert seen["reel_extra"] == ["--whisper-lang", "zh"]
+
+
+def test_run_capture_to_vault_inherit_asr_mode_suppresses_environment_and_config_hint(
+    monkeypatch,
+    tmp_path,
+):
+    from omd import capture
+    from omd._manifest import manifest_path_for_output
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "schema_version": 1,
+        "capture": {
+            "spoken_language_mode": "explicit",
+            "spoken_language_hint": "zh",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("OMD_CONFIG", str(config_file))
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_MODE", "explicit")
+    monkeypatch.setenv("OMD_SPOKEN_LANGUAGE_HINT", "ja")
+    monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(tmp_path))
+    source = tmp_path / "episode.mp3"
+    source.write_bytes(b"audio")
+    vault = tmp_path / "vault"
+    output = vault / "Sources" / "Audio" / "episode.md"
+    index = vault / "Index" / "OMD Captures.md"
+    seen = {}
+
+    def fake_capture_one(uri, vault_arg, **kwargs):
+        seen.update(kwargs)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        index.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("# Episode\n", encoding="utf-8")
+        manifest_path_for_output(output).write_text('{"warnings":[]}\n', encoding="utf-8")
+        return capture.CaptureResult(
+            source=uri,
+            output_path=output,
+            index_path=index,
+            source_type="audio",
+            title="Episode",
+            tags=[],
+            return_code=0,
+        )
+
+    monkeypatch.setattr(capture, "capture_one", fake_capture_one)
+
+    mcp_server._run_capture_to_vault(
+        str(source),
+        str(vault),
+        None,
+        [],
+        asr_mode="inherit-adapter-default",
+    )
+
+    assert seen["reel_extra"] == [
+        "--spoken-language-mode",
+        "inherit-adapter-default",
+    ]
+
+
 def test_inspect_source_accepts_cookie_readiness_context(monkeypatch, tmp_path):
     from omd import doctor
 
     cookies = tmp_path / "cookies.txt"
-    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".douyin.com\tTRUE\t/\tTRUE\t0\tsessionid\tdemo\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(tmp_path))
     monkeypatch.setattr(doctor, "run_checks", lambda: [
-        doctor.Check("f2", True, "tool", "/bin/f2", "Douyin downloads"),
+        doctor.Check("yt-dlp", True, "tool", "/bin/yt-dlp", "Douyin downloads"),
         doctor.Check("ffmpeg", True, "tool", "/bin/ffmpeg", "audio/video extraction"),
         doctor.Check("mlx_whisper", True, "tool", "/bin/mlx_whisper", "Apple Silicon transcription"),
     ])
+    monkeypatch.setattr(
+        doctor,
+        "ytdlp_douyin_readiness",
+        lambda executable=None: {"ready": True, "available": True},
+    )
 
     result = mcp_server._inspect_source("https://v.douyin.com/abc", cookies=str(cookies))
 
@@ -529,9 +1100,11 @@ def test_handle_inspect_source_tool_call(capsys):
 
 def test_run_omd_rejects_secret_input_path(tmp_path, monkeypatch):
     monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(tmp_path))
+    secret_path = str(tmp_path / ".env")
 
-    with pytest.raises(ValueError, match="secret-bearing"):
-        mcp_server._run_omd(str(tmp_path / ".env"), None, "eng", [])
+    with pytest.raises(ValueError, match="secret-bearing") as exc_info:
+        mcp_server._run_omd(secret_path, None, "eng", [])
+    assert secret_path not in str(exc_info.value)
 
 
 def test_run_omd_rejects_home_dotfile(monkeypatch, tmp_path):
@@ -551,8 +1124,10 @@ def test_run_omd_rejects_path_outside_allowed_roots(tmp_path, monkeypatch):
     outside.mkdir()
     monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(safe))
 
-    with pytest.raises(ValueError, match="allowed roots"):
+    with pytest.raises(ValueError, match="allowed roots") as exc_info:
         mcp_server._run_omd(str(outside / "report.pdf"), None, "eng", [])
+    assert str(outside) not in str(exc_info.value)
+    assert str(safe) not in str(exc_info.value)
 
 
 def test_run_omd_rejects_output_outside_allowed_roots(tmp_path, monkeypatch):
@@ -572,8 +1147,29 @@ def test_run_omd_rejects_home_ssh_path(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(tmp_path))
 
-    with pytest.raises(ValueError, match="secret-bearing"):
-        mcp_server._run_omd(str(home / ".ssh" / "id_rsa"), None, "eng", [])
+    secret_path = str(home / ".ssh" / "id_rsa")
+    with pytest.raises(ValueError, match="secret-bearing") as exc_info:
+        mcp_server._run_omd(secret_path, None, "eng", [])
+    assert secret_path not in str(exc_info.value)
+
+
+def test_capture_failure_does_not_echo_source_url(monkeypatch, tmp_path):
+    from omd import capture
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv(mcp_server.ALLOWED_ROOTS_ENV, str(tmp_path))
+    monkeypatch.setattr(
+        capture,
+        "capture_one",
+        lambda *_args, **_kwargs: SimpleNamespace(return_code=1),
+    )
+    secret_url = "https://example.com/private-token-in-path"
+
+    with pytest.raises(RuntimeError, match="capture failed with exit code 1") as exc_info:
+        mcp_server._run_capture_to_vault(secret_url, str(vault), None, [])
+    assert secret_url not in str(exc_info.value)
+    assert "private-token-in-path" not in str(exc_info.value)
 
 
 def test_run_omd_rejects_remote_ollama_host():
@@ -665,6 +1261,63 @@ def test_inspect_tool_missing_uri_returns_clear_error(capsys):
     response = json.loads(capsys.readouterr().out)
     assert response["error"]["code"] == -32000
     assert response["error"]["message"] == "uri must be a non-empty string"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "runner_name"),
+    [
+        ("convert_to_markdown", {"uri": "https://example.com"}, "_run_omd"),
+        (
+            "capture_to_vault",
+            {"uri": "https://example.com", "vault": "/tmp/vault"},
+            "_run_capture_to_vault",
+        ),
+    ],
+)
+def test_tool_call_reports_system_exit_as_json_rpc_error(
+    tool_name,
+    arguments,
+    runner_name,
+    monkeypatch,
+    capsys,
+):
+    def fail_with_system_exit(**_kwargs):
+        raise SystemExit("invalid adapter arguments")
+
+    monkeypatch.setattr(mcp_server, runner_name, fail_with_system_exit)
+
+    mcp_server._handle({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    })
+
+    response = json.loads(capsys.readouterr().out)
+    assert response["error"] == {
+        "code": -32000,
+        "message": "invalid adapter arguments",
+    }
+
+
+def test_tool_call_does_not_swallow_keyboard_interrupt(monkeypatch, capsys):
+    def interrupt_capture(**_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mcp_server, "_run_capture_to_vault", interrupt_capture)
+
+    with pytest.raises(KeyboardInterrupt):
+        mcp_server._handle({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "capture_to_vault",
+                "arguments": {"uri": "https://example.com", "vault": "/tmp/vault"},
+            },
+        })
+
+    assert capsys.readouterr().out == ""
 
 
 def test_handle_rejects_non_object_request(capsys):

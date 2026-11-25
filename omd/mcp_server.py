@@ -6,14 +6,20 @@ Speaks MCP over stdio (JSON-RPC 2.0). No SDK dependency — pure stdlib.
 Tools exposed:
     convert_to_markdown(uri: str, output: str | null = null,
                         output_format: "md" | "rmd" = "md",
-                        lang: str = "eng",
+                        lang: str | null = null,
+                        ocr_language: str | null = null,
+                        asr_language: str | null = null,
+                        asr_mode: str | null = null,
                         reel_options: list[str] = []) -> {markdown, output_path}
 
     inspect_source(uri: str, include_readiness: bool = true,
                    cookies: str | null = null,
                    cookies_from_browser: str | null = null) -> {preflight fields, readiness?}
 
-    capture_to_vault(uri: str, vault: str, lang: str = "eng") -> {output_path, manifest_path}
+    capture_to_vault(uri: str, vault: str, lang: str | null = null,
+                     ocr_language: str | null = null,
+                     asr_language: str | null = null,
+                     asr_mode: str | null = null) -> {output_path, manifest_path}
 
     search_memory(vault: str, query: str, limit: int = 10) -> {hits, untrusted}
 
@@ -42,7 +48,7 @@ import tempfile
 from pathlib import Path
 
 from omd import __version__
-from omd._language import DEFAULT_OCR_LANGUAGE, MIXED_OCR_LANGUAGE_EXAMPLE
+from omd._language import MIXED_OCR_LANGUAGE_EXAMPLE
 from omd._network_policy import (
     public_network_policy_scope,
     validate_ollama_host,
@@ -57,6 +63,9 @@ FORBIDDEN_REEL_OPTIONS = {
     "--output",
     "--keep",
     "--cookies",
+    "--douyin-cookies",
+    "--instagram-cookies",
+    "--xhs-cookies",
     "--cookies-from-browser",
 }
 
@@ -64,11 +73,14 @@ ALLOWED_REEL_OPTIONS = {
     "--comments": 0,
     "--json-events": 0,
     "--lang": 1,
+    "--ocr-lang": 1,
+    "--ocr-language": 1,
     "--model": 1,
     "--ocr": 0,
     "--ollama-host": 1,
     "--polish": (0, 1),
     "--quiet": 0,
+    "--spoken-language-mode": 1,
     "--verbose": 0,
     "--whisper-lang": 1,
 }
@@ -108,6 +120,22 @@ ALLOWED_ROOTS_ENV = "OMD_MCP_ALLOWED_ROOTS"
 REMOTE_OLLAMA_ENV = "OMD_MCP_ALLOW_REMOTE_OLLAMA"
 PRIVATE_URL_ENV = "OMD_MCP_ALLOW_PRIVATE_URLS"
 
+ASR_MODES = ["inherit-adapter-default", "auto-detect", "explicit"]
+
+SUBPROCESS_ERROR_SCAN_CHARS = 16_384
+SUBPROCESS_ERROR_LINE_CHARS = 4_096
+SUBPROCESS_ERROR_KIND_CHARS = 128
+SUBPROCESS_ERROR_MESSAGE_CHARS = 1_024
+SUBPROCESS_ERROR_DATA_CHARS = 2_048
+
+ROUTINE_SUBPROCESS_EVENTS = {
+    "done",
+    "progress",
+    "recognition_resolved",
+    "stage",
+    "stage_state",
+}
+
 TOOLS = [
     {
         "name": "convert_to_markdown",
@@ -143,10 +171,32 @@ TOOLS = [
                 },
                 "lang": {
                     "type": "string",
-                    "default": DEFAULT_OCR_LANGUAGE,
                     "description": (
-                        f"Tesseract language(s) for image OCR (default {DEFAULT_OCR_LANGUAGE}; "
-                        f"Chinese + English example: {MIXED_OCR_LANGUAGE_EXAMPLE})."
+                        "Deprecated OCR-language alias retained for existing MCP callers. "
+                        "Prefer ocr_language."
+                    ),
+                },
+                "ocr_language": {
+                    "type": "string",
+                    "description": (
+                        f"Tesseract OCR language set; for example "
+                        f"{MIXED_OCR_LANGUAGE_EXAMPLE} for Chinese + English. "
+                        "Omit to use environment/config/default resolution."
+                    ),
+                },
+                "asr_language": {
+                    "type": "string",
+                    "description": (
+                        "One Whisper language hint such as en or zh, or auto for backend detection. "
+                        "Omit to inherit the adapter/config default."
+                    ),
+                },
+                "asr_mode": {
+                    "type": "string",
+                    "enum": ASR_MODES,
+                    "description": (
+                        "Spoken-language policy. Explicit requires a non-auto asr_language; "
+                        "inherit-adapter-default and auto-detect reject explicit language hints."
                     ),
                 },
                 "reel_options": {
@@ -212,10 +262,31 @@ TOOLS = [
                 },
                 "lang": {
                     "type": "string",
-                    "default": DEFAULT_OCR_LANGUAGE,
                     "description": (
-                        f"Tesseract language(s) for image OCR; use "
-                        f"{MIXED_OCR_LANGUAGE_EXAMPLE} for Chinese + English."
+                        "Deprecated OCR-language alias retained for existing MCP callers. "
+                        "Prefer ocr_language."
+                    ),
+                },
+                "ocr_language": {
+                    "type": "string",
+                    "description": (
+                        f"Tesseract OCR language set; use {MIXED_OCR_LANGUAGE_EXAMPLE} "
+                        "for Chinese + English. Omit to use environment/config/default resolution."
+                    ),
+                },
+                "asr_language": {
+                    "type": "string",
+                    "description": (
+                        "One Whisper language hint such as en or zh, or auto for backend detection. "
+                        "Omit to inherit the adapter/config default."
+                    ),
+                },
+                "asr_mode": {
+                    "type": "string",
+                    "enum": ASR_MODES,
+                    "description": (
+                        "Spoken-language policy. Explicit requires a non-auto asr_language; "
+                        "inherit-adapter-default and auto-detect reject explicit language hints."
                     ),
                 },
                 "tags": {
@@ -380,19 +451,18 @@ def _validate_mcp_path(value: str | None, *, role: str) -> None:
         return
     path = Path(value).expanduser().resolve(strict=False)
     if _path_has_secret_name(path):
-        raise ValueError(f"MCP {role} path is blocked because it appears secret-bearing: {value}")
+        raise ValueError(f"MCP {role} path is blocked because it appears secret-bearing.")
     if _is_home_dotfile(path):
-        raise ValueError(f"MCP {role} path is blocked because home dotfiles are not allowed: {value}")
+        raise ValueError(f"MCP {role} path is blocked because home dotfiles are not allowed.")
     roots = _allowed_roots()
     if not any(_is_relative_to(path, root) for root in roots):
-        allowed = ", ".join(str(root) for root in roots)
-        raise ValueError(f"MCP {role} path must be under allowed roots ({allowed}): {value}")
+        raise ValueError(f"MCP {role} path is outside the configured allowed roots.")
 
 
 def _validate_mcp_input(value: str) -> None:
     from omd import cli
 
-    url = value if _looks_like_url(value) else cli.extract_url_from_blob(value)
+    url = cli.extract_url_from_blob(value)
     if url:
         if not _env_flag(PRIVATE_URL_ENV):
             validate_public_http_url(url)
@@ -409,12 +479,6 @@ def _require_non_empty_string(value: object, *, name: str) -> str:
 def _optional_non_empty_string(value: object, *, name: str) -> str | None:
     if value is None:
         return None
-    return _require_non_empty_string(value, name=name)
-
-
-def _non_empty_string_or_default(value: object, *, name: str, default: str) -> str:
-    if value is None:
-        return default
     return _require_non_empty_string(value, name=name)
 
 
@@ -508,8 +572,17 @@ def _read_markdown_outputs(output: Path) -> tuple[str, list[dict] | None]:
 
 
 def _subprocess_log_summary(*, stderr: str, stdout: str) -> str:
-    if stderr.strip() or stdout.strip():
+    if stdout.strip():
         return "completed with warnings"
+    for line in stderr.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return "completed with warnings"
+        if not isinstance(event, dict) or event.get("event") not in ROUTINE_SUBPROCESS_EVENTS:
+            return "completed with warnings"
     return "completed"
 
 
@@ -517,17 +590,157 @@ def _subprocess_failure_message(returncode: int) -> str:
     return f"omd exited {returncode} (status: failed)"
 
 
+def _bounded_subprocess_error_text(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if len(value) <= maximum:
+        return value
+    return value[: maximum - 1] + "\u2026"
+
+
+def _resolve_mcp_asr_options(
+    asr_language: str | None,
+    asr_mode: str | None,
+    *language_aliases: str,
+    mode_aliases: list[str] | None = None,
+) -> list[str]:
+    from omd import cli
+
+    requested_language = cli._coalesce_whisper_language_values(
+        _optional_non_empty_string(asr_language, name="asr_language"),
+        *language_aliases,
+    )
+    explicit_mode = _optional_non_empty_string(asr_mode, name="asr_mode")
+    if explicit_mode is not None:
+        explicit_mode = explicit_mode.lower()
+        if explicit_mode not in ASR_MODES:
+            raise ValueError("asr_mode must be one of: " + ", ".join(ASR_MODES))
+    mode = cli._coalesce_spoken_language_modes(
+        explicit_mode,
+        *(mode_aliases or []),
+    )
+
+    if mode == "inherit-adapter-default":
+        if requested_language is not None:
+            raise ValueError("asr_mode inherit-adapter-default conflicts with an ASR language hint")
+        return [cli.SPOKEN_LANGUAGE_MODE_FLAG, mode]
+    if mode == "auto-detect":
+        if requested_language not in {None, "auto"}:
+            raise ValueError("asr_mode auto-detect conflicts with an explicit ASR language hint")
+        return [cli.SPOKEN_LANGUAGE_MODE_FLAG, mode]
+    if mode == "explicit":
+        if requested_language is None:
+            raise ValueError("asr_mode explicit requires asr_language")
+        if requested_language == "auto":
+            raise ValueError("asr_mode explicit requires a non-auto asr_language")
+        return [
+            cli.SPOKEN_LANGUAGE_MODE_FLAG,
+            mode,
+            cli.WHISPER_LANGUAGE_FLAG,
+            requested_language,
+        ]
+    if requested_language is not None:
+        return [cli.WHISPER_LANGUAGE_FLAG, requested_language]
+    return []
+
+
+def _subprocess_error_event(stderr: str) -> dict | None:
+    tail = stderr[-SUBPROCESS_ERROR_SCAN_CHARS:]
+    for line in reversed(tail.splitlines()):
+        if len(line) > SUBPROCESS_ERROR_LINE_CHARS:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict) or event.get("event") != "error":
+            continue
+        kind = _bounded_subprocess_error_text(
+            event.get("kind"),
+            maximum=SUBPROCESS_ERROR_KIND_CHARS,
+        )
+        message = _bounded_subprocess_error_text(
+            event.get("message"),
+            maximum=SUBPROCESS_ERROR_MESSAGE_CHARS,
+        )
+        if kind is None or message is None:
+            continue
+        parsed = {"kind": kind, "message": message}
+        if "data" in event:
+            encoded_data = json.dumps(event["data"], ensure_ascii=False, separators=(",", ":"))
+            if len(encoded_data) <= SUBPROCESS_ERROR_DATA_CHARS:
+                parsed["data"] = event["data"]
+        return parsed
+    return None
+
+
+class _OmdSubprocessError(RuntimeError):
+    def __init__(self, returncode: int, event: dict | None = None) -> None:
+        message = _subprocess_failure_message(returncode)
+        self.rpc_data = None
+        if event is not None:
+            message = event["message"]
+            self.rpc_data = {"kind": event["kind"], "returncode": returncode}
+            if "data" in event:
+                self.rpc_data["data"] = event["data"]
+        super().__init__(message)
+
+
 def _run_omd(
     uri: str,
     output: str | None,
-    lang: str,
+    lang: str | None,
     reel_options: list[str],
     output_format: str | None = None,
+    *,
+    ocr_language: str | None = None,
+    asr_language: str | None = None,
+    asr_mode: str | None = None,
 ) -> dict:
     uri = _require_non_empty_string(uri, name="uri")
     output = _optional_non_empty_string(output, name="output")
-    lang = _non_empty_string_or_default(lang, name="lang", default=DEFAULT_OCR_LANGUAGE)
     safe_reel_options = _validate_reel_options(_string_list(reel_options, name="reel_options"))
+    from omd import cli
+
+    legacy_ocr = _optional_non_empty_string(lang, name="lang")
+    explicit_ocr = _optional_non_empty_string(ocr_language, name="ocr_language")
+    requested_ocr = cli._coalesce_ocr_language_values(legacy_ocr, explicit_ocr)
+    for option_name in ("--ocr-lang", "--ocr-language"):
+        for option_value in cli._option_values(safe_reel_options, option_name):
+            requested_ocr = cli._coalesce_ocr_language_values(requested_ocr, option_value)
+
+    adapter_lang_values = cli._option_values(safe_reel_options, "--lang")
+    target_url = cli.extract_url_from_blob(uri)
+    target_is_xhs = bool(target_url and cli.is_xhs_url(target_url))
+    if target_is_xhs:
+        for adapter_lang in adapter_lang_values:
+            requested_ocr = cli._coalesce_ocr_language_values(
+                requested_ocr,
+                adapter_lang,
+            )
+
+    asr_options = _resolve_mcp_asr_options(
+        asr_language,
+        asr_mode,
+        *([] if target_is_xhs else adapter_lang_values),
+        *cli._option_values(safe_reel_options, "--whisper-lang"),
+        mode_aliases=cli._option_values(safe_reel_options, "--spoken-language-mode"),
+    )
+    safe_reel_options = cli._strip_extra_flags_with_value(
+        safe_reel_options,
+        {
+            "--lang",
+            "--ocr-lang",
+            "--ocr-language",
+            "--spoken-language-mode",
+            "--whisper-lang",
+        },
+    )
+    safe_reel_options = [
+        option for option in safe_reel_options if option != "--json-events"
+    ]
+    safe_reel_options.append("--json-events")
     output_format = _resolve_output_format(output_format, output)
     if output_format not in {"md", "rmd"}:
         raise ValueError("output_format must be 'md' or 'rmd'")
@@ -547,7 +760,10 @@ def _run_omd(
         tmp.close()
         output = tmp.name
     try:
-        cmd = [sys.executable, "-m", "omd.cli", "convert", uri, "-o", output, "--lang", lang]
+        cmd = [sys.executable, "-m", "omd.cli", "convert", uri, "-o", output]
+        if requested_ocr is not None:
+            cmd += ["--ocr-language", requested_ocr]
+        cmd += asr_options
         if output_format != "md":
             cmd += ["--format", output_format]
         cmd += safe_reel_options
@@ -556,7 +772,10 @@ def _run_omd(
         with public_network_policy_scope(enabled=not _env_flag(PRIVATE_URL_ENV)):
             proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
-            raise RuntimeError(_subprocess_failure_message(proc.returncode))
+            raise _OmdSubprocessError(
+                proc.returncode,
+                _subprocess_error_event(proc.stderr),
+            )
         output_path = Path(output)
         md, files = _read_markdown_outputs(output_path)
         result = {
@@ -594,12 +813,9 @@ def _inspect_source(
         raise ValueError("uri must be a non-empty string")
     cookies = _optional_non_empty_string(cookies, name="cookies")
     cookies_from_browser = _optional_non_empty_string(cookies_from_browser, name="cookies_from_browser")
-    from omd import cli
 
     raw = uri.strip()
-    extracted_url = cli.extract_url_from_blob(raw) if not _looks_like_url(raw) else None
-    if not extracted_url:
-        _validate_mcp_path(raw, role="input")
+    _validate_mcp_input(raw)
     _validate_mcp_path(cookies, role="cookies")
 
     from omd._preflight import inspect_target
@@ -616,10 +832,25 @@ def _inspect_source(
     return result
 
 
-def _run_capture_to_vault(uri: str, vault: str, lang: str, tags: list[str]) -> dict:
+def _run_capture_to_vault(
+    uri: str,
+    vault: str,
+    lang: str | None,
+    tags: list[str],
+    *,
+    ocr_language: str | None = None,
+    asr_language: str | None = None,
+    asr_mode: str | None = None,
+) -> dict:
     uri = _require_non_empty_string(uri, name="uri")
     vault = _require_non_empty_string(vault, name="vault")
-    lang = _non_empty_string_or_default(lang, name="lang", default=DEFAULT_OCR_LANGUAGE)
+    from omd import cli
+
+    requested_ocr = cli._coalesce_ocr_language_values(
+        _optional_non_empty_string(lang, name="lang"),
+        _optional_non_empty_string(ocr_language, name="ocr_language"),
+    )
+    asr_options = _resolve_mcp_asr_options(asr_language, asr_mode)
     if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
         raise ValueError("tags must be a list of strings")
     _validate_mcp_input(uri)
@@ -632,13 +863,14 @@ def _run_capture_to_vault(uri: str, vault: str, lang: str, tags: list[str]) -> d
         result = capture.capture_one(
             uri,
             vault,
-            lang=lang,
+            lang=requested_ocr,
+            reel_extra=asr_options,
             tags=tags,
             agent_safe=True,
             memory_cards=False,
         )
     if result.return_code != 0:
-        raise RuntimeError(f"capture failed with exit code {result.return_code}: {uri}")
+        raise RuntimeError(f"capture failed with exit code {result.return_code}")
     manifest_path = manifest_path_for_output(result.output_path)
     return {
         "output_path": str(result.output_path),
@@ -697,8 +929,11 @@ def _ok(req_id, result):
     _send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
-def _err(req_id, code, message):
-    _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+def _err(req_id, code, message, *, data=None):
+    error = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    _send({"jsonrpc": "2.0", "id": req_id, "error": error})
 
 
 def _object_param(value: object, *, name: str) -> dict:
@@ -740,9 +975,12 @@ def _handle(msg: object) -> None:
                 out = _run_omd(
                     uri=_require_non_empty_string(args.get("uri"), name="uri"),
                     output=args.get("output"),
-                    lang=args.get("lang", DEFAULT_OCR_LANGUAGE),
+                    lang=args.get("lang"),
                     reel_options=args.get("reel_options", []),
                     output_format=args.get("output_format"),
+                    ocr_language=args.get("ocr_language"),
+                    asr_language=args.get("asr_language"),
+                    asr_mode=args.get("asr_mode"),
                 )
                 _ok(req_id, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]})
             elif name == "inspect_source":
@@ -761,8 +999,11 @@ def _handle(msg: object) -> None:
                 out = _run_capture_to_vault(
                     uri=_require_non_empty_string(args.get("uri"), name="uri"),
                     vault=_require_non_empty_string(args.get("vault"), name="vault"),
-                    lang=args.get("lang", DEFAULT_OCR_LANGUAGE),
+                    lang=args.get("lang"),
                     tags=args.get("tags", []),
+                    ocr_language=args.get("ocr_language"),
+                    asr_language=args.get("asr_language"),
+                    asr_mode=args.get("asr_mode"),
                 )
                 _ok(req_id, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]})
             elif name == "search_memory":
@@ -776,6 +1017,10 @@ def _handle(msg: object) -> None:
                 _ok(req_id, {"content": [{"type": "text", "text": json.dumps(SUPPORTED, ensure_ascii=False, indent=2)}]})
             else:
                 _err(req_id, -32601, f"unknown tool: {name}")
+        except _OmdSubprocessError as e:
+            _err(req_id, -32000, str(e), data=e.rpc_data)
+        except SystemExit as e:
+            _err(req_id, -32000, str(e))
         except Exception as e:
             _err(req_id, -32000, str(e))
     elif req_id is not None:

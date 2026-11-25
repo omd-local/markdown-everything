@@ -208,6 +208,7 @@ def test_model_validation_never_switches_to_another_available_model():
     assert status.available is False
     assert status.selected_model == "requested-model"
     assert status.alternative_models == ("different-model",)
+    assert status.catalog_models == ("different-model",)
 
 
 def test_model_validation_reports_exact_selected_model_as_available():
@@ -215,16 +216,93 @@ def test_model_validation_reports_exact_selected_model_as_available():
 
     status = validate_selected_model(
         "anthropic",
-        "claude-selected",
+        "claude-sonnet-4-5-20250929",
         api_key="sk-test",
         opener=lambda request, timeout: _FakeResponse(
-            {"data": [{"id": "claude-selected"}]}
+            {
+                "data": [
+                    {"id": "claude-opus-5-5"},
+                    {"id": "claude-sonnet-4-5-20250929"},
+                ]
+            }
         ),
     )
 
     assert status.available is True
-    assert status.selected_model == "claude-selected"
+    assert status.selected_model == "claude-sonnet-4-5-20250929"
     assert status.alternative_models == ()
+    assert status.catalog_models == (
+        "claude-opus-5-5",
+        "claude-sonnet-4-5-20250929",
+    )
+    assert status.answer_compatibility == "supported"
+    assert status.answer_contract == "strict_json_schema"
+    assert "Anthropic JSON schema" in status.answer_compatibility_reason
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "status", "contract"),
+    [
+        ("openai", "gpt-4.1", "supported", "strict_json_schema"),
+        ("openai", "gpt-4.1-mini-2025-04-14", "supported", "strict_json_schema"),
+        ("openai", "gpt-6-astra", "supported", "strict_json_schema"),
+        ("openai", "gpt-5.6-terra", "supported", "strict_json_schema"),
+        ("openai", "gpt-5.5-pro-2026-04-23", "unsupported", None),
+        ("openai", "gpt-5.4-mini", "supported", "strict_json_schema"),
+        ("openai", "gpt-5.2-chat-latest", "supported", "strict_json_schema"),
+        ("openai", "o4-mini-2025-04-16", "supported", "strict_json_schema"),
+        ("openai", "o3-pro", "unsupported", None),
+        ("openai", "gpt-5.4-pro", "unsupported", None),
+        ("openai", "gpt-5.2-pro-2025-12-11", "unsupported", None),
+        ("openai", "gpt-4", "unsupported", None),
+        ("openai", "future-openai-model", "unverified", None),
+        ("anthropic", "claude-haiku-4-5-20251001", "supported", "strict_json_schema"),
+        ("anthropic", "claude-opus-5-5", "supported", "strict_json_schema"),
+        ("anthropic", "claude-sonnet-5-5", "supported", "strict_json_schema"),
+        ("anthropic", "claude-sonnet-5", "supported", "strict_json_schema"),
+        ("anthropic", "claude-opus-5-5-20260922", "unverified", None),
+        ("anthropic", "claude-opus-5.5", "unverified", None),
+        ("anthropic", "claude-sonnet-5-6", "unverified", None),
+        ("anthropic", "claude-fable-5-1", "supported", "strict_json_schema"),
+        ("anthropic", "claude-mythos-preview", "supported", "strict_json_schema"),
+        ("anthropic", "claude-sonnet-4-20250514", "unsupported", None),
+        ("anthropic", "future-claude-model", "unverified", None),
+        ("deepseek", "deepseek-v4-flash", "supported", "json_mode_local_validation"),
+        ("deepseek", "deepseek-chat", "unsupported", None),
+        ("deepseek", "future-deepseek-model", "unverified", None),
+    ],
+)
+def test_answer_compatibility_is_provider_and_model_specific(
+    provider, model, status, contract
+):
+    from omd.provider_models import answer_model_compatibility
+
+    result = answer_model_compatibility(provider, model)
+
+    assert result.status == status
+    assert result.contract == contract
+    assert model in result.reason
+
+
+def test_deepseek_compatibility_does_not_claim_provider_strict_schema():
+    from omd.provider_models import answer_model_compatibility
+
+    result = answer_model_compatibility("deepseek", "deepseek-flash")
+
+    assert result.status == "supported"
+    assert result.contract == "json_mode_local_validation"
+    assert "local schema validation" in result.reason
+    assert "does not enforce" in result.reason
+
+
+def test_openai_non_streaming_model_is_not_approved_for_streaming_answers():
+    from omd.provider_models import answer_model_compatibility
+
+    result = answer_model_compatibility("openai", "gpt-5.5-pro")
+
+    assert result.status == "unsupported"
+    assert result.contract is None
+    assert "streaming" in result.reason
 
 
 def test_catalog_normalises_timeout_without_leaking_credentials():

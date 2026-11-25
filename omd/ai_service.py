@@ -427,6 +427,32 @@ def execute_text_task(
             "model_unavailable",
             f"selected model {task.model.strip()} is unavailable for {provider}",
         )
+    answer_compatibility = availability.answer_compatibility
+    answer_compatibility_reason = availability.answer_compatibility_reason
+    answer_contract = availability.answer_contract
+    if (
+        answer_compatibility not in {"supported", "unsupported", "unverified"}
+        or not isinstance(answer_compatibility_reason, str)
+        or not answer_compatibility_reason.strip()
+        or (
+            answer_compatibility == "supported"
+            and (
+                not isinstance(answer_contract, str)
+                or not answer_contract.strip()
+            )
+        )
+    ):
+        raise AIServiceError(
+            provider,
+            "model_check_invalid",
+            "model check answer compatibility is invalid",
+        )
+    if answer_compatibility != "supported":
+        raise AIServiceError(
+            provider,
+            "selected_model_incompatible",
+            answer_compatibility_reason,
+        )
 
     readiness = evaluate_processing_readiness(
         policy,
