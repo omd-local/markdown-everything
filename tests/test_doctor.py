@@ -162,10 +162,11 @@ def test_tesseract_readiness_reports_missing_requested_packs(monkeypatch):
 
 
 def test_tesseract_readiness_resolves_environment_over_config(monkeypatch):
-    monkeypatch.setattr(doctor, "_which_tool", lambda name: "/bin/tesseract")
+    executable = "/fixture/tesseract"
     configured = OMDConfig(capture=CaptureConfig(ocr_language="deu"))
 
     def fake_run(argv, **_kwargs):
+        assert argv[0] == executable
         if argv[-1] == "--version":
             return subprocess.CompletedProcess(argv, 0, "tesseract 5.5.1\n", "")
         return subprocess.CompletedProcess(
@@ -178,10 +179,12 @@ def test_tesseract_readiness_resolves_environment_over_config(monkeypatch):
     monkeypatch.setattr(doctor.subprocess, "run", fake_run)
 
     readiness = doctor.tesseract_readiness(
-        environ={"OMD_OCR_LANGUAGE": " chi_sim + eng "},
+        executable=executable,
+        environ={"OMD_OCR_LANGUAGE": " chi_sim + eng ", "PATH": ""},
         config=configured,
     )
 
+    assert readiness["available"] is True
     assert readiness["requested_language"] == " chi_sim + eng "
     assert readiness["effective_language"] == "chi_sim+eng"
     assert readiness["language_source"] == "environment"
