@@ -1440,7 +1440,7 @@ def test_copy_with_progress_emits_byte_units_in_events_mode(capsys):
 def test_image_ocr_emits_real_pixel_work_units(
     tmp_path, monkeypatch, capsys, ocr_packs_available
 ):
-    from PIL import Image
+    Image = pytest.importorskip("PIL.Image", reason="Pixel fixture requires optional Pillow")
     from omd import _events, _progress, cli
 
     source = tmp_path / "scan.png"
