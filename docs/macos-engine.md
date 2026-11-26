@@ -1,6 +1,7 @@
 # Install the OMD Engine on macOS
 
-> **0.3.0b6 is an unpublished candidate**, paired with Home 0.2.3. Use a
+> **0.3.0b6 release assets are not published**, paired with Home 0.2.3. Public
+> candidate source or a draft PR does not publish an installer. Use a
 > separately supplied local test artifact until release assets exist. The current
 > public b5 wheel/source archive is not this standalone app. Candidates are
 > unsigned and not notarized; stop and report Gatekeeper blocks. Third-party
@@ -22,7 +23,8 @@ The document-conversion bundles currently require **macOS 14 or newer**.
    About This Mac**. The packages contain different native Python runtimes.
 3. Use the matching engine installer, or unpack the engine archive and move
    **OMD Engine.app** into **Applications** or your home folder's **Applications**.
-4. In Obsidian, open **Settings > OMD Home > OMD**, then **Check again**. The
+4. In Obsidian, open **Settings > OMD Home > Capture and processing**, then
+   **Detect OMD** or **Check again**. The
    plugin checks the installed app's executable and capability contract.
 
 The prebuilt engine includes Python and basic document converters. It does not
