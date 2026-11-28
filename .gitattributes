@@ -1,0 +1,3 @@
+# Hash-pinned upstream notices must retain their original bytes, including
+# line endings and whitespace. Do not normalize them as project source files.
+packaging/macos/licenses/** -text -whitespace
