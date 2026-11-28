@@ -1,0 +1,5 @@
+# Maintainer build input; these are existing OMD document capabilities.
+# Resolve on the matching macOS architecture with CPython 3.12, then freeze
+# every wheel filename and SHA-256 into wheelhouse.json before building.
+pip==26.1.2
+markitdown[docx,outlook,pdf,pptx,xls,xlsx]>=0.1.6,<0.2

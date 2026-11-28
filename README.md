@@ -1,6 +1,6 @@
 <div align="center">
 
-<sub>OMD.EXE // PUBLIC BETA 0.3.0b5</sub>
+<sub>OMD.EXE // BETA CANDIDATE 0.3.0b6</sub>
 
 # OMD.EXE
 
@@ -20,8 +20,8 @@ URLs into traceable Markdown that stays in folders you control.
 
 </div>
 
-**Beta 0.3.0b5 provides the core backend for OMD Home, the command line, and
-MCP.** The browser UI is deferred until its Gradio/Pillow dependencies have a
+**The 0.3.0b6 candidate retains the public b5 core backend for OMD Home, the command line, and
+MCP, adding independent macOS packaging.** The browser UI is deferred until its Gradio/Pillow dependencies have a
 compatible, audited installation. OMD Home does not require that browser UI.
 
 ## How conversion stays recoverable
@@ -39,6 +39,19 @@ Core conversion never depends on AI. Optional model work is isolated, so a
 missing model or failed call leaves the raw Markdown intact.
 
 ## Quick start
+
+> **First-install candidate:** the source prepares OMD Engine **0.3.0b6** with
+> Home **0.2.3**. It is not published yet. The current public Homebrew release
+> remains **0.3.0b5**; do not expect the commands below to install b6.
+
+For the independent candidate on macOS 14+, follow the
+[macOS engine guide](docs/macos-engine.md). A matching arm64 or x86_64 app
+contains Python and basic document converters. The base installation needs no
+Homebrew, Xcode/CLT, model download or all-language OCR data. The app ZIP does
+not create a bare `omd` command. Candidate artifacts are unsigned, not notarized,
+and retain the release gates listed in the guide.
+
+### Existing public Homebrew route
 
 ```bash
 brew install omd-local/omd/omd

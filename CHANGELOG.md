@@ -3,6 +3,20 @@
 All notable changes are documented here. Version numbers follow Semantic
 Versioning and Python's beta-version convention.
 
+## 0.3.0b6 - Unreleased first-install candidate
+
+- Add separately installed, relocatable macOS app/ZIP/PKG builds with pinned
+  CPython and hash-locked document wheels. The base user route avoids Homebrew,
+  source compilation, Xcode/CLT and Xcode license acceptance.
+- Keep OCR languages, media/transcription tools, Ollama/models and browser UI
+  outside the base document package. App discovery and isolated Python bridge
+  support are paired with Home 0.2.3.
+- Retain public b5 runtime behavior and protocol v1. iPhone capture, experimental
+  answer verification and evidence benchmark modules are excluded.
+- Candidate artifacts are unsigned and not notarized. Third-party notice
+  completion, Intel/macOS 14/fresh-Mac installation and Gatekeeper acceptance
+  remain release gates. This entry does not claim public assets are available.
+
 ## 0.3.0b5 - 2026-11-25
 
 ### Added
