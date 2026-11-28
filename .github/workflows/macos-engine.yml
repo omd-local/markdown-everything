@@ -7,6 +7,7 @@ on:
       - "omd/**"
       - "packaging/macos/**"
       - "tests/test_macos_bundle.py"
+      - "docs/macos-engine.md"
       - ".github/workflows/macos-engine.yml"
 
 permissions:

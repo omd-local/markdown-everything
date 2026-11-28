@@ -1,9 +1,9 @@
 # Install the OMD Engine on macOS
 
-> **0.3.0b6 release assets are not published**, paired with Home 0.2.3. Public
-> candidate source or a draft PR does not publish an installer. Use a
-> separately supplied local test artifact until release assets exist. The current
-> public b5 wheel/source archive is not this standalone app. Candidates are
+> **0.3.0b6 release assets are not published**, paired with Home 0.2.3. Download
+> the candidate's GitHub PR build artifacts using the steps below; a draft PR
+> does not publish a Release. The current public b5 wheel/source archive is not
+> this standalone app. Candidates are
 > unsigned and not notarized; stop and report Gatekeeper blocks. Third-party
 > notice completion, Intel, minimum-macOS and fresh-Mac Installer acceptance
 > remain open. Do not treat this page as proof those gates have passed.
@@ -12,20 +12,44 @@ OMD Home is the Obsidian interface. OMD Engine is a separate local runtime for
 capture and the Python-backed AI tools. Install the engine yourself; the plugin
 checks and connects to it without running a package manager.
 
-These steps apply to releases containing the prebuilt **OMD Engine** assets.
-Older source archives and Homebrew formulas use a different installation path.
-The document-conversion bundles currently require **macOS 14 or newer**.
+These steps install the prebuilt **OMD Engine** candidate from GitHub on the Mac
+you are testing. Older source archives and Homebrew formulas use a different
+installation path. The document-conversion bundles require **macOS 14 or newer**.
+
+Install the matching Home plugin using the same [English Mac guide](https://github.com/omd-local/obsidian-omd-home/blob/agent/public-beta-first-install/docs/getting-started-mac.en.md#manual-install)
+or [简体中文 Mac 指南](https://github.com/omd-local/obsidian-omd-home/blob/agent/public-beta-first-install/docs/getting-started-mac.md#manual-install).
+The plugin and engine have separate PR artifacts.
 
 ## Choose and install a prebuilt package
 
-1. Open the [official OMD releases](https://github.com/omd-local/markdown-everything/releases).
-2. Choose **Apple Silicon / arm64** or **Intel / x86_64** to match **Apple menu >
-   About This Mac**. The packages contain different native Python runtimes.
-3. Use the matching engine installer, or unpack the engine archive and move
-   **OMD Engine.app** into **Applications** or your home folder's **Applications**.
-4. In Obsidian, open **Settings > OMD Home > Capture and processing**, then
-   **Detect OMD** or **Check again**. The
-   plugin checks the installed app's executable and capability contract.
+1. Sign in to GitHub on this Mac and open [Engine PR #16](https://github.com/omd-local/markdown-everything/pull/16).
+2. Open **Checks**, choose a successful **Build independent macOS engine** run
+   for the PR revision you want to test, then open the workflow run's summary.
+   Use the summary's **Artifacts** section, rather than an individual job log.
+3. Check **Apple menu > About This Mac** and download the matching artifact:
+
+   | Your Mac | Artifact |
+   |---|---|
+   | Apple Silicon / Apple M series | `omd-engine-unsigned-arm64` |
+   | Intel | `omd-engine-unsigned-x86_64` |
+
+   The packages contain different native Python runtimes. Each artifact is
+   retained for **14 days** from its build. If it has expired, look for a newer
+   successful run on the same PR or report that no downloadable build remains.
+   Record the run URL when reporting your test result.
+4. Unpack the downloaded artifact ZIP. It may contain additional directories;
+   find `OMD-Engine-arm64.zip` or `OMD-Engine-x86_64.zip` inside it, matching your
+   chosen architecture. Unpack that inner ZIP, then move **OMD Engine.app** into
+   **Applications** or your home folder's **Applications**. This ZIP route does
+   not need an administrator installation. The artifact also contains a matching
+   `.pkg`, checksums and build metadata for separate installer acceptance.
+5. In Obsidian, open **Settings > OMD Home > Capture and processing**, then
+   **Detect OMD** or **Check again**. The plugin checks the installed app's
+   executable and capability contract.
+
+After a candidate is formally released, its published prebuilt packages will be
+available from the [official OMD releases](https://github.com/omd-local/markdown-everything/releases).
+The current candidate test route is the PR artifact above.
 
 The prebuilt engine includes Python and basic document converters. It does not
 run Homebrew, build Python packages on your computer, or require you to accept an
