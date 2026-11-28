@@ -197,6 +197,92 @@ def verify_wheelhouse(directory: Path, lock_path: Path, architecture: str) -> tu
     return sorted(wheels), lock
 
 
+def _license_relative_path(value: str) -> PurePosixPath:
+    path = PurePosixPath(value)
+    if (not value or "\\" in value or path.is_absolute() or ".." in path.parts
+            or path.as_posix() != value or any(ord(c) < 32 for c in value)):
+        raise BundleError("Unsafe license material pathname")
+    return path
+
+
+def write_license_materials(resources: Path, runtime_manifest: dict, architecture: str,
+                            wheels: list[Path], *, strict_release: bool = False) -> dict:
+    """Copy exact reviewed notices offline; missing or changed materials reject a build."""
+    root = HERE / "licenses"
+    try:
+        manifest = json.loads((root / "manifest.json").read_text())
+        if manifest["schema_version"] != 1:
+            raise BundleError("Unsupported license manifest")
+        runtime = manifest["runtimes"][architecture]
+        if (runtime["archive_sha256"] != runtime_manifest["runtimes"][architecture]["sha256"]
+                or runtime["python_version"] != runtime_manifest["python_version"]
+                or runtime["release"] != runtime_manifest["release"]):
+            raise BundleError("Runtime license materials do not match the pinned interpreter")
+        selected = set(runtime["materials"])
+        wheel_records = []
+        for wheel in wheels:
+            record = manifest["wheels"][wheel.name]
+            verify_sha256(wheel, record["sha256"])
+            if not record["embedded"] and not record["supplemental"]:
+                raise BundleError(f"No license materials recorded for {wheel.name}")
+            selected.update(record["supplemental"])
+            wheel_records.append(record)
+        materials = {}
+        for name in sorted(selected):
+            relative = _license_relative_path(name)
+            source = root / relative
+            if any(parent.is_symlink() for parent in [source, *source.parents]
+                   if parent.is_relative_to(root)):
+                raise BundleError("License materials must not be symbolic links")
+            record = manifest["materials"][name]
+            verify_sha256(source, record["sha256"])
+            materials[name] = record
+        # Verify every license referenced by PBS metadata, including linked OpenSSL,
+        # rather than assuming the stripped runtime's CPython LICENSE covers them.
+        metadata_name = f"runtime/{architecture}/PYTHON.json"
+        if metadata_name not in selected:
+            raise BundleError("Runtime license inventory is missing PYTHON.json")
+        metadata = json.loads((root / metadata_name).read_text())
+        expected_target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}[architecture]
+        if (metadata["python_version"] != runtime_manifest["python_version"]
+                or metadata["target_triple"] != expected_target):
+            raise BundleError("Runtime license metadata targets a different interpreter")
+        required = {metadata["license_path"]}
+        for entries in metadata["build_info"]["extensions"].values():
+            for entry in entries:
+                required.update(entry.get("license_paths", []))
+        if any(f"runtime/{architecture}/{name}" not in selected for name in required):
+            raise BundleError("Runtime license inventory omits a referenced component")
+        components = {f"{record['name']}=={record['version']}" for record in wheel_records}
+        inventory = {"schema_version": 1, "runtime": runtime, "materials": materials,
+                     "wheels": wheel_records,
+                     "release_blockers": [item for item in manifest["release_blockers"]
+                                          if item["component"] in components]}
+        if strict_release and inventory["release_blockers"]:
+            names = ", ".join(item["component"] for item in inventory["release_blockers"])
+            raise BundleError(f"Unresolved third-party license release blockers: {names}")
+        destination = resources / "third-party-licenses"
+        destination.mkdir()
+        for name in sorted(selected):
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / name, target)
+        for wheel, record in zip(wheels, wheel_records, strict=True):
+            with zipfile.ZipFile(wheel) as archive:
+                for item in record["embedded"]:
+                    relative = _license_relative_path(item["path"])
+                    data = archive.read(item["path"])
+                    if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                        raise BundleError(f"Embedded license changed in {wheel.name}")
+                    target = destination / "wheels" / wheel.name / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+        (destination / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+        return inventory
+    except (KeyError, TypeError, OSError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+        raise BundleError(f"Missing or invalid third-party license materials: {exc}") from exc
+
+
 def _verify_wheel_archive(path: Path) -> None:
     try:
         with zipfile.ZipFile(path) as handle:
@@ -456,7 +542,8 @@ def normalize_permissions(root: Path, file_modes: dict[str, int] | None = None) 
 
 
 def build_bundle(*, runtime_archive: Path, architecture: str, profile: str, wheelhouse: Path | None,
-                 wheel_lock: Path | None, output_dir: Path, source_root: Path, revision: str) -> Path:
+                 wheel_lock: Path | None, output_dir: Path, source_root: Path, revision: str,
+                 strict_release: bool = False) -> Path:
     if output_dir.exists() or output_dir.is_symlink():
         raise BundleError("Output directory already exists; refusing to overwrite it")
     if platform.system() != "Darwin" or platform.machine() != architecture or architecture not in ARCHITECTURES:
@@ -501,8 +588,11 @@ def build_bundle(*, runtime_archive: Path, architecture: str, profile: str, whee
         resources = contents / "Resources"
         resources.mkdir()
         license_path = source_root / "LICENSE"
-        if license_path.is_file():
-            shutil.copyfile(license_path, resources / "OMD-LICENSE")
+        if not license_path.is_file():
+            raise BundleError("OMD source license is missing")
+        shutil.copyfile(license_path, resources / "OMD-LICENSE")
+        license_inventory = write_license_materials(resources, manifest, architecture, wheels,
+                                                    strict_release=strict_release)
         numeric_version = ".".join(re.findall(r"\d+", version)[:3])
         with (contents / "Info.plist").open("wb") as handle:
             plistlib.dump({"CFBundleName": "OMD Engine", "CFBundleDisplayName": "OMD Engine", "CFBundleIdentifier": APP_ID, "CFBundlePackageType": "APPL", "CFBundleExecutable": "OMD Engine", "CFBundleShortVersionString": numeric_version, "CFBundleVersion": numeric_version, "LSMinimumSystemVersion": minimum_macos(wheels), "NSHighResolutionCapable": True}, handle)
@@ -528,7 +618,10 @@ def build_bundle(*, runtime_archive: Path, architecture: str, profile: str, whee
         provenance = {"schema_version": 1, "name": "OMD Engine", "version": version, "build_revision": revision,
                       "architecture": architecture, "profile": profile, "python_version": identity["version"],
                       "minimum_macos": minimum_macos(wheels),
-                      "runtime": runtime, "wheelhouse": lock, "signing": "unsigned; release signing and notarization required",
+                      "runtime": runtime, "wheelhouse": lock,
+                      "license_inventory": "third-party-licenses/inventory.json",
+                      "license_release_blockers": license_inventory["release_blockers"],
+                      "signing": "unsigned; release signing and notarization required",
                       "optional_components": ["ollama", "models", "tesseract", "ocr-language-data", "ffmpeg", "yt-dlp", "transcription", "browser-ui"]}
         (resources / "omd-engine.json").write_text(json.dumps(provenance, indent=2) + "\n")
         normalize_permissions(app)
@@ -559,6 +652,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, default=HERE.parents[1])
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--strict-release", action="store_true",
+                        help="Reject builds with unresolved third-party license release blockers")
     args = parser.parse_args()
     try:
         app = build_bundle(**vars(args))

@@ -410,3 +410,101 @@ def test_ci_accepts_pkgbuild_empty_relocation_marker_but_rejects_relocatable_or_
     else:
         with pytest.raises(AssertionError):
             exec(compile(assertions, "macos-engine.yml", "exec"), namespace)
+
+
+def test_license_inventory_covers_exact_locked_wheels_and_runtime_components(tmp_path):
+    manifest = json.loads((BUILDER_PATH.parent / "licenses/manifest.json").read_text())
+    runtime = bundle.load_runtime_manifest()
+    for architecture in ("arm64", "x86_64"):
+        lock = json.loads((BUILDER_PATH.parent / f"wheels-{architecture}.lock.json").read_text())
+        for wheel in lock["wheels"]:
+            record = manifest["wheels"][wheel["filename"]]
+            assert record["sha256"] == wheel["sha256"]
+            assert record["embedded"] or record["supplemental"]
+        resources = tmp_path / architecture
+        resources.mkdir()
+        inventory = bundle.write_license_materials(resources, runtime, architecture, [])
+        notices = resources / "third-party-licenses"
+        assert (notices / f"runtime/{architecture}/licenses/LICENSE.openssl-3.txt").is_file()
+        assert (notices / f"runtime/{architecture}/PYTHON.json").is_file()
+        assert inventory["release_blockers"] == []  # Diagnostic core omits cobble.
+        assert json.loads((notices / "inventory.json").read_text()) == inventory
+
+
+def license_fixture(tmp_path, monkeypatch):
+    import shutil
+    root = tmp_path / "packaging"
+    shutil.copytree(BUILDER_PATH.parent / "licenses", root / "licenses",
+                    ignore=shutil.ignore_patterns("._*"))
+    monkeypatch.setattr(bundle, "HERE", root)
+    resources = tmp_path / "Resources"
+    resources.mkdir()
+    return root, resources
+
+
+@pytest.mark.parametrize("alteration", ["missing", "tampered", "symlink"])
+def test_build_rejects_missing_or_changed_runtime_notices(tmp_path, monkeypatch, alteration):
+    root, resources = license_fixture(tmp_path, monkeypatch)
+    source = root / "licenses/runtime/arm64/licenses/LICENSE.openssl-3.txt"
+    if alteration == "missing":
+        source.unlink()
+    elif alteration == "tampered":
+        source.write_text("Not the reviewed upstream license")
+    else:
+        replacement = tmp_path / "external-license"
+        source.rename(replacement)
+        source.symlink_to(replacement)
+    with pytest.raises(bundle.BundleError):
+        runtime = json.loads((BUILDER_PATH.parent / "runtime-manifest.json").read_text())
+        bundle.write_license_materials(resources, runtime, "arm64", [])
+    assert not (resources / "third-party-licenses").exists()
+
+
+def test_runtime_license_materials_cannot_silently_follow_runtime_updates(tmp_path):
+    resources = tmp_path / "Resources"
+    resources.mkdir()
+    runtime = bundle.load_runtime_manifest()
+    runtime["runtimes"]["arm64"]["sha256"] = "0" * 64
+    with pytest.raises(bundle.BundleError, match="do not match"):
+        bundle.write_license_materials(resources, runtime, "arm64", [])
+
+
+def test_license_manifest_rejects_unreviewed_wheel_and_unsafe_notice_paths(tmp_path, monkeypatch):
+    root, resources = license_fixture(tmp_path, monkeypatch)
+    wheel, _, _ = wheel_fixture(tmp_path)
+    runtime = json.loads((BUILDER_PATH.parent / "runtime-manifest.json").read_text())
+    with pytest.raises(bundle.BundleError, match="license materials"):
+        bundle.write_license_materials(resources, runtime, "arm64", [wheel])
+    path = root / "licenses/manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["runtimes"]["arm64"]["materials"].append("../outside-LICENSE")
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(bundle.BundleError, match="Unsafe license"):
+        bundle.write_license_materials(resources, runtime, "arm64", [])
+    assert not (tmp_path / "outside-LICENSE").exists()
+
+
+def test_embedded_and_supplemental_licenses_ship_with_original_notice_and_blockers(tmp_path, monkeypatch):
+    root, resources = license_fixture(tmp_path, monkeypatch)
+    wheel, _, _ = wheel_fixture(tmp_path, "cobble-0.1.4-py3-none-any.whl")
+    embedded_path = "cobble-0.1.4.dist-info/licenses/NOTICE"
+    original = b"Fixture upstream copyright notice\n"
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(embedded_path, original)
+    path = root / "licenses/manifest.json"
+    manifest = json.loads(path.read_text())
+    record = manifest["wheels"][wheel.name]
+    record["sha256"] = bundle.digest(wheel)
+    record["embedded"] = [{"path": embedded_path, "sha256": hashlib.sha256(original).hexdigest()}]
+    path.write_text(json.dumps(manifest))
+    runtime = json.loads((BUILDER_PATH.parent / "runtime-manifest.json").read_text())
+    with pytest.raises(bundle.BundleError, match="Unresolved third-party license release blockers: cobble"):
+        bundle.write_license_materials(resources, runtime, "arm64", [wheel], strict_release=True)
+    assert not (resources / "third-party-licenses").exists()
+    inventory = bundle.write_license_materials(resources, runtime, "arm64", [wheel])
+    notices = resources / "third-party-licenses"
+    assert (notices / "wheels" / wheel.name / embedded_path).read_bytes() == original
+    assert b"2012-2015 Janne Vanhala" in (notices / "wheels/cobble-inflection-LICENSE").read_bytes()
+    assert inventory["release_blockers"][0]["component"] == "cobble==0.1.4"
+    # The reference BSD template must never be claimed as the original notice.
+    assert "reference template" in inventory["release_blockers"][0]["reason"]

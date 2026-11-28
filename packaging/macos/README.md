@@ -104,13 +104,27 @@ tools remain discoverable because launchers prepend the bundle's executables
 to the user's inherited PATH. The plugin checks feature readiness and provides
 guidance; it does not execute this installer or install executable dependencies.
 
+## Third-party notices and release clearance
+
+The builder copies the exact reviewed runtime and wheel notices into
+`Contents/Resources/third-party-licenses/` and records their provenance and
+hashes in `inventory.json`. Missing or changed materials reject the build.
+For public release builds, pass `--strict-release`; it also rejects unresolved
+license blockers. **The current document profile is blocked by cobble 0.1.4's
+missing original copyright/license notice.** Review builds retain this blocker
+in both the license inventory and `omd-engine.json`; they are not cleared for
+public binary release. See [third-party materials](../../docs/third-party-licenses.md)
+for sources, coverage and the required resolution.
+
 ## Verification and release boundary
 
 `.github/workflows/macos-engine.yml` builds natively for both architectures,
 tests hostile archive inputs and install conflicts, exercises document capture,
 moves the app to a path containing spaces, runs with a minimal PATH, and builds
-and expands the package without installing it. It uploads **unsigned review
-artifacts** only; it does not publish a release.
+and expands the package without installing it. It audits the exact wheel lock
+and records the license inventory. Public binary uploads are blocked if either
+gate fails; review JSON evidence remains available. Any permitted binary uploads
+are **unsigned review artifacts** only; the workflow does not publish a release.
 
 Before a public release, sign nested native code and the app with the project's
 Developer ID Application identity, sign the installer with Developer ID
@@ -120,3 +134,6 @@ signing changes files. Signing and notarization require real credentials and
 are not claimed by this builder. Verify Gatekeeper and first use on a fresh
 Mac of each architecture with no Homebrew, system Python setup or developer
 tools before declaring that release ready.
+
+The owner preparation, credential boundaries and final-artifact acceptance steps
+are listed in [macOS signing and notarization](../../docs/macos-signing.md).

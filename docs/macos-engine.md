@@ -1,8 +1,12 @@
 # Install the OMD Engine on macOS
 
 > **0.3.0b6 release assets are not published**, paired with Home 0.2.3. Download
-> the candidate's GitHub PR build artifacts using the steps below; a draft PR
-> does not publish a Release. The current public b5 wheel/source archive is not
+> a new candidate's GitHub PR build artifacts using the steps below **only after
+> its dependency and license gates pass**. New binary uploads are currently blocked:
+> Cobble's original package copyright notice is missing, and the Intel wheel lock
+> includes known cryptography vulnerabilities with no fixed upstream Intel wheel.
+> See [third-party license status](third-party-licenses.md). Do not bypass these gates
+> with an older successful run. A draft PR does not publish a Release; the current public b5 wheel/source archive is not
 > this standalone app. Candidates are
 > unsigned and not notarized; stop and report Gatekeeper blocks. Third-party
 > notice completion, Intel, minimum-macOS and fresh-Mac Installer acceptance
